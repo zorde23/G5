@@ -14,9 +14,20 @@ double TraceMs() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - origin).count();
 }
 
-std::uint64_t SkippedShader() {
-    static const std::uint64_t skipped = [] { const char* text = std::getenv("APS5_SKIP_SHADER"); return text ? std::strtoull(text, nullptr, 16) : 0ull; }();
-    return skipped;
+bool ShaderSkipped(std::uint64_t address) {
+    static const std::set<std::uint64_t> skipped = [] {
+        std::set<std::uint64_t> addresses;
+        const char* text = std::getenv("APS5_SKIP_SHADER");
+        while (text != nullptr && *text != '\0') {
+            char* end = nullptr;
+            const auto value = std::strtoull(text, &end, 16);
+            if (end == text) throw std::runtime_error(std::string("APS5_SKIP_SHADER must be hex program addresses separated by commas, got \"") + std::getenv("APS5_SKIP_SHADER") + "\"");
+            if (value != 0) addresses.insert(value);
+            text = *end == ',' ? end + 1 : end;
+        }
+        return addresses;
+    }();
+    return address != 0 && skipped.contains(address);
 }
 
 bool SkipRefusedDraws() {
