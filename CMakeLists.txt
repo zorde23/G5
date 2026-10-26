@@ -90,6 +90,11 @@ elseif(NOT APPLE)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static -static-libgcc -static-libstdc++")
 endif()
 
+option(APS5_HOST_NO_RED_ZONE "Compile host code without the System V red zone on Windows, where a resumed fault writes its exception frame below RSP" OFF)
+if(MINGW AND APS5_HOST_NO_RED_ZONE)
+    add_compile_options(-mno-red-zone)
+endif()
+
 if(APPLE AND NOT ANYPS5_RELINKER_ONLY)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fexperimental-library>)
     add_link_options(-fexperimental-library)
