@@ -15,6 +15,10 @@
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <vector>
 #include <iterator>
 #include <utility>
 #include <mutex>
@@ -350,11 +354,106 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
     return true;
 }
 
+struct RedZoneRange {
+    std::uint64_t Begin;
+    std::uint64_t End;
+    bool Uncovered;
+    char Reason[64];
+};
+
+struct RedZoneTable {
+    std::wstring Module;
+    std::vector<RedZoneRange> Ranges;
+};
+
+std::vector<RedZoneTable>* g_redZoneTables = nullptr;
+std::atomic<std::uint64_t> g_redZoneLogged[1024]{};
+std::atomic<std::uint64_t> g_redZoneFaults{0};
+
+void LoadRedZoneTables(const std::filesystem::path& directory, std::vector<RedZoneTable>& tables) {
+    std::error_code error;
+    for (const auto& entry : std::filesystem::directory_iterator(directory, error)) {
+        const auto name = entry.path().filename().wstring();
+        const std::wstring suffix = L".redzone.txt";
+        if (name.size() <= suffix.size() || name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+        std::ifstream file(entry.path());
+        RedZoneTable table{entry.path().wstring().substr(0, entry.path().wstring().size() - suffix.size()), {}};
+        std::string line;
+        while (std::getline(file, line)) {
+            RedZoneRange range{};
+            int consumed = 0;
+            unsigned long long begin = 0, end = 0;
+            if (std::sscanf(line.c_str(), "%llx %llx %n", &begin, &end, &consumed) < 2 || end <= begin) continue;
+            range.Begin = begin;
+            range.End = end;
+            std::snprintf(range.Reason, sizeof(range.Reason), "%s", line.c_str() + consumed);
+            range.Uncovered = std::strcmp(range.Reason, "no FDE") == 0;
+            table.Ranges.push_back(range);
+        }
+        std::sort(table.Ranges.begin(), table.Ranges.end(), [](const RedZoneRange& left, const RedZoneRange& right) { return left.Begin < right.Begin; });
+        tables.push_back(std::move(table));
+    }
+}
+
+void InstallRedZoneGuard() {
+    const char* guard = std::getenv("APS5_RED_ZONE_GUARD");
+    const bool armed = std::getenv("APS5_ARM_SHARED_IMPORTS") != nullptr;
+    if (guard != nullptr && std::strcmp(guard, "0") == 0) {
+        if (armed) Report("[red-zone-guard] WARNING: APS5_ARM_SHARED_IMPORTS arms shared guest pages with the guard turned off by APS5_RED_ZONE_GUARD=0; a fault resumed in an unframed red-zone leaf corrupts its stack silently\n");
+        return;
+    }
+    if (guard == nullptr && !armed) return;
+    wchar_t exe[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    const std::filesystem::path root = std::filesystem::path(exe).parent_path();
+    auto* tables = new std::vector<RedZoneTable>();
+    for (const auto& directory : {root, root / "libs", root / "app0" / "sce_module"}) LoadRedZoneTables(directory, *tables);
+    const bool exeCovered = std::any_of(tables->begin(), tables->end(), [&](const RedZoneTable& table) { return _wcsicmp(table.Module.c_str(), exe) == 0; });
+    std::size_t ranges = 0;
+    for (const auto& table : *tables) ranges += table.Ranges.size();
+    Report("[red-zone-guard] %zu tables, %zu ranges%s\n", tables->size(), ranges, exeCovered ? "" : "; INERT for the executable: it has no .redzone.txt (convert with --frame-red-zone)");
+    g_redZoneTables = tables;
+}
+
+void GuardRedZone(const EXCEPTION_POINTERS* info) {
+    if (g_redZoneTables == nullptr) return;
+    const auto faults = g_redZoneFaults.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto rip = static_cast<std::uint64_t>(info->ContextRecord->Rip);
+    const auto access = info->ExceptionRecord->ExceptionInformation[0];
+    HMODULE module = nullptr;
+    wchar_t path[MAX_PATH] = L"?";
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(rip), &module) && module != nullptr) GetModuleFileNameW(module, path, MAX_PATH);
+    const auto rva = rip - reinterpret_cast<std::uint64_t>(module);
+    const RedZoneRange* hit = nullptr;
+    bool tabled = false;
+    for (const auto& table : *g_redZoneTables) {
+        if (module == nullptr || _wcsicmp(table.Module.c_str(), path) != 0) continue;
+        tabled = true;
+        const auto next = std::upper_bound(table.Ranges.begin(), table.Ranges.end(), rva, [](std::uint64_t value, const RedZoneRange& range) { return value < range.Begin; });
+        if (next != table.Ranges.begin() && rva < std::prev(next)->End) hit = &*std::prev(next);
+        break;
+    }
+    if (hit != nullptr && !hit->Uncovered) {
+        Report("[red-zone-guard] %s fault at %ls+0x%llx resumed inside a red-zone leaf without a frame [0x%llx, 0x%llx) (%s): its values below RSP were overwritten; terminating\n", access == 1 ? "write" : access == 0 ? "read" : "other", path, static_cast<unsigned long long>(rva), static_cast<unsigned long long>(hit->Begin), static_cast<unsigned long long>(hit->End), hit->Reason);
+        TerminateProcess(GetCurrentProcess(), 0xC0000409u);
+    }
+    auto& slot = g_redZoneLogged[(rip * 0x9e3779b97f4a7c15ull) >> 54];
+    std::uint64_t expected = 0;
+    if (slot.load(std::memory_order_relaxed) == rip || !slot.compare_exchange_strong(expected, rip)) return;
+    Report("[red-zone-guard] %s fault at %ls+0x%llx %s (faults so far %llu)\n", access == 1 ? "write" : access == 0 ? "read" : "other", path, static_cast<unsigned long long>(rva), hit != nullptr ? "in code no FDE covers" : tabled ? "outside every listed range" : "in a module without a red-zone table", static_cast<unsigned long long>(faults));
+}
+
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
     const auto* fault = info->ExceptionRecord;
-    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
-    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 0 && GuestArena::GuestArenaHandleRead_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
+    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) {
+        GuardRedZone(info);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 0 && GuestArena::GuestArenaHandleRead_nid_postfix(fault->ExceptionInformation[1])) {
+        GuardRedZone(info);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleSse4a(info)) return EXCEPTION_CONTINUE_EXECUTION;
     const auto* record = info->ExceptionRecord;
@@ -678,6 +777,7 @@ const bool g_crashReportInstalled = [] {
     std::signal(SIGABRT, AbortSignalHandler);
     _set_invalid_parameter_handler(InvalidParameterHandler);
     InstallWatch();
+    InstallRedZoneGuard();
     if (const char* hang = std::getenv("APS5_HANG_DUMP_SECS")) {
         unsigned long long seconds = 0;
         if (hang[0] >= '0' && hang[0] <= '9') {
