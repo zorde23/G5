@@ -14,6 +14,7 @@
 #include "IntermediateRepresentation/IrMetadata/BufferFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "ThreadOwned.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -686,6 +687,16 @@ std::atomic<bool>& anyGuarded() {
     return any;
 }
 
+std::atomic<std::uint64_t>& guardedVersion() {
+    static std::atomic<std::uint64_t> version{1};
+    return version;
+}
+
+void publishGuarded(bool any) {
+    anyGuarded().store(any, std::memory_order_release);
+    guardedVersion().fetch_add(1, std::memory_order_release);
+}
+
 void guardReads(std::uint64_t address, std::size_t bytes) {
     RequireNoMultisampleTarget(address, bytes, "a CPU read");
 }
@@ -731,7 +742,7 @@ void retireUnmapped(std::uintptr_t address, std::size_t bytes) {
         return true;
     });
     std::erase_if(guarded(), [](const auto& range) { return range.metadataValid && !range.active->load(std::memory_order_acquire); });
-    anyGuarded().store(!guarded().empty(), std::memory_order_release);
+    publishGuarded(!guarded().empty());
 }
 
 void guard(const Context& context, const ColorTarget& target, const std::shared_ptr<std::atomic<bool>>& active, const std::shared_ptr<std::atomic<bool>>& metadataValid) {
@@ -752,7 +763,7 @@ void guard(const Context& context, const ColorTarget& target, const std::shared_
         if (target.cmaskAddress != 0) guarded().push_back({context.device, target.cmaskAddress, target.cmaskBytes, target.samples, active, metadataValid});
         if (target.samples == 8u && target.fmaskAddress != 0u && target.cmaskAddress != 0u) guarded().push_back({context.device, target.fmaskAddress, DescribeSurface(fmaskResource(target)).guestBytes, target.samples, active, metadataValid});
     }
-    anyGuarded().store(true, std::memory_order_release);
+    publishGuarded(true);
     InstallResidentImageReadGuard_nid_no_patch();
 }
 
@@ -781,7 +792,7 @@ MultisampleTarget& acquire(const Context& context, const ColorTarget& requested)
             {
                 std::unique_lock lock(guardedMutex());
                 std::erase_if(guarded(), [&](const auto& range) { return range.active == target->active; });
-                anyGuarded().store(!guarded().empty(), std::memory_order_release);
+                publishGuarded(!guarded().empty());
             }
             target->Recreate(use);
             guard(context, use, target->active, target->metadataValid);
@@ -1318,7 +1329,7 @@ void ClearMultisampleTargets(VkDevice device) {
     std::erase_if(targets(), [&](const auto& target) { return target->context.device == device; });
     std::unique_lock guardLock(guardedMutex());
     std::erase_if(guarded(), [&](const auto& range) { return range.device == device; });
-    anyGuarded().store(!guarded().empty(), std::memory_order_release);
+    publishGuarded(!guarded().empty());
     UpdateResidentImageUnmapObserver_nid_no_patch();
 }
 
@@ -1327,8 +1338,10 @@ void GuardOneFragmentFmask(const Context& context, const ColorTarget& target) {
     const auto bytes = std::max<std::uint64_t>((bits / 8u + 0xffffu) & ~0xffffull, 0x10000u);
     std::unique_lock lock(guardedMutex());
     const bool known = std::ranges::any_of(guarded(), [&](const auto& range) { return range.fmask && range.device == context.device && range.address == target.fmaskAddress && range.bytes == bytes; });
-    if (!known) guarded().push_back({context.device, target.fmaskAddress, bytes, target.coverageSamples, std::make_shared<std::atomic<bool>>(true), nullptr, true});
-    anyGuarded().store(true, std::memory_order_release);
+    if (!known) {
+        guarded().push_back({context.device, target.fmaskAddress, bytes, target.coverageSamples, std::make_shared<std::atomic<bool>>(true), nullptr, true});
+        publishGuarded(true);
+    }
     lock.unlock();
     InstallResidentImageReadGuard_nid_no_patch();
 }
@@ -1340,8 +1353,15 @@ void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const 
 
 void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, const char* access) {
     if (bytes == 0 || !anyGuarded().load(std::memory_order_acquire)) return;
-    std::shared_lock lock(guardedMutex());
-    for (const auto& range : guarded()) {
+    thread_local std::uint64_t seenVersion = 0;
+    thread_local std::vector<GuardedRange>* seenSlot = nullptr;
+    auto& seen = ShaderRecompiler::ThreadOwned(seenSlot);
+    if (guardedVersion().load(std::memory_order_acquire) != seenVersion) {
+        std::shared_lock lock(guardedMutex());
+        seen = guarded();
+        seenVersion = guardedVersion().load(std::memory_order_relaxed);
+    }
+    for (const auto& range : seen) {
         if (address >= range.address + range.bytes || range.address >= address + bytes) continue;
         char text[256];
         if (range.fmask) {
