@@ -307,6 +307,7 @@ void Driver::execute(const Submission& submission) {
 
         timing.Mark("device_lock");
         GuestMemory::SetCurrentPacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.queue);
+        GuestMemory::SetCurrentProgram(0);
         CaptureTrace::Log("packet submission=%llu queue=%x offset=%zu header=%08x words=%zu", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, header, packet.size());
         if (predicated) {
             landPendingWaits(submission.queue);

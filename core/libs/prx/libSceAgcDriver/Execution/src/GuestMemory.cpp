@@ -242,6 +242,16 @@ PacketTag CurrentPacket() {
     return {static_cast<std::uint32_t>(bits), static_cast<std::uint32_t>(bits >> 32u)};
 }
 
+struct CurrentProgramSlot {};
+
+void SetCurrentProgram(std::uint64_t address) {
+    HostThreadSlot<std::uint64_t, CurrentProgramSlot>::Set(address);
+}
+
+std::uint64_t CurrentProgram() {
+    return HostThreadSlot<std::uint64_t, CurrentProgramSlot>::Get();
+}
+
 const char* ReadSiteName(ReadSite site) {
     static const char* const names[static_cast<std::size_t>(ReadSite::Count)] = {"unknown", "capture", "dispatch-cache", "texture-compare", "texture-read", "buffer-upload", "index-buffer", "vertex-buffer", "registers", "indirect-args", "wait", "label", "scanout", "store", "mirror-refresh", "draw-cache"};
     const auto index = static_cast<std::size_t>(site);

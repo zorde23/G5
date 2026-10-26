@@ -2971,6 +2971,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     if (published != nullptr && !SnapshotCovers(published.get(), address, end)) published = nullptr;
     open->writeValues.push_back(static_cast<std::int16_t>(value));
     open->writeWords.push_back(word);
+    open->writePrograms.push_back(GuestMemory::CurrentProgram());
     if (!ownLabel) markOverwritten(address, end);
     // A poller waiting on this range learns that the open batch may now hold its producer.
     if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
@@ -3000,6 +3001,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     if (published != nullptr && !SnapshotCovers(published.get(), address, address + bytes)) published = nullptr;
     batch.writeValues.push_back(-1);
     batch.writeWords.push_back(-1);
+    batch.writePrograms.push_back(GuestMemory::CurrentProgram());
     if (!ownLabel) markOverwritten(address, address + bytes);
     if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
     if (!SnapshotCovers(address, address + bytes)) {
@@ -3187,6 +3189,24 @@ std::uint64_t Recorder::NewestWriteNote(std::uint64_t address, std::size_t bytes
     if (open != nullptr) scan(*open);
     for (const auto& batch : inFlight) scan(*batch);
     return newest;
+}
+
+std::uint64_t Recorder::NewestWriteProgram(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return 0;
+    const auto end = address + bytes;
+    std::uint64_t newest = 0;
+    std::uint64_t program = 0;
+    const auto scan = [&](const Batch& batch) {
+        for (std::size_t i = 0; i < batch.writes.size(); ++i) {
+            if (address < batch.writes[i].second && batch.writes[i].first < end && batch.writeNotes[i] > newest) {
+                newest = batch.writeNotes[i];
+                program = i < batch.writePrograms.size() ? batch.writePrograms[i] : 0;
+            }
+        }
+    };
+    if (open != nullptr) scan(*open);
+    for (const auto& batch : inFlight) scan(*batch);
+    return program;
 }
 
 std::vector<Recorder::PendingWrite> Recorder::PendingWritesOver(std::uint64_t address, std::size_t bytes) const {

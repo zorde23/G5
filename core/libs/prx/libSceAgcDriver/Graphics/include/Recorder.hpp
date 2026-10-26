@@ -134,6 +134,7 @@ public:
     bool PendingWriteSettled(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t LastWriteNote(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t NewestWriteNote(std::uint64_t address, std::size_t bytes) const;
+    std::uint64_t NewestWriteProgram(std::uint64_t address, std::size_t bytes) const;
     struct PendingWrite {
         std::uint64_t begin;
         std::uint64_t end;
@@ -563,6 +564,7 @@ private:
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;
         std::vector<std::int64_t> writeWords;
+        std::vector<std::uint64_t> writePrograms;
         // In-place reads (see NotePendingRead), dying with the batch: a finished batch's reads are done.
         struct Read {
             std::uint64_t begin;

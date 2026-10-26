@@ -231,6 +231,8 @@ struct PacketTag {
 constexpr std::uint32_t NoPacket = 0xfffffffeu;
 void SetCurrentPacket(std::uint32_t opcode, std::uint32_t queue);
 PacketTag CurrentPacket();
+void SetCurrentProgram(std::uint64_t address);
+std::uint64_t CurrentProgram();
 
 // Store: a CPU write (Write/WriteChanged) rather than a read; a hook sync made for one orders a
 // write after a pending GPU write, so whether the bytes change says nothing about its necessity.

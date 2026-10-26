@@ -12,12 +12,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -514,12 +516,92 @@ DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized
 
 DccKeys currentDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized);
 
+struct KeySpeculation {
+    std::uint64_t observations = 0;
+    std::uint64_t uses = 0;
+    std::chrono::steady_clock::time_point firstSeen{};
+    bool banned = false;
+};
+
+struct KeySpeculations {
+    AgcDriver::Mutex mutex;
+    std::map<std::tuple<std::uint64_t, std::uint64_t, std::size_t>, KeySpeculation> writers;
+    std::map<std::pair<std::uint64_t, std::size_t>, std::uint64_t> lastWriter;
+    std::uint64_t speculated = 0;
+    std::uint64_t verified = 0;
+    std::uint64_t failed = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+KeySpeculations& Speculations() {
+    static KeySpeculations speculations;
+    return speculations;
+}
+
+bool SpeculateKeys() {
+    static const bool speculate = std::getenv("APS5_SPECULATE_DCC_KEYS") != nullptr;
+    return speculate;
+}
+
+constexpr std::uint64_t SpeculationObservations = 256;
+constexpr auto SpeculationSpan = std::chrono::seconds(5);
+constexpr std::uint64_t SpeculationVerifyEvery = 16;
+
+bool SpeculatesNotClear(const Recorder& recorder, std::uint64_t metaAddress, std::size_t count, bool use) {
+    if (!SpeculateKeys()) return false;
+    const auto program = recorder.NewestWriteProgram(metaAddress, count);
+    auto& speculations = Speculations();
+    std::lock_guard lock(speculations.mutex);
+    if (program != 0) speculations.lastWriter[{metaAddress, count}] = program;
+    const auto found = speculations.writers.find({program, metaAddress, count});
+    if (program == 0 || found == speculations.writers.end()) return false;
+    auto& writer = found->second;
+    if (writer.banned || writer.observations < SpeculationObservations || std::chrono::steady_clock::now() - writer.firstSeen < SpeculationSpan) return false;
+    if (!use) return true;
+    if (++writer.uses % SpeculationVerifyEvery == 0) {
+        ++speculations.verified;
+        return false;
+    }
+    ++speculations.speculated;
+    return true;
+}
+
+void NoteKeysOutcome(std::uint64_t metaAddress, std::size_t count, bool notClear) {
+    if (!SpeculateKeys()) return;
+    auto& speculations = Speculations();
+    std::lock_guard lock(speculations.mutex);
+    const auto last = speculations.lastWriter.find({metaAddress, count});
+    if (last == speculations.lastWriter.end()) return;
+    auto& writer = speculations.writers[{last->second, metaAddress, count}];
+    if (writer.observations == 0) writer.firstSeen = std::chrono::steady_clock::now();
+    if (notClear) {
+        ++writer.observations;
+    } else if (!writer.banned) {
+        writer.banned = true;
+        if (writer.observations >= SpeculationObservations) {
+            ++speculations.failed;
+            std::fprintf(stderr, "[dcc-speculate] keys at 0x%llx+0x%zx written by program 0x%llx read as a uniform clear after %llu uses spoken for as not clear; speculation off for the pair\n", static_cast<unsigned long long>(metaAddress), count, static_cast<unsigned long long>(last->second), static_cast<unsigned long long>(writer.uses));
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (!ScanProfileEnabled() || now - speculations.reported < std::chrono::seconds(10)) return;
+    speculations.reported = now;
+    std::size_t active = 0;
+    for (const auto& [key, entry] : speculations.writers) active += !entry.banned && entry.observations >= SpeculationObservations ? 1u : 0u;
+    std::fprintf(stderr, "[dcc-speculate] (cumulative) %llu key waits answered as not a uniform clear, %llu verified by waiting, %llu writer and range pairs proved wrong, %zu pairs tracked, %zu speculated\n", static_cast<unsigned long long>(speculations.speculated), static_cast<unsigned long long>(speculations.verified), static_cast<unsigned long long>(speculations.failed), speculations.writers.size(), active);
+}
+
 DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t guestBytes, bool& memoized) {
     memoized = false;
     if (resource.dccAddress == 0) return DccKeys::Uncompressed;
     DccKeys keys;
+    bool observed = false;
     if (const auto known = WaitForKeyWriters(resource, guestBytes)) keys = *known;
-    else keys = currentDccKeys(resource.dccAddress, DccKeyBytes(guestBytes), memoized);
+    else {
+        keys = currentDccKeys(resource.dccAddress, DccKeyBytes(guestBytes), memoized);
+        observed = true;
+    }
+    if (observed) NoteKeysOutcome(resource.dccAddress, static_cast<std::size_t>(guestBytes / KeyBytes), !IsDccClear(keys));
     if (keys == DccKeys::Uncompressed || (keys == DccKeys::ClearSingle && SingleKeysReadable(resource))) return keys;
     if (IsConvertedTextureFormat(resource.format) && (keys == DccKeys::Clear0001 || keys == DccKeys::Clear1110)) throw std::runtime_error(std::string("AGC graphics: DCC clear code ") + DccKeysName(keys) + " of converted texture format " + std::to_string(resource.format) + " is not implemented");
     std::byte probe[16]{};
@@ -869,7 +951,7 @@ bool DccKeyWritersPending(std::uint64_t metaAddress, std::size_t count) {
 bool DccKeyWriterNeedsSync(std::uint64_t metaAddress, std::size_t count) {
     if (metaAddress == 0 || count == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
     auto* recorder = Recorder::Active();
-    return recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count) && !PendingStoreKeys(*recorder, metaAddress, count).has_value();
+    return recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count) && !PendingStoreKeys(*recorder, metaAddress, count).has_value() && !SpeculatesNotClear(*recorder, metaAddress, count, false);
 }
 
 std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes) {
@@ -891,6 +973,7 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
         waits.fillsUncompressed.fetch_add(1, std::memory_order_relaxed);
         return DccKeys::Uncompressed;
     }
+    if (SpeculatesNotClear(*recorder, metaAddress, count, true)) return DccKeys::Uncompressed;
     waits.synced.fetch_add(1, std::memory_order_relaxed);
     Recorder::CountSync(2);
     recorder->SyncThrough(metaAddress, count);

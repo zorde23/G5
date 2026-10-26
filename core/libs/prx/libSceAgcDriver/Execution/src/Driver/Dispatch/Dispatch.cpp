@@ -86,6 +86,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     PerformanceTimer timing("Driver.Dispatch");
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     if (SkippedShader(address)) return;
+    GuestMemory::SetCurrentProgram(address);
     auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
     if (!registeredShader) registeredShader = ReadRawShader(address);
     const auto& snapshot = *registeredShader;

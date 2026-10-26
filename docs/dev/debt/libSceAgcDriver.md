@@ -275,5 +275,6 @@
 
 ### Opt-in draw paths
 
+- [`APS5_SPECULATE_DCC_KEYS`](../../../core/libs/prx/libSceAgcDriver/Graphics/src/DccMetadata.cpp) - opt-in. It answers a sampled texture whose keys a known dispatch program is still writing as not cleared from that program's past results over the range, not from the keys it writes. If the program starts storing a uniform clear there, up to 15 reads take the stored texels instead of the clear color before a checking read turns the speculation off. Closes when: the keys a dispatch writes are known from the program instead of from its past results.
 - [Moved data words in the draw upload chunk](../../../core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp) (`APS5_UPLOAD_MOVED_WORDS`) - opt-in. A shader read past the bound range of such a buffer can return other draws' words from the shared chunk on a device with plain `robustBufferAccess` (without `robustBufferAccess2`); the default path binds a buffer of exactly the words. Closes when: the recompiler bounds-checks data-role loads, or the device has `robustBufferAccess2`.
 - [Draw finisher](../../../core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawPipeline.cpp) (`APS5_DRAW_PIPELINE`) - opt-in. The Linux main-image page table it adds matches what Windows already does by default.

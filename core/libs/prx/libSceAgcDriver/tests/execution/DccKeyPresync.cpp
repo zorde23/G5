@@ -15,6 +15,7 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +25,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -154,7 +156,9 @@ void Reset(const Scenario& scenario) {
 void RecordKeyCopy(AgcDriver::VulkanDevice& device, const Scenario& scenario) {
     const auto copy = Compile(device, CopyKeysCode, scenario.copyData);
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    AgcDriver::GuestMemory::SetCurrentProgram(reinterpret_cast<std::uintptr_t>(CopyKeysCode.data()));
     device.Dispatch(copy, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(CopyKeysCode.data()));
+    AgcDriver::GuestMemory::SetCurrentProgram(0);
     Require(AgcDriver::Graphics::DccKeyWritersPending(AddressOf(scenario.keys), KeyBytes), "a recorded kernel that copies data over the keys is not seen as a pending key writer");
 }
 
@@ -263,9 +267,53 @@ void RunNoWriter(AgcDriver::VulkanDevice& device, const Scenario& scenario) {
     device.WaitIdle();
 }
 
+bool SampledStored(const Scenario& scenario) {
+    return std::none_of(scenario.output, scenario.output + Threads * 4u, [](std::uint32_t value) { return value == 0u || value == 0xdeadbeefu; });
 }
 
-int main() {
+bool SampledClear(const Scenario& scenario) {
+    return std::all_of(scenario.output, scenario.output + Threads * 4u, [](std::uint32_t value) { return value == 0u; });
+}
+
+bool SampleBehindKeyCopy(AgcDriver::VulkanDevice& device, const Scenario& scenario, bool mixed) {
+    Reset(scenario);
+    if (mixed) for (std::size_t i = 0; i < KeyBytes; ++i) scenario.source[i] = (i & 1u) != 0 ? 0xffu : 0x00u;
+    RecordKeyCopy(device, scenario);
+    const auto sample = Compile(device, SampleSecondTexelCode, scenario.sampleData);
+    const auto before = AgcDriver::VulkanDevice::PresyncCounts();
+    auto prepared = device.PrepareDispatch(sample, {}, Threads, reinterpret_cast<std::uintptr_t>(SampleSecondTexelCode.data()));
+    const bool waited = AgcDriver::VulkanDevice::PresyncCounts().keyWaits != before.keyWaits;
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    device.Dispatch(sample, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(SampleSecondTexelCode.data()), std::move(prepared));
+    device.WaitIdle();
+    return waited;
+}
+
+void RunSpeculatedKeys(AgcDriver::VulkanDevice& device, const Scenario& scenario) {
+    for (int round = 0; round < 256; ++round) {
+        Require(SampleBehindKeyCopy(device, scenario, true), "stage A did not wait for mixed keys before their writer was seen 256 times not to store a clear");
+        Require(SampledStored(scenario), "a texture behind mixed keys was not read as stored");
+    }
+    Require(SampleBehindKeyCopy(device, scenario, true), "stage A did not wait for mixed keys seen for less than 5 s");
+    std::this_thread::sleep_for(std::chrono::milliseconds(5100));
+    Require(!SampleBehindKeyCopy(device, scenario, true), "stage A still waited for keys whose writer was seen 256 times over 5 s not to store a clear");
+    Require(SampledStored(scenario), "a texture whose mixed keys were spoken for was not read as stored");
+    int cleared = -1;
+    for (int round = 0; round < 16; ++round) {
+        SampleBehindKeyCopy(device, scenario, false);
+        if (SampledClear(scenario)) {
+            cleared = round;
+            break;
+        }
+    }
+    Require(cleared >= 0, "keys that turned into a clear were spoken for as not a clear for more than 16 dispatches");
+    SampleBehindKeyCopy(device, scenario, false);
+    Require(SampledClear(scenario), "keys proved to be a clear were spoken for again");
+}
+
+}
+
+int main(int argc, char** argv) {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
@@ -285,6 +333,12 @@ int main() {
         if (!CanFillKeys(*device, control)) {
             std::puts("skipped, host imports are unavailable: the key writers of the test are copied writers");
             return VulkanTestSkipped;
+        }
+        if (argc > 1 && std::string(argv[1]) == "--speculate") {
+            RunLockedSync(*device, control);
+            RunSpeculatedKeys(*device, changed);
+            std::puts("DCC key pre-sync tests passed");
+            return 0;
         }
         RunLockedSync(*device, control);
         RunPresync(*device, changed);
