@@ -15,6 +15,7 @@
 #include "IntermediateRepresentation/IrMetadata/BufferFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "ThreadOwned.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -689,6 +690,16 @@ std::atomic<bool>& anyGuarded() {
     return any;
 }
 
+std::atomic<std::uint64_t>& guardedVersion() {
+    static std::atomic<std::uint64_t> version{1};
+    return version;
+}
+
+void publishGuarded(bool any) {
+    anyGuarded().store(any, std::memory_order_release);
+    guardedVersion().fetch_add(1, std::memory_order_release);
+}
+
 void guardReads(std::uint64_t address, std::size_t bytes) {
     RequireNoMultisampleTarget(address, bytes, "a CPU read");
 }
@@ -734,7 +745,7 @@ void retireUnmapped(std::uintptr_t address, std::size_t bytes) {
         return true;
     });
     std::erase_if(guarded(), [](const auto& range) { return range.metadataValid && !range.active->load(std::memory_order_acquire); });
-    anyGuarded().store(!guarded().empty(), std::memory_order_release);
+    publishGuarded(!guarded().empty());
 }
 
 void guard(const Context& context, const ColorTarget& target, const std::shared_ptr<std::atomic<bool>>& active, const std::shared_ptr<std::atomic<bool>>& metadataValid, const std::shared_ptr<std::atomic<bool>>& hostOnly) {
@@ -755,7 +766,7 @@ void guard(const Context& context, const ColorTarget& target, const std::shared_
         if (target.cmaskAddress != 0) guarded().push_back({context.device, target.cmaskAddress, target.cmaskBytes, target.samples, active, metadataValid, hostOnly});
         if (target.samples == 8u && target.fmaskAddress != 0u && target.cmaskAddress != 0u) guarded().push_back({context.device, target.fmaskAddress, DescribeSurface(fmaskResource(target)).guestBytes, target.samples, active, metadataValid, hostOnly});
     }
-    anyGuarded().store(true, std::memory_order_release);
+    publishGuarded(true);
     InstallResidentImageReadGuard_nid_no_patch();
 }
 
@@ -792,7 +803,7 @@ MultisampleTarget& acquire(const Context& context, const ColorTarget& requested)
                 std::unique_lock lock(guardedMutex());
                 if (!target->active->load(std::memory_order_acquire)) continue;
                 std::erase_if(guarded(), [&](const auto& range) { return range.active == target->active; });
-                anyGuarded().store(!guarded().empty(), std::memory_order_release);
+                publishGuarded(!guarded().empty());
             }
             target->Recreate(use);
             target->hostOnly->store(true, std::memory_order_release);
@@ -1342,7 +1353,7 @@ void ClearMultisampleTargets(VkDevice device) {
     std::erase_if(targets(), [&](const auto& target) { return target->context.device == device; });
     std::unique_lock guardLock(guardedMutex());
     std::erase_if(guarded(), [&](const auto& range) { return range.device == device; });
-    anyGuarded().store(!guarded().empty(), std::memory_order_release);
+    publishGuarded(!guarded().empty());
     UpdateResidentImageUnmapObserver_nid_no_patch();
 }
 
@@ -1351,8 +1362,10 @@ void GuardOneFragmentFmask(const Context& context, const ColorTarget& target) {
     const auto bytes = std::max<std::uint64_t>((bits / 8u + 0xffffu) & ~0xffffull, 0x10000u);
     std::unique_lock lock(guardedMutex());
     const bool known = std::ranges::any_of(guarded(), [&](const auto& range) { return range.fmask && range.device == context.device && range.address == target.fmaskAddress && range.bytes == bytes; });
-    if (!known) guarded().push_back({context.device, target.fmaskAddress, bytes, target.coverageSamples, std::make_shared<std::atomic<bool>>(true), nullptr, std::make_shared<std::atomic<bool>>(true), true});
-    anyGuarded().store(true, std::memory_order_release);
+    if (!known) {
+        guarded().push_back({context.device, target.fmaskAddress, bytes, target.coverageSamples, std::make_shared<std::atomic<bool>>(true), nullptr, std::make_shared<std::atomic<bool>>(true), true});
+        publishGuarded(true);
+    }
     lock.unlock();
     InstallResidentImageReadGuard_nid_no_patch();
 }
@@ -1374,6 +1387,15 @@ void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, c
         std::snprintf(text, sizeof(text), "AGC graphics: %s of 0x%llx+0x%zx overlaps multisampled color target 0x%llx+0x%llx (%u samples), whose samples are only on the host: guest access to it is not implemented", access, static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(range.address), static_cast<unsigned long long>(range.bytes), range.samples);
         throw std::runtime_error(text);
     };
+    thread_local std::uint64_t seenVersion = 0;
+    thread_local std::vector<GuardedRange>* seenSlot = nullptr;
+    auto& seen = ShaderRecompiler::ThreadOwned(seenSlot);
+    if (guardedVersion().load(std::memory_order_acquire) != seenVersion) {
+        std::shared_lock lock(guardedMutex());
+        seen = guarded();
+        seenVersion = guardedVersion().load(std::memory_order_relaxed);
+    }
+    if (std::none_of(seen.begin(), seen.end(), overlaps)) return;
     {
         std::shared_lock lock(guardedMutex());
         bool retirable = false;
@@ -1393,7 +1415,7 @@ void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, c
     }
     for (const auto& active : retired) active->store(false, std::memory_order_release);
     std::erase_if(guarded(), [&](const auto& range) { return std::find(retired.begin(), retired.end(), range.active) != retired.end(); });
-    anyGuarded().store(!guarded().empty(), std::memory_order_release);
+    publishGuarded(!guarded().empty());
 }
 
 }
