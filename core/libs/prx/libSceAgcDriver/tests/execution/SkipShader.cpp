@@ -42,7 +42,7 @@ void Dispatch(const std::array<std::uint32_t, 7>& code, std::array<std::uint32_t
 int main() {
     try {
         char value[32];
-        std::snprintf(value, sizeof(value), "1,%llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(Skipped.data())));
+        std::snprintf(value, sizeof(value), "%llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(Skipped.data())));
 #ifdef _WIN32
         Require(_putenv_s("APS5_SKIP_SHADER", value) == 0, "cannot set APS5_SKIP_SHADER");
 #else

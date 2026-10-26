@@ -10,7 +10,7 @@ namespace AgcDriver::DriverDetail {
 
 double TraceMs();
 
-bool ShaderSkipped(std::uint64_t address);
+bool SkippedShader(std::uint64_t address);
 
 class RefusedDraw final : public std::runtime_error {
 public:
