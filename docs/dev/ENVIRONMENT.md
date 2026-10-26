@@ -562,6 +562,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 
 | Name | Kind | Source | Default | Description |
 |------|------|--------|---------|-------------|
+| `APS5_ARM_SHARED_IMPORTS` | presence | `core/libs/prx/libc/include/WindowsMappings.hpp` |  | on Windows, leaves shared guest pages imported for the GPU armed (write-protected) instead of marking them to be compared, so guest stores into them fault and are resumed; turns on `APS5_RED_ZONE_GUARD` unless `APS5_RED_ZONE_GUARD` is `0` |
 | `APS5_CRASH_INDIRECT_MEMORY` | presence | `core/libs/prx/libc/src/specifics/windows/CrashReport.cpp` |  | adds to the Windows crash report up to 64 bytes from each pointer in the dump of the words the registers point at, as `[[reg+off]] @addr` lines; off when unset or empty |
 | `APS5_CRASH_STACK_BYTES` | integer | `core/libs/prx/libc/src/specifics/windows/CrashReport.cpp` | 0 | bytes of the faulting thread's stack from rsp, decimal or 0x hexadecimal and at most 1048576, that the Windows crash report prints with the data at the stack words pointing outside the stack; 0 prints none |
 | `APS5_HANG_DUMP_SECS` | integer | `core/libs/prx/libc/src/specifics/windows/CrashReport.cpp` |  | seconds after which a watchdog dumps all threads and aborts |

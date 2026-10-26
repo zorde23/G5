@@ -255,6 +255,8 @@ public:
     }
 
     void CompareWhenShared(std::uintptr_t address, std::size_t bytes, bool residentOnly = false) {
+        static const bool armShared = std::getenv("APS5_ARM_SHARED_IMPORTS") != nullptr;
+        if (armShared) return;
         std::lock_guard lock(mutex);
         collectableRanges.clear();
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
