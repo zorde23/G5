@@ -216,6 +216,9 @@ private:
     bool float16Binary(const RdnaInstruction& inst, IrOpcode opcode, bool reverse);
     bool float16Ternary(const RdnaInstruction& inst, IrOpcode opcode, bool accumulator, bool mix);
     bool float16Native(const RdnaInstruction& inst, IrOpcode opcode, const RdnaOperand& lhsOperand, const RdnaOperand& rhsOperand);
+    bool float16NativeFma(const RdnaInstruction& inst, bool accumulator);
+    IrU32 nativeF16Overflow(IrU32 lane, std::span<const IrU32> sources);
+    IrU32 propagateF16Nans(IrU32 lane, std::span<const IrU32> sources);
     IrF32 fmaF16RoundedToOdd(IrF32 lhs, IrF32 rhs, IrF32 addend);
     bool floatUnary(const RdnaInstruction& inst, IrOpcode opcode);
     bool floatBinary(const RdnaInstruction& inst, IrOpcode opcode, bool reverse);

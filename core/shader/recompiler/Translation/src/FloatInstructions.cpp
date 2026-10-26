@@ -2,12 +2,48 @@
 #include "Translation/TranslationContext.hpp"
 #include <array>
 #include <cstdint>
+#include <cstdlib>
+#include <span>
 #include <stdexcept>
 
 namespace ShaderRecompiler {
 
 void TranslateFloatInstruction(IrBuilder& builder, const RdnaInstruction& instruction) {
     throw std::runtime_error("TranslateFloatInstruction not implemented");
+}
+
+namespace {
+
+bool NativeF16Fma() {
+    static const bool enabled = std::getenv("APS5_NATIVE_F16_FMA") != nullptr;
+    return enabled;
+}
+
+}
+
+IrU32 TranslationContext::nativeF16Overflow(IrU32 lane, std::span<const IrU32> sources) {
+    const auto magnitude = [&](const IrU32& bits) { return IrU32(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffu))); };
+    IrU1 overflow(ir.IEqual(magnitude(lane).Value(), ir.Constant(0x7c00u)));
+    for (const auto& source : sources) {
+        overflow = IrU1(ir.LogicalAnd(overflow.Value(), ir.INotEqual(magnitude(source).Value(), ir.Constant(0x7c00u))));
+    }
+    return IrU32(ir.Select(overflow.Value(), ir.BitwiseOr(ir.BitwiseAnd(lane.Value(), ir.Constant(0x8000u)), ir.Constant(0x7bffu)), lane.Value()));
+}
+
+IrU32 TranslationContext::propagateF16Nans(IrU32 lane, std::span<const IrU32> sources) {
+    const auto magnitude = [&](const IrU32& bits) { return IrU32(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffu))); };
+    const auto isNan = [&](const IrU32& bits) { return IrU1(ir.UGreaterThan(magnitude(bits).Value(), ir.Constant(0x7c00u))); };
+    const auto quiet = [&](const IrU32& bits) { return ieeeMode ? IrU32(ir.BitwiseOr(bits.Value(), ir.Constant(0x0200u))) : bits; };
+    const auto infZero = [&](const IrU32& inf, const IrU32& zero) {
+        return IrU1(ir.LogicalAnd(ir.IEqual(magnitude(inf).Value(), ir.Constant(0x7c00u)), ir.IEqual(magnitude(zero).Value(), ir.Constant(0u))));
+    };
+    lane = IrU32(ir.Select(isNan(lane).Value(), ir.Constant(0xfe00u), lane.Value()));
+    for (std::size_t index = sources.size(); index-- > 0u;) {
+        IrU1 selected = isNan(sources[index]);
+        if (index == 2u) selected = IrU1(ir.LogicalAnd(selected.Value(), ir.LogicalNot(ir.LogicalOr(infZero(sources[0], sources[1]).Value(), infZero(sources[1], sources[0]).Value()))));
+        lane = IrU32(ir.Select(selected.Value(), quiet(sources[index]).Value(), lane.Value()));
+    }
+    return lane;
 }
 
 bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opcode, bool accumulator, bool quietSnan) {
@@ -59,10 +95,14 @@ bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opc
         return sourceBits[index][lane];
     };
     const auto minMaxLane = [&](bool high) { return minMaxF16Bits(opcode == IrOpcode::FPMax32, sourceLaneBits(0u, high), sourceLaneBits(1u, high)); };
-    const bool native = nativeFloat16 && !flushResults && inst.destination.omod == 0u && (opcode == IrOpcode::FPAdd32 || opcode == IrOpcode::FPMul32);
+    const bool native = nativeFloat16 && !flushResults && inst.destination.omod == 0u && (opcode == IrOpcode::FPAdd32 || opcode == IrOpcode::FPMul32 || (NativeF16Fma() && opcode == IrOpcode::FPFma32 && nativeFloat16Mode()));
     const auto nativeResult = [&]() {
         const IrU32 lhs = packU16Lanes(sourceLaneBits(0u, false), sourceLaneBits(0u, true));
         const IrU32 rhs = packU16Lanes(sourceLaneBits(1u, false), sourceLaneBits(1u, true));
+        if (opcode == IrOpcode::FPFma32) {
+            const IrU32 addend = packU16Lanes(sourceLaneBits(2u, false), sourceLaneBits(2u, true));
+            return IrU32(ir.Emit(IrOpcode::FPFma16x2, IrType::U32, {&lhs.Value(), &rhs.Value(), &addend.Value()}));
+        }
         return IrU32(ir.Emit(opcode == IrOpcode::FPAdd32 ? IrOpcode::FPAdd16x2 : IrOpcode::FPMul16x2, IrType::U32, {&lhs.Value(), &rhs.Value()}));
     };
     IrU32 result = quietSnan ? packU16Lanes(minMaxLane(false), minMaxLane(true)) : native ? nativeResult() : packHalf2x16(translateLane(false), translateLane(true));
@@ -74,13 +114,6 @@ bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opc
             return IrU1(ir.LogicalAnd(isNan(bits).Value(), ir.IEqual(ir.BitwiseAnd(bits.Value(), ir.Constant(0x0200u)), ir.Constant(0u))));
         };
         const auto quiet = [&](const IrU32& bits) { return ieeeMode ? IrU32(ir.BitwiseOr(bits.Value(), ir.Constant(0x0200u))) : bits; };
-        const auto magnitude = [&](const IrU32& bits) { return IrU32(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffu))); };
-        const auto invalidProduct = [&](const IrU32& lhs, const IrU32& rhs) {
-            const auto infZero = [&](const IrU32& inf, const IrU32& zero) {
-                return IrU1(ir.LogicalAnd(ir.IEqual(magnitude(inf).Value(), ir.Constant(0x7c00u)), ir.IEqual(magnitude(zero).Value(), ir.Constant(0u))));
-            };
-            return IrU1(ir.LogicalOr(infZero(lhs, rhs).Value(), infZero(rhs, lhs).Value()));
-        };
         const auto nanLane = [&](bool high) {
             const std::uint32_t count = accumulator ? 3u : inst.sourceCount;
             std::array<IrU32, 3> bits{};
@@ -89,13 +122,7 @@ bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opc
             }
             IrU32 lane(high ? ir.ShiftRightLogical(result.Value(), ir.Constant(16u)) : ir.BitwiseAnd(result.Value(), ir.Constant(0xffffu)));
             if (native && inst.destination.clamp && dx10Clamp()) return lane;
-            if (native && fp16Overflow()) {
-                IrU1 overflow(ir.IEqual(magnitude(lane).Value(), ir.Constant(0x7c00u)));
-                for (std::uint32_t index = 0u; index < count; ++index) {
-                    overflow = IrU1(ir.LogicalAnd(overflow.Value(), ir.INotEqual(magnitude(bits[index]).Value(), ir.Constant(0x7c00u))));
-                }
-                lane = IrU32(ir.Select(overflow.Value(), ir.BitwiseOr(ir.BitwiseAnd(lane.Value(), ir.Constant(0x8000u)), ir.Constant(0x7bffu)), lane.Value()));
-            }
+            if (native && fp16Overflow()) lane = nativeF16Overflow(lane, std::span<const IrU32>(bits.data(), count));
             if (quietSnan) {
                 lane = IrU32(ir.Select(isNan(bits[0]).Value(), bits[1].Value(), lane.Value()));
                 lane = IrU32(ir.Select(isNan(bits[1]).Value(), bits[0].Value(), lane.Value()));
@@ -105,13 +132,7 @@ bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opc
                 }
                 return lane;
             }
-            lane = IrU32(ir.Select(isNan(lane).Value(), ir.Constant(0xfe00u), lane.Value()));
-            for (std::uint32_t index = count; index-- > 0u;) {
-                IrU1 selected = isNan(bits[index]);
-                if (index == 2u) selected = IrU1(ir.LogicalAnd(selected.Value(), ir.LogicalNot(invalidProduct(bits[0], bits[1]).Value())));
-                lane = IrU32(ir.Select(selected.Value(), quiet(bits[index]).Value(), lane.Value()));
-            }
-            return lane;
+            return propagateF16Nans(lane, std::span<const IrU32>(bits.data(), count));
         };
         const auto clampedLane = [&](bool high) { return inst.destination.clamp ? clampF16Bits(inst.destination, nanLane(high)) : nanLane(high); };
         result = packU16Lanes(clampedLane(false), clampedLane(true));
@@ -268,6 +289,7 @@ bool TranslationContext::float16Ternary(const RdnaInstruction& inst, IrOpcode op
     if (mix && floatMode.has_value() && (floatMode->floatMode & 0xc0u) != 0xc0u) {
         throw std::runtime_error("v_fma_mixlo/mixhi_f16 at pc " + std::to_string(inst.programCounter) + " in FLOAT_MODE " + std::to_string(floatMode->floatMode) + " (f16 denormals not kept) is not implemented");
     }
+    if (opcode == IrOpcode::FPFma32 && !mix && NativeF16Fma() && nativeFloat16Mode() && inst.destination.omod == 0u) return float16NativeFma(inst, accumulator);
     const bool measured = opcode == IrOpcode::FPFma32 && !mix && floatMode.has_value() && (floatMode->floatMode & 0x0cu) == 0u;
     std::array<IrValue*, 3> args{};
     for (std::uint32_t index = 0u; index < args.size(); ++index) {
@@ -310,6 +332,21 @@ bool TranslationContext::float16Native(const RdnaInstruction& inst, IrOpcode opc
         result = IrU32(ir.Select(overflow.Value(), ir.BitwiseOr(ir.BitwiseAnd(result.Value(), ir.Constant(0x8000u)), ir.Constant(0x7bffu)), result.Value()));
     }
     write16Bits(inst.destination, clampF16Bits(inst.destination, result));
+    return true;
+}
+
+bool TranslationContext::float16NativeFma(const RdnaInstruction& inst, bool accumulator) {
+    std::array<IrU32, 3> bits{};
+    for (std::uint32_t index = 0u; index < bits.size(); ++index) {
+        bits[index] = readF16Bits(accumulator && index == 2u ? accumulatorOperand(inst) : sourceAt(inst, index));
+    }
+    const IrU32 fused(ir.Emit(IrOpcode::FPFma16x2, IrType::U32, {&bits[0].Value(), &bits[1].Value(), &bits[2].Value()}));
+    IrU32 lane(ir.BitwiseAnd(fused.Value(), ir.Constant(0xffffu)));
+    if (!inst.destination.clamp || !dx10Clamp()) {
+        if (fp16Overflow()) lane = nativeF16Overflow(lane, bits);
+        lane = propagateF16Nans(lane, bits);
+    }
+    write16Bits(inst.destination, clampF16Bits(inst.destination, lane));
     return true;
 }
 

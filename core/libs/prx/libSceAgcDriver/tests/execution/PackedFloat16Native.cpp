@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <iostream>
 #include <iterator>
@@ -74,6 +75,12 @@ std::uint32_t Next() {
     z = (z ^ (z >> 27u)) * 0x94d049bb133111ebull;
     return static_cast<std::uint32_t>(z ^ (z >> 31u));
 }
+
+constexpr std::array<std::array<std::uint32_t, 3>, 12> EdgeCases{{
+    {0x3c01u, 0x3c01u, 0xbc02u}, {0x4248u, 0x4248u, 0xc6a9u}, {0x7800u, 0x4000u, 0xf800u}, {0x7bffu, 0x7bffu, 0xfbffu},
+    {0x7800u, 0x4000u, 0xfc00u}, {0x3c00u, 0x3c00u, 0x7c00u}, {0x7800u, 0x4000u, 0x7c00u}, {0x0001u, 0x0001u, 0x8000u},
+    {0x7c00u, 0x0000u, 0x3c00u}, {0x0400u, 0x3800u, 0x8200u}, {0x5bffu, 0x5bffu, 0xfbffu}, {0xd8ffu, 0x58ffu, 0x7bffu},
+}};
 
 std::uint32_t Half() {
     const std::uint32_t bits = Next();
@@ -182,6 +189,7 @@ int main() {
             return Output;
         };
 
+        const bool nativeFma = std::getenv("APS5_NATIVE_F16_FMA") != nullptr;
         std::uint64_t compared = 0u;
         for (const auto& mode : Modes) {
             const auto native = compile(target, mode);
@@ -189,10 +197,14 @@ int main() {
             const F16x2Math nativeMath = FindF16x2Math(native.spirv.Words());
             const F16x2Math emulatedMath = FindF16x2Math(emulated.spirv.Words());
             Require(nativeMath.add && nativeMath.mul, std::string("packed f16 native: ") + mode.name + " does not use f16vec2 add and mul");
-            Require(!nativeMath.fma, std::string("packed f16 native: ") + mode.name + " uses an f16vec2 Fma, which Vulkan does not require to be fused");
+            Require(nativeMath.fma == nativeFma, std::string("packed f16 native: ") + mode.name + (nativeMath.fma ? " uses an f16vec2 Fma, which Vulkan does not require to be fused, without APS5_NATIVE_F16_FMA" : " does not use an f16vec2 Fma under APS5_NATIVE_F16_FMA"));
             Require(!emulatedMath.add && !emulatedMath.mul && !emulatedMath.fma, std::string("packed f16 native: ") + mode.name + " uses f16vec2 math without Float16");
             for (std::uint32_t batch = 0; batch < Batches; ++batch) {
                 for (auto& word : Input) word = Half() | (Half() << 16u);
+                for (std::uint32_t tid = 0; batch == 0u && tid < Threads; ++tid) {
+                    const auto& edge = EdgeCases[tid % EdgeCases.size()];
+                    for (std::uint32_t input = 0; input < edge.size(); ++input) Input[tid * Inputs + input] = edge[input] | (edge[input] << 16u);
+                }
                 const auto nativeOutput = run(native);
                 const auto emulatedOutput = run(emulated);
                 for (std::uint32_t tid = 0; tid < Threads; ++tid) {
