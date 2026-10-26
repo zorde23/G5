@@ -36,6 +36,7 @@ struct ConvertedExecutable {
     std::string Diagnostics;
     std::vector<Relinker::GamePatch::AppliedPatch> AppliedPatches;
     std::optional<std::uint64_t> LinuxBase;
+    std::string RedZoneTable;
 };
 
 ConvertedExecutable Convert(const Cli::Args& args, const std::string& inputPath, const std::string& absPath, const bool mainExecutable, const std::string& targetName, const std::vector<Relinker::GamePatch::PatchEntry>& patches, Cli::ConsoleProgress& progress) {
@@ -78,7 +79,7 @@ ConvertedExecutable Convert(const Cli::Args& args, const std::string& inputPath,
     for (const auto& module : input.Modules) progress.IncludeFile(Io::Utf8Path(module.Path));
     auto converted = Relinker::Conversion(progress).Convert(std::move(input), options);
     if (!args.skipSceModule) Cli::ReportUnconvertedNeeded(modules, converted.Analysis.DynamicSection.NeededLibraries, args.toWindows, std::cout);
-    return {inputPath, absPath, std::move(converted.Analysis), std::move(converted.Modules), std::move(converted.Executable), std::move(converted.WindowsDiagnostics), std::move(converted.AppliedPatches), converted.LinuxBase};
+    return {inputPath, absPath, std::move(converted.Analysis), std::move(converted.Modules), std::move(converted.Executable), std::move(converted.WindowsDiagnostics), std::move(converted.AppliedPatches), converted.LinuxBase, std::move(converted.RedZoneTable)};
 }
 
 class OutputIdentityDirectory {
@@ -394,11 +395,19 @@ int Run(const int argc, char* argv[]) {
         }
         for (const auto& artifact : guestArtifacts) checkOutputInputs(artifact.Path, "Guest module");
 
+        std::vector<std::pair<std::filesystem::path, const std::string*>> redZoneTables;
+        for (const auto& executable : executables)
+            if (!executable.RedZoneTable.empty()) redZoneTables.emplace_back(Io::NativePath(executable.OutputPath + ".redzone.txt"), &executable.RedZoneTable);
+        for (const auto& artifact : guestArtifacts)
+            if (!artifact.RedZoneTable.empty()) redZoneTables.emplace_back(Io::NativePath(Io::Utf8Path(artifact.Path) + ".redzone.txt"), &artifact.RedZoneTable);
+        for (const auto& [path, table] : redZoneTables) checkOutputInputs(path, "Red-zone table");
+
         std::vector<std::filesystem::path> outputPaths;
         for (const auto& executable : executables) outputPaths.push_back(Io::NativePath(executable.OutputPath));
         for (const auto& artifact : guestArtifacts) outputPaths.push_back(artifact.Path);
         outputPaths.insert(outputPaths.end(), registryPaths.begin(), registryPaths.end());
         outputPaths.insert(outputPaths.end(), neededPaths.begin(), neededPaths.end());
+        for (const auto& [path, table] : redZoneTables) outputPaths.push_back(path);
         if (!manifestPath.empty()) outputPaths.push_back(manifestPath);
         if (desktopEntry) {
             outputPaths.push_back(desktopEntry->IconPath);
@@ -444,6 +453,7 @@ int Run(const int argc, char* argv[]) {
                 fileWriter.Write(Io::Utf8Path(neededPaths[executables.size() + index]), registryWriter->WriteNeededLibraries(guestArtifacts[index].NeededLibraries));
             }
         }
+        for (const auto& [path, table] : redZoneTables) fileWriter.Write(Io::Utf8Path(path), *table);
         if (!manifestPath.empty()) fileWriter.Write(Io::Utf8Path(manifestPath), manifestText);
         progress.Finish();
         if (!manifestPath.empty()) std::cout << "Patch manifest: " << Io::Utf8Path(manifestPath) << '\n';

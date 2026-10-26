@@ -60,6 +60,7 @@ add_library(relinker_core STATIC
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/CallSiteResolver.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/CodeInstructionCollector.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/SceCodeExtent.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/RedZoneTable.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/RelativeJumpTables.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/UnusedNidFilter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/UnusedNidFilter/StrictNidFilter.cpp
@@ -315,6 +316,9 @@ if(BUILD_TESTING)
     add_test_executable(red_zone_framer_tests ${CMAKE_CURRENT_SOURCE_DIR}/codegen/tests/RedZoneFramerTests.cpp)
     target_link_libraries(red_zone_framer_tests PRIVATE relinker_core)
     add_test(NAME red_zone_framer COMMAND red_zone_framer_tests)
+    add_test_executable(red_zone_table_tests ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/RedZoneTableTests.cpp)
+    target_link_libraries(red_zone_table_tests PRIVATE relinker_core)
+    add_test(NAME red_zone_table COMMAND red_zone_table_tests)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
         add_test_executable(red_zone_framer_execution_tests ${CMAKE_CURRENT_SOURCE_DIR}/codegen/tests/RedZoneFramerExecutionTests.cpp)
         target_link_libraries(red_zone_framer_execution_tests PRIVATE relinker_core)

@@ -1,4 +1,5 @@
 #include <relinker/guest/GuestImage.hpp>
+#include <relinker/analysis/RedZoneTable.hpp>
 #include <relinker/analysis/RelativeJumpTables.hpp>
 #include <relinker/analysis/SceCodeExtent.hpp>
 #include <relinker/analysis/UnusedNidFilter/EhFrameReader.hpp>
@@ -431,6 +432,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
                 image.Bytes[header.Offset + offset + 1] = 0x0B;
             }
         }
+        auto redZoneTable = redZoneTables && windows ? RedZoneGuardTable(image.Bytes, image.Headers, image.Trampolines, nullptr) : std::string{};
         const auto relativeDirectory = appDirectory(image);
         const auto destination = outputDirectory / relativeDirectory;
         const auto target = destination / image.OutputName;
@@ -483,7 +485,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         std::vector<std::string> neededLibraries;
         for (const auto& name : image.Dependencies)
             if (findGuest(name) == guestNames.end()) neededLibraries.push_back(hostLibrary(name));
-        artifacts.push_back({target, std::move(output), std::move(imports), image.SourcePath, std::move(neededLibraries)});
+        artifacts.push_back({target, std::move(output), std::move(imports), image.SourcePath, std::move(neededLibraries), std::move(redZoneTable)});
         progress.Report({Domain::ProgressStage::Modules, Io::Utf8Path(image.SourcePath), artifacts.size(), order.size()});
     }
     return artifacts;

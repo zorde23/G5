@@ -71,6 +71,7 @@ struct GuestArtifact {
     std::vector<Domain::CallRegistryEntry> Imports;
     std::filesystem::path SourcePath;
     std::vector<std::string> NeededLibraries;
+    std::string RedZoneTable;
 };
 
 struct GuestModuleInput {
@@ -81,7 +82,11 @@ struct GuestModuleInput {
 
 class GuestModuleBuilder {
 public:
+    GuestModuleBuilder() = default;
+    explicit GuestModuleBuilder(bool redZoneTables) : redZoneTables(redZoneTables) {}
     std::vector<GuestArtifact> Build(const std::filesystem::path& inputPath, const std::filesystem::path& outputPath, Domain::SysVDynamicSection& dynamic, bool windows, bool macos, bool toIntel, bool toRosetta, ISyscallScanner& syscallScanner, bool lazyBinding, const std::string& runPath, const std::set<std::string>& excludedModules, const std::filesystem::path& root, const std::vector<std::filesystem::path>& runtimeDirectories, std::vector<GuestModuleInput> modules, Domain::IProgress& progress) const;
+private:
+    bool redZoneTables = false;
 };
 
 }

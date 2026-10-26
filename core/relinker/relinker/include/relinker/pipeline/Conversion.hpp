@@ -48,6 +48,7 @@ struct ConversionOutput {
     std::string WindowsDiagnostics;
     std::vector<GamePatch::AppliedPatch> AppliedPatches;
     std::optional<std::uint64_t> LinuxBase;
+    std::string RedZoneTable;
 };
 
 class Conversion {
