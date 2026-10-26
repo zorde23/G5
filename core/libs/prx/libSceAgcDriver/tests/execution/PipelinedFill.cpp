@@ -243,9 +243,39 @@ void SatisfiedWaitDrainsOverlappingQueuedWork() {
     Require(marker == 1, "a label after an overlapping WAIT_REG_MEM did not execute");
 }
 
+void FillAfterSatisfiedWaitKeepsQueuedWork() {
+    alignas(8) static std::uint32_t gate = 1;
+    Output.fill(0xcafebabeu);
+    Pattern = {0x3c3c3c3cu, 0, 0, 0};
+    Control = {256, 0, 0, 0};
+
+    Blocker blocker;
+    blocker.Enqueue();
+
+    const auto address = reinterpret_cast<std::uintptr_t>(&gate);
+    std::vector<std::uint32_t> words{
+        0xc0053c00u, 0x13u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u),
+        1u, 0xffffffffu, 0x19u};
+    AppendOutputFill(words);
+    Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
+    const auto drainsBefore = DrawPipeline::DrainRequestsByOpcode(0x15);
+    AgcDriver::Submit(&packet, 0);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (DrawPipeline::Queue0().Outstanding() < 2 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool keptQueued = DrawPipeline::Queue0().Outstanding() >= 2;
+    const bool drained = DrawPipeline::DrainRequestsByOpcode(0x15) > drainsBefore;
+    blocker.Release();
+    Finish();
+    blocker.Join();
+    Require(keptQueued && !drained, "a fill dispatch after a satisfied WAIT_REG_MEM drained the queued work with APS5_NO_QUEUE0_GATE_DRAIN set");
+    for (std::size_t i = 0; i < Output.size(); ++i) Require(Output[i] == (i < 256 ? 0x3c3c3c3cu : 0xcafebabeu), "a fill after a satisfied WAIT_REG_MEM did not land at " + std::to_string(i));
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
 #ifdef _WIN32
     _putenv_s("APS5_PIPELINED_DRAWS", "1");
 #else
@@ -255,6 +285,12 @@ int main() {
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
+        }
+        if (argc > 1 && std::string(argv[1]) == "--queue0-gate") {
+            FillAfterSatisfiedWaitKeepsQueuedWork();
+            AgcDriverShutdown_nid_postfix();
+            std::puts("pipelined fill tests passed");
+            return 0;
         }
         InputsAfterQueuedLabels();
         FillIntoFullPipeline();

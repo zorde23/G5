@@ -429,7 +429,7 @@ void Driver::execute(const Submission& submission) {
             if (gateOpened()) {
                 gateOpened() = false;
                 if (!pipelineDispatch() || submission.queue != 0) {
-                    if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
+                    if (pipelined && (queue0GateDrain() || submission.queue != 0 || opcode != 0x15) && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
                     timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
                 }
             }

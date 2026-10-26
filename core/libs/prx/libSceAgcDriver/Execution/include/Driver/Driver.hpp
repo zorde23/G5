@@ -148,6 +148,7 @@ private:
     static bool dataHits();
     static bool verifyDataHits();
     static bool pipelineDispatch();
+    static bool queue0GateDrain();
     static std::size_t dispatchVariants();
     static bool insertCompare();
     static std::size_t dispatchCacheEntries();
