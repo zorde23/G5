@@ -264,4 +264,5 @@
 
 ### Opt-in draw paths
 
+- [Moved data words in the draw upload chunk](../../../core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp) (`APS5_UPLOAD_MOVED_WORDS`) - opt-in. A shader read past the bound range of such a buffer can return other draws' words from the shared chunk on a device with plain `robustBufferAccess` (without `robustBufferAccess2`); the default path binds a buffer of exactly the words. Closes when: the recompiler bounds-checks data-role loads, or the device has `robustBufferAccess2`.
 - [Draw finisher](../../../core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawPipeline.cpp) (`APS5_DRAW_PIPELINE`) - opt-in. The Linux main-image page table it adds matches what Windows already does by default.
