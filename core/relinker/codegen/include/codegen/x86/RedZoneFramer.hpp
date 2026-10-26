@@ -16,6 +16,12 @@ struct RedZoneFunction {
     std::uint64_t End = 0;
 };
 
+struct RedZoneLeaf {
+    std::uint64_t Begin = 0;
+    std::uint64_t End = 0;
+    std::string Reason;
+};
+
 struct RedZoneFrameReport {
     std::size_t Functions = 0;
     std::size_t RedZoneFunctions = 0;
@@ -26,6 +32,7 @@ struct RedZoneFrameReport {
     std::size_t OperandStubs = 0;
     std::size_t StubbedOperands = 0;
     std::map<std::string, std::size_t> Skipped;
+    std::vector<RedZoneLeaf> Leaves;
 };
 
 struct RedZoneDisplacement {

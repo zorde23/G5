@@ -249,7 +249,10 @@ void frameSegment(
         const auto start = static_cast<std::size_t>(function.Begin - ph.MappedAddress);
         const auto limit = static_cast<std::size_t>(function.End - ph.MappedAddress);
         ++report.Functions;
-        const auto skip = [&](const char* reason) { ++report.Skipped[reason]; };
+        const auto skip = [&](const char* reason) {
+            ++report.Skipped[reason];
+            report.Leaves.push_back({function.Begin, function.End, reason});
+        };
 
         const std::vector<std::uint8_t> code(seg.begin() + static_cast<std::ptrdiff_t>(start), seg.begin() + static_cast<std::ptrdiff_t>(limit));
         std::vector<Insn> body;
@@ -415,6 +418,7 @@ void frameSegment(
         for (auto& stub : stubs) addSite(stub.Begin, stub.End, std::move(stub.Body));
         for (auto& [k, move] : moves) displacements.push_back({ph.Offset + move.first, std::move(move.second)});
         ++report.Framed;
+        report.Leaves.push_back({function.Begin, function.End, {}});
         if (!rbpPrologue) ++report.FramedWithoutFramePointer;
         report.Exits += exits.size();
         report.MovedOperands += moves.size();

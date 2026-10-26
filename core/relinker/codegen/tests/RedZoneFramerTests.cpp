@@ -588,6 +588,18 @@ void leavesCodeWithoutAFunctionRange() {
 
 }
 
+void listsEachRedZoneLeafWithWhyItWasNotFramed() {
+    std::vector<std::uint8_t> framed = StoreBelowRsp;
+    append(framed, LoadBelowRsp);
+    const auto input = image({framelessLeaf(FramelessPrologue, framed, FramelessExit), framelessLeaf({0x41, 0x56, 0x41, 0x57}, StoreBelowRsp, {0x41, 0x5f, 0x41, 0x5e, 0xc3}), leaf(LoadAbovePushes)});
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
+    require(report.Leaves.size() == 2, "the report must list the two red-zone leaves and not the leaf that stays above its pushes");
+    require(report.Leaves[0].Begin == input.functions[0].Begin && report.Leaves[0].End == input.functions[0].End && report.Leaves[0].Reason.empty(), "the framed leaf was not listed by its bounds without a reason");
+    require(report.Leaves[1].Begin == input.functions[1].Begin && report.Leaves[1].End == input.functions[1].End && report.Leaves[1].Reason == "prologue shorter than a jump", "the skipped leaf was not listed by its bounds with its reason");
+}
+
 int main() {
     try {
         framesRedZoneLeaf();
@@ -616,6 +628,7 @@ int main() {
         keepsLoopsAlignedAfterAJump();
         framesAPointerOnlyFunctionByItsOwnBounds();
         leavesCodeWithoutAFunctionRange();
+        listsEachRedZoneLeafWithWhyItWasNotFramed();
         std::cout << "red-zone framer tests passed\n";
         return 0;
     } catch (const std::exception& error) {
