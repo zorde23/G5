@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -57,6 +58,10 @@ void Driver::markCompleted(std::uint64_t serial) {
     }
 }
 
+bool Driver::finisherOrderedEnd() {
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FinisherOrderedEnd);
+}
+
 bool& Driver::completionDeferred() {
     static thread_local bool deferred = false;
     return deferred;
@@ -70,9 +75,16 @@ void Driver::deferCompletion(const Submission& submission) {
         queue0Uncommitted.push_back(received);
     }
     completionDeferred() = true;
-    DrawPipeline::Queue0().Enqueue([this, serial = submission.serial, received, labelWrites = submission.labelWrites, progress = submission.progress] {
-        completeSubmission(serial, received, labelWrites, progress);
-    }, {});
+    auto enqueue = [this, serial = submission.serial, received, labelWrites = submission.labelWrites, progress = submission.progress]() mutable {
+        DrawPipeline::Queue0().Enqueue([this, serial, received, labelWrites = std::move(labelWrites), progress = std::move(progress)] {
+            completeSubmission(serial, received, labelWrites, progress);
+        }, {});
+    };
+    if (finisherOrderedEnd() && submission.queue == 0 && DrawFinisher::Overlap() && DrawFinisher::Busy()) {
+        DrawFinisher::Get().Enqueue(std::move(enqueue), DrawFinisher::NoWrites());
+        return;
+    }
+    enqueue();
 }
 
 void Driver::submitOpenWork(const std::shared_ptr<SubmissionProgress>& progress) {

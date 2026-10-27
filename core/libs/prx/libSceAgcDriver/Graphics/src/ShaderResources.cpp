@@ -3428,6 +3428,10 @@ void noteEpochProof(bool reused, bool verified, bool failed) {
 }
 }
 
+void ShaderResources::PublishDirectRegions() const {
+    for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (EpochProofs()) {
         const auto epoch = GuestMemory::CollectEpoch();

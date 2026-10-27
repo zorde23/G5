@@ -524,8 +524,13 @@ void Driver::execute(const Submission& submission) {
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
                     if (const auto localDevice = device.Load()) localDevice->SealPassWriteOnly();
                 };
-                if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Enqueue(seal, {});
-                else seal();
+                if (pipelined && finisherOrderedEnd() && DrawFinisher::Overlap() && DrawFinisher::Busy()) {
+                    DrawFinisher::Get().Enqueue([seal] { DrawPipeline::Queue0().Enqueue(seal, {}); }, DrawFinisher::NoWrites());
+                } else if (pipelined && DrawPipeline::Queue0().Busy()) {
+                    DrawPipeline::Queue0().Enqueue(seal, {});
+                } else {
+                    seal();
+                }
             }
         } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
             if (!wroteOnGpu) {
@@ -567,7 +572,10 @@ void Driver::execute(const Submission& submission) {
         cursor = nextCursor;
     }
 
-    if (submission.queue == 0) DrawFinisher::Get().Drain();
+    const bool rewindReady = submission.rewindTail != nullptr && (std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0;
+    const bool orderedEnd = finisherOrderedEnd() && submission.queue == 0 && pipelined && orderedCompletion && (submission.rewindTail == nullptr || rewindReady) && deferredLabels().labels.empty();
+    if (orderedEnd) settleFinisher.queue0 = false;
+    else if (submission.queue == 0) DrawFinisher::Get().Drain();
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;
@@ -576,11 +584,15 @@ void Driver::execute(const Submission& submission) {
             deferCompletion(submission);
             return;
         }
-        if ((std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0) {
-            DrawPipeline::Queue0().Enqueue([this, progress = submission.progress] {
-                submitOpenWork(progress);
-                wakeQueueZeroForCompletions();
-            }, {});
+        if (rewindReady) {
+            auto enqueue = [this, progress = submission.progress]() mutable {
+                DrawPipeline::Queue0().Enqueue([this, progress = std::move(progress)] {
+                    submitOpenWork(progress);
+                    wakeQueueZeroForCompletions();
+                }, {});
+            };
+            if (orderedEnd && DrawFinisher::Overlap() && DrawFinisher::Busy()) DrawFinisher::Get().Enqueue(std::move(enqueue), DrawFinisher::NoWrites());
+            else enqueue();
             endTiming.Finish();
             executeRewindTail(submission);
             return;

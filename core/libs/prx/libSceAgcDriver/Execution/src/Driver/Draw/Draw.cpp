@@ -167,6 +167,7 @@ struct DrawTail {
     bool stageEntries = false;
     bool patchedStages = false;
     const Submission* submission = nullptr;
+    Submission ownSubmission;
     std::uint32_t submissionQueue = 0;
     std::uint64_t submissionSerial = 0;
     std::size_t packetOffset = 0;
@@ -732,6 +733,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         tail.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         tail.submissionSerial = submission.serial;
         tail.packetOffset = static_cast<std::size_t>(packet.data() - submission.commands.data());
+        tail.ownSubmission.serial = submission.serial;
+        tail.ownSubmission.queue = submission.queue;
+        tail.ownSubmission.shaders = submission.shaders;
+        tail.submission = &tail.ownSubmission;
         noteFinisherHandOff(true);
         DrawFinisher::Pending held;
         if (DrawFinisher::Overlap()) held = heldWrites(tail);

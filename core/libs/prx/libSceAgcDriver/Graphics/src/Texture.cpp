@@ -18,6 +18,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
@@ -4268,14 +4269,24 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     if (trace) {
         for (const auto& texture : flush) std::fprintf(stderr, "[flush] image 0x%llx+0x%llx for %s 0x%llx+0x%zx\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), reason, static_cast<unsigned long long>(address), bytes);
     }
-    std::lock_guard gpu(GuestMemory::GpuMutex());
+    std::unique_lock gpu(GuestMemory::GpuMutex());
     if (!ownNotes.empty() && (flush.size() != 1 || std::any_of(flush.begin(), flush.end(), [](const std::shared_ptr<StorageTexture>& texture) { return ExistingHostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) == nullptr; }))) ownNotes.clear();
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes, ownNotes) != 0) {
         try {
             recorder->Reap();
             if (const auto writer = recorder->PendingWriterSerial(address, bytes, ownNotes); writer == recorder->OpenSerial()) {
                 Recorder::CountSync(recorder->OpenWriteOverlaps(address, bytes) ? 1 : 3);
-                recorder->Sync();
+                bool waited = false;
+                if (RuntimeSwitches::Set(RuntimeSwitch::PublishWaitUnlocked) && GuestMemory::GpuMutex().DepthOnThisThread() == 1) {
+                    recorder->Submit();
+                    gpu.unlock();
+                    waited = recorder->WaitSerialFor(writer, ~std::uint64_t{0});
+                    gpu.lock();
+                    if (waited && Recorder::Active() == recorder) recorder->FinishUpTo(writer);
+                    else if (auto* active = Recorder::Active(); active != nullptr) active->Sync();
+                } else {
+                    recorder->Sync();
+                }
             } else if (writer != 0) {
                 recorder->FinishUpTo(writer);
             }

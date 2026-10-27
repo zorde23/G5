@@ -120,6 +120,7 @@ public:
         std::uint64_t labelAddress = 0;
         std::vector<std::byte> labelBytes;
     };
+    static Pending NoWrites() { return Pending{0, 0, false, {}, 0, {}}; }
     enum class LabelLookup : std::uint8_t { NotHeld, Value, Unknown };
     static bool Overlap();
     bool PendingOverlaps(std::uint64_t begin, std::uint64_t end);

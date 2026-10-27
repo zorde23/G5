@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -611,6 +612,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 phaseMs[PhasePrepareOther] += std::max(0.0, prepareMs - parts);
             }
         }
+        if (recipeHit != nullptr && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PublishWaitUnlocked) && !GuestMemory::GpuMutex().HeldByThisThread()) VulkanDevice::PublishRecipeRegions(recipeHit);
         GuestMemory::TagGpuLockSite(indirectArguments != 0 ? GuestMemory::GpuLockSite::Indirect : GuestMemory::GpuLockSite::Dispatch);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         phaseTiming.Phase(PhaseLockWait);
