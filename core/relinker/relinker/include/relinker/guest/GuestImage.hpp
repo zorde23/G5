@@ -9,6 +9,7 @@
 #include <domain/IProgress.hpp>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace Relinker {
@@ -79,6 +80,8 @@ struct GuestModuleInput {
     std::vector<std::uint8_t> Bytes;
     std::vector<GamePatch::PatchedRange> PatchedRanges;
 };
+
+std::vector<std::pair<std::filesystem::path, std::filesystem::path>> RemoveBackupCopies(std::vector<GuestModuleInput>& modules);
 
 class GuestModuleBuilder {
 public:
