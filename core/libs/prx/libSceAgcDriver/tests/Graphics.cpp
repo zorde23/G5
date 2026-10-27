@@ -12598,11 +12598,6 @@ int main(int argc, char** argv) {
             imageTableSnapshotAllocationTests();
             return 0;
         }
-        if (argc == 2 && std::string_view(argv[1]) == "--descriptor-snapshot") {
-            descriptorSnapshotTests();
-            imageTableSnapshotAllocationTests();
-            return 0;
-        }
         const std::array<std::string_view, 3> samplerCases{"--sampler-table-lod-bias", "--sampler-table-anisotropy", "--sampler-table-reduction-compare"};
         for (std::uint32_t index = 0; index < samplerCases.size(); ++index) {
             if (argc == 2 && std::string_view(argv[1]) == samplerCases[index]) {
