@@ -11958,6 +11958,111 @@ void pipelineStoreReplayGrowthTests() {
     Require(mock.live == 0, "pipeline store replay growth tests leaked Vulkan objects");
 }
 
+// APS5_FINISHER_DRAW_PREP: PrepareDrawPure equals what the committer computes for a plain draw,
+// refuses every path it does not cover, and CheckDrawPrep refuses a prep the committer must redo.
+void drawPrepTests() {
+    using namespace AgcDriver::Graphics;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.device = makeHandle<VkDevice>();
+    // The mock builds pipelines from libraries (it has no render pass functions).
+    context.graphicsPipelineLibrary = true;
+    context.pipelineLinkTimeOptimization = false;
+    context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    auto cache = std::make_unique<DescriptorCache>(context);
+    context.descriptorCache = cache.get();
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.spirv = makeModule({});
+    fragment.spirv = makeModule({.fragment = true});
+    vertex.variantId = 501;
+    fragment.variantId = 502;
+    const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}}};
+    const State state{};
+    const AgcDriver::Pm4::DrawParameters draw{0, 3u, 0, 1u, 0, false, 0, 0};
+    auto skip = DrawPrepSkip::Threw;
+    auto prep = PrepareDrawPure(context, state, draw, shaders, &skip);
+    Require(prep.has_value() && skip == DrawPrepSkip::None, "a plain draw produced no prep (reason " + std::to_string(static_cast<int>(skip)) + ")");
+    // The committer's own computation of the same values.
+    const auto described = DescribeSetLayouts(context, shaders);
+    Require(prep->device == context.device && prep->vertexInput == nullptr, "the prep's device or vertex input differs from the draw's");
+    Require(prep->layouts.mainKey == described.mainKey && prep->layouts.fragmentKey == described.fragmentKey && prep->layouts.layouts.main == described.layouts.main, "the prep's set layouts differ from the described ones");
+    Require(CachedPipeline(context, state, VertexInputLayout{}, described.View(), shaders, VK_IMAGE_LAYOUT_GENERAL) == prep->pipeline, "the prep's pipeline differs from the pipeline store's");
+    Require(prep->pushStages == PushConstantStages(shaders) && prep->pushBytes == AssemblePushConstants(shaders), "the prep's push constants differ from the assembled ones");
+    auto again = PrepareDrawPure(context, state, draw, shaders);
+    Require(again.has_value() && DrawPrepDifference(*prep, *again, true) == nullptr, "two preps of one draw differ");
+    // The committer's checks.
+    Require(CheckDrawPrep(context, *prep, described.View(), true, true) == DrawPrepReject::None, "a matching prep was refused");
+    auto other = context;
+    other.device = makeHandle<VkDevice>();
+    Require(CheckDrawPrep(other, *prep, described.View(), true, true) == DrawPrepReject::Device, "a prep of another device was taken");
+    Require(CheckDrawPrep(context, *prep, described.View(), false, true) == DrawPrepReject::NotLean, "a prep was taken for a draw off the lean path");
+    Require(CheckDrawPrep(context, *prep, described.View(), true, false) == DrawPrepReject::Target, "a prep was taken for proxied or multisampled targets");
+    const std::array<std::uint32_t, 1> otherKey{77};
+    const PipelineSetLayouts built{makeHandle<VkDescriptorSetLayout>(), VK_NULL_HANDLE, false, otherKey, {}};
+    Require(CheckDrawPrep(context, *prep, built, true, true) == DrawPrepReject::Layouts, "a prep was taken against other set layouts");
+    Require(prep->storeHash != 0, "the prep's pipeline is not the store's");
+    {
+        // The store dropped the pipeline: the check refuses the prep, and a new one (the committer's
+        // recomputation) passes again.
+        auto stale = std::move(*prep);
+        ClearCachedPipelines(context.device);
+        Require(CheckDrawPrep(context, stale, described.View(), true, true) == DrawPrepReject::PipelineGone, "a prep whose pipeline left the store was taken");
+        const auto redone = PrepareDrawPure(context, state, draw, shaders);
+        Require(redone.has_value() && redone->pipeline != stale.pipeline && CheckDrawPrep(context, *redone, described.View(), true, true) == DrawPrepReject::None, "the recomputed prep was refused");
+        Require(std::string_view(DrawPrepDifference(stale, *redone, false)) == "pipeline", "two preps of different pipelines compared equal");
+    }
+    // The paths the prep does not cover.
+    const auto expectSkip = [&](const Context& with, const State& tried, const AgcDriver::Pm4::DrawParameters& parameters, std::span<const CompiledShader> stages, DrawPrepSkip expected, const char* what) {
+        auto why = DrawPrepSkip::None;
+        Require(!PrepareDrawPure(with, tried, parameters, stages, &why).has_value() && why == expected, std::string("a prep was produced for ") + what);
+    };
+    auto indirect = draw;
+    indirect.indirect.emplace();
+    expectSkip(context, state, indirect, shaders, DrawPrepSkip::Indirect, "an indirect draw");
+    auto empty = draw;
+    empty.instanceCount = 0;
+    expectSkip(context, state, empty, shaders, DrawPrepSkip::Empty, "an empty draw");
+    auto quads = state;
+    quads.quadList = true;
+    expectSkip(context, quads, draw, shaders, DrawPrepSkip::QuadOrStrip, "a quad list");
+    auto mesh = state;
+    mesh.stages.mesh.emplace();
+    expectSkip(context, mesh, draw, shaders, DrawPrepSkip::Mesh, "a mesh draw");
+    auto patches = state;
+    patches.stages.tessellation.emplace();
+    expectSkip(context, patches, draw, shaders, DrawPrepSkip::Tessellation, "a tessellated draw");
+    auto multisampled = state;
+    multisampled.colors.emplace_back().samples = 2;
+    expectSkip(context, multisampled, draw, shaders, DrawPrepSkip::Multisampled, "a multisampled target");
+    auto replayed = fragment;
+    replayed.stencilReferences = {1};
+    const std::array<CompiledShader, 2> replay{{shaders[0], {ShaderRecompiler::ShaderStage::Fragment, &replayed, PipelinePushSlotBytes}}};
+    expectSkip(context, state, draw, replay, DrawPrepSkip::StencilReplay, "a stencil replay");
+    const std::array<CompiledShader, 1> missing{{{ShaderRecompiler::ShaderStage::Vertex, nullptr, 0}}};
+    expectSkip(context, state, draw, missing, DrawPrepSkip::NoProgram, "a missing stage");
+    auto proxyContext = context;
+    proxyContext.formatProperties = srgb8FormatProperties;
+    proxyContext.physical = reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{0x6000});
+    srgb8Features = 0;
+    auto proxied = state;
+    proxied.colors.emplace_back().format = VK_FORMAT_R8_SRGB;
+    expectSkip(proxyContext, proxied, draw, shaders, DrawPrepSkip::Proxied, "a proxied target");
+    // The mock has no detiler, so no color target can be resident.
+    auto targeted = state;
+    targeted.colors.emplace_back().format = VK_FORMAT_R8G8B8A8_UNORM;
+    expectSkip(context, targeted, draw, shaders, DrawPrepSkip::NotLean, "a draw off the lean path");
+    auto uncached = context;
+    uncached.descriptorCache = nullptr;
+    expectSkip(uncached, state, draw, shaders, DrawPrepSkip::NoDescriptorCache, "a device without a descriptor cache");
+    prep.reset();
+    again.reset();
+    ClearCachedPipelines(context.device);
+    ClearPipelineLibraries(context.device);
+    context.descriptorCache = nullptr;
+    cache.reset();
+    Require(mock.live == 0, "draw prep tests leaked Vulkan objects");
+}
+
 void pipelineJournalTests(bool longPath = false, bool extended = false) {
     using namespace AgcDriver::Graphics;
     using Stage = ShaderRecompiler::ShaderStage;
@@ -12395,6 +12500,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-clear-waits-for-build") {
             pipelineLibraryClearWaitsForBuildTests();
             std::cout << "pipeline library clear waits for active part builds\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-prep") {
+            drawPrepTests();
+            std::cout << "the finisher's draw prep equals the committer's and is refused where it must be redone\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-store-replay-growth") {

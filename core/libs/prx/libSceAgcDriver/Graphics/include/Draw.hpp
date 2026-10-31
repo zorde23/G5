@@ -22,10 +22,39 @@ struct DrawTraceContext {
     std::uint64_t target = 0;
 };
 
+// The part of a draw's preparation that depends on the draw alone (APS5_FINISHER_DRAW_PREP): the
+// validated fragment outputs and stages, vertex input layout, resource key, set layouts, masked
+// state, lean pipeline and unpatched push constants, computed by the draw finisher. A device refusal
+// drops all of it; any other refusal recomputes only the pipeline and push constants.
+struct DrawPrep {
+    VkDevice device = VK_NULL_HANDLE;
+    std::uint32_t fragmentOutputs = 0;
+    bool validateMemoized = false;
+    bool validateHit = false;
+    VkPipelineStageFlags shaderStages = 0;
+    std::shared_ptr<const VertexInputLayout> vertexInput;
+    bool keyed = false;
+    std::vector<std::uint32_t> contentKey;
+    DescribedSetLayouts layouts;
+    std::optional<State> masked;
+    std::shared_ptr<Pipeline> pipeline;
+    std::uint64_t storeHash = 0;
+    VkShaderStageFlags pushStages = 0;
+    std::array<std::byte, PipelinePushConstantBytes> pushBytes{};
+};
+// Why PrepareDrawPure produced nothing; on Threw the committer repeats the step and reports the error.
+enum class DrawPrepSkip : std::uint8_t { None, QuadOrStrip, StencilReplay, Multisampled, Proxied, Mesh, Tessellation, Indirect, NoDescriptorCache, Empty, NoProgram, NotLean, Threw, Count };
+enum class DrawPrepReject : std::uint8_t { None, Device, NotLean, Target, Layouts, PipelineGone, Count };
+std::optional<DrawPrep> PrepareDrawPure(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawPrepSkip* skip = nullptr);
+DrawPrepReject CheckDrawPrep(const Context& context, const DrawPrep& prep, const PipelineSetLayouts& built, bool lean, bool plainTargets);
+// The first field two preps differ in, or null: the stored pipeline and the resource key, with `full` every field.
+const char* DrawPrepDifference(const DrawPrep& a, const DrawPrep& b, bool full);
+void NoteDrawPrepSkip(DrawPrepSkip skip);
+
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
 // APS5_NO_DRAW_RECIPE=1).
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0);
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0, const DrawPrep* prep = nullptr);
 
 struct PixelFunctionLdsLayouts {
     VkDescriptorSetLayout empty = VK_NULL_HANDLE;

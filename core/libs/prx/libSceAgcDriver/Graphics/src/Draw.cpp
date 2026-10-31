@@ -1306,8 +1306,8 @@ std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, std::size_t byt
 
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
-// instead of computed.
-DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe) {
+// instead of computed; with `prep` they are the draw finisher's (PrepareDrawPure).
+DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, const DrawPrep* prep = nullptr) {
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
     APS5_LOG_OUT_DEBUG("State colorTarget=%u render=%ux%u colorAddress=0x%llx colorBytes=%llu colorExtent=%ux%u", state.hasColorTarget ? 1u : 0u, state.renderExtent.width, state.renderExtent.height, static_cast<unsigned long long>(state.color.address), static_cast<unsigned long long>(state.color.bytes), state.color.extent.width, state.color.extent.height);
@@ -1353,7 +1353,13 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     if (recipe != nullptr) {
         inputs.fragmentOutputs = recipe->fragmentOutputs;
         inputs.shaderStages = recipe->shaderStages;
+    } else if (prep != nullptr) {
+        inputs.fragmentOutputs = prep->fragmentOutputs;
+        inputs.shaderStages = prep->shaderStages;
+        outcome.validateMemoized = prep->validateMemoized;
+        outcome.validateHit = prep->validateHit;
     } else {
+        PerformanceTimer pure("Draw.prep_pure");
         inputs.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, outcome.validateMemoized, outcome.validateHit);
         inputs.shaderStages = PipelineStages(shaders);
     }
@@ -1527,7 +1533,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
     if (recipe != nullptr) {
         inputs.vertexInput = recipe->vertexInput;
+    } else if (prep != nullptr) {
+        inputs.retainedVertexInput = prep->vertexInput;
     } else if (!attributes.empty()) {
+        PerformanceTimer pure("Draw.prep_pure");
         if (context.vertexInputs != nullptr) inputs.retainedVertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
         if (inputs.retainedVertexInput == nullptr) inputs.vertexInput = BuildVertexInputLayout(context, attributes);
     }
@@ -1672,7 +1681,7 @@ struct ResolvedResources {
     const ShaderResources::BuildTiming* built = nullptr;
 };
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer) {
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const DrawPrep* prep) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -1688,7 +1697,12 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
     if (resolved.cacheable) {
-        resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+        if (prep != nullptr && prep->keyed) {
+            resolved.contentKey = prep->contentKey;
+        } else {
+            PerformanceTimer pure("Draw.prep_pure");
+            resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+        }
         if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
             const bool valid = cached->Revalidate(shaders);
             auto* recorder = Recorder::Active();
@@ -2496,6 +2510,9 @@ struct PreparedDraw {
     std::shared_ptr<const DrawRecipe>* recipeOut = nullptr;
     const DrawTraceContext* trace = nullptr;
     std::uint64_t shape = 0;
+    // `prepUsed`: the prep's pipeline and push constants passed CheckDrawPrep.
+    const DrawPrep* prep = nullptr;
+    bool prepUsed = false;
     std::vector<std::uint32_t> stencilReferences;
     std::optional<PerformanceTimer> timing;
     DrawTimer timer;
@@ -2527,6 +2544,67 @@ struct PreparedDraw {
     SampleOrderPass reorderPass;
     std::optional<DepthSampleLocations> depthLocations;
 };
+
+struct DrawPrepCounts {
+    std::atomic<std::uint64_t> used{0};
+    std::atomic<std::uint64_t> sampled{0};
+    std::atomic<std::uint64_t> differing{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPrepReject::Count)> rejected{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPrepSkip::Count)> skipped{};
+    std::atomic<std::int64_t> reportedAt{0};
+};
+
+DrawPrepCounts& drawPrepCounts() {
+    static DrawPrepCounts counts;
+    return counts;
+}
+
+// The [draw-prep] line, every 10 s under APS5_PROFILE_DRAW.
+void printDrawPrep() {
+    auto& counts = drawPrepCounts();
+    constexpr std::array<const char*, static_cast<std::size_t>(DrawPrepReject::Count)> rejects{"", "device", "not lean", "target", "set layouts", "pipeline gone"};
+    constexpr std::array<const char*, static_cast<std::size_t>(DrawPrepSkip::Count)> skips{"", "quad or strip", "stencil replay", "multisampled", "proxied", "mesh", "tessellation", "indirect", "no descriptor cache", "empty", "no program", "not lean", "threw"};
+    std::string text;
+    char item[64];
+    for (std::size_t index = 1; index < rejects.size(); ++index) {
+        std::snprintf(item, sizeof(item), "%s %s %llu", index == 1 ? "" : ",", rejects[index], static_cast<unsigned long long>(counts.rejected[index].load(std::memory_order_relaxed)));
+        text += item;
+    }
+    text += "; not produced:";
+    for (std::size_t index = 1; index < skips.size(); ++index) {
+        std::snprintf(item, sizeof(item), "%s %s %llu", index == 1 ? "" : ",", skips[index], static_cast<unsigned long long>(counts.skipped[index].load(std::memory_order_relaxed)));
+        text += item;
+    }
+    std::fprintf(stderr, "[draw-prep] used %llu; refused:%s; sampled verify %llu, differing %llu\n", static_cast<unsigned long long>(counts.used.load(std::memory_order_relaxed)), text.c_str(), static_cast<unsigned long long>(counts.sampled.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.differing.load(std::memory_order_relaxed)));
+}
+
+void reportDrawPrep() {
+    static const bool report = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!report) return;
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (drawPrepCounts().reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    printDrawPrep();
+}
+
+void noteDrawPrepReject(DrawPrepReject reject) {
+    auto& counts = drawPrepCounts();
+    if (reject == DrawPrepReject::None) counts.used.fetch_add(1, std::memory_order_relaxed);
+    else counts.rejected[static_cast<std::size_t>(reject)].fetch_add(1, std::memory_order_relaxed);
+    reportDrawPrep();
+}
+
+// APS5_VERIFY_DRAW_PIPELINE: every 64th used prep is computed again here; a difference is counted, never fatal.
+void sampleDrawPrep(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawPrep& prep) {
+    static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
+    thread_local std::uint64_t seen = 0;
+    if (!verify || ++seen % 64u != 0u) return;
+    auto& counts = drawPrepCounts();
+    counts.sampled.fetch_add(1, std::memory_order_relaxed);
+    const auto fresh = PrepareDrawPure(context, state, draw, shaders);
+    const char* difference = fresh.has_value() ? DrawPrepDifference(prep, *fresh, false) : "presence (the committer produced none)";
+    if (difference == nullptr) return;
+    if (counts.differing.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[draw-prep] sampled verify: the finisher's prep differs from the committer's in its %s\n", difference);
+}
 
 bool ShapeMemoEnabled() {
     static const bool enabled = std::getenv("APS5_NO_SHAPE_MEMO") == nullptr;
@@ -2705,7 +2783,11 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& ownWaitedMs = prepared.ownWaitedMs;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
     auto& inputs = prepared.inputs;
-    inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr);
+    if (prepared.prep != nullptr && prepared.prep->device != context.device) {
+        noteDrawPrepReject(DrawPrepReject::Device);
+        prepared.prep = nullptr;
+    }
+    inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr, prepared.prep);
     if (inputs.nothing) return false;
     const auto* args = prepared.args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
@@ -2842,7 +2924,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto* recorder = prepared.recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
     auto& resolved = prepared.resolved;
-    resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
+    resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, prepared.prep);
     auto& resources = resolved.resources;
     if (!stencilReferences.empty() && resources->ChecksFaults()) recordable = false;
     if (!stencilReferences.empty()) {
@@ -3002,7 +3084,12 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
     auto& masked = prepared.masked;
-    masked = maskedState(state, inputs.fragmentOutputs);
+    if (prepared.prep != nullptr) {
+        masked = prepared.prep->masked;
+    } else {
+        PerformanceTimer pure("Draw.prep_pure");
+        masked = maskedState(state, inputs.fragmentOutputs);
+    }
     if (std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied; })) recipeOut = nullptr;
     for (std::size_t index = 0; index < targets.size(); ++index) {
         if (!targets[index].proxied) continue;
@@ -3035,13 +3122,33 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         const bool memoized = stencilReferences.empty() && std::none_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied || binding.multisampled; });
         const auto layouts = resources->SetLayouts();
         std::uint64_t storeHash = 0;
-        if (memoized) pipeline = shapePipeline(context, prepared.shape, inputs.VertexLayout(), layouts, shaders, attachmentLayout, inputs.fragmentOutputs);
-        if (pipeline != nullptr && VerifyShapeMemo()) {
+        if (const auto* prep = prepared.prep; prep != nullptr) {
+            const auto reject = CheckDrawPrep(context, *prep, layouts, lean, memoized);
+            noteDrawPrepReject(reject);
+            if (reject == DrawPrepReject::None) {
+                pipeline = prep->pipeline;
+                storeHash = prep->storeHash;
+                prepared.prepUsed = true;
+                sampleDrawPrep(context, state, draw, shaders, *prep);
+                if (VerifyShapeMemo()) {
+                    const auto fresh = PrepareDrawPure(context, state, draw, shaders);
+                    Require(fresh.has_value(), "APS5_VERIFY_SHAPE_MEMO: the committer produced no prep for a draw the finisher prepared");
+                    const char* difference = DrawPrepDifference(*prep, *fresh, true);
+                    Require(difference == nullptr, std::string("APS5_VERIFY_SHAPE_MEMO: the finisher's prep differs from the committer's in its ") + (difference != nullptr ? difference : ""));
+                    Require(storeHash == 0 || CachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout) == pipeline, "APS5_VERIFY_SHAPE_MEMO: the finisher's pipeline differs from the pipeline store's for the built resources");
+                }
+            }
+        }
+        std::optional<PerformanceTimer> pure;
+        if (!prepared.prepUsed) pure.emplace("Draw.prep_pure");
+        if (memoized && pipeline == nullptr) pipeline = shapePipeline(context, prepared.shape, inputs.VertexLayout(), layouts, shaders, attachmentLayout, inputs.fragmentOutputs);
+        if (pipeline != nullptr && !prepared.prepUsed && VerifyShapeMemo()) {
             Require(CachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout) == pipeline, "APS5_VERIFY_SHAPE_MEMO: the shape memo's pipeline differs from the pipeline store's");
             noteShapeMemoVerified(true);
         }
-        const bool repeated = pipeline != nullptr;
-        if (!repeated) pipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout, nullptr, &storeHash);
+        const bool repeated = pipeline != nullptr && !prepared.prepUsed;
+        if (pipeline == nullptr) pipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout, nullptr, &storeHash);
+        pure.reset();
         if (memoized) rememberShape(context, prepared.shape, targets, repeated ? nullptr : &pipeline, storeHash, inputs.VertexLayout(), layouts, shaders, attachmentLayout, inputs.fragmentOutputs);
     }
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
@@ -3135,6 +3242,14 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         record.reordered = reordered;
         record.reorderPass = reorderPass;
         record.depthLocations = depthLocations;
+        // The template's patches are the committer's.
+        std::array<std::byte, PipelinePushConstantBytes> preparedPush{};
+        if (prepared.prepUsed) {
+            preparedPush = prepared.prep->pushBytes;
+            resources->PatchPushConstants(preparedPush);
+            record.pushBytes = &preparedPush;
+            record.pushStages = prepared.prep->pushStages;
+        }
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, prepared.trace);
         // The recipe for the caller's draw-cache entry (design_cpu_final M8, rule R3 for draws):
         // only a template the resource cache serves under this content key (reusable: no lease,
@@ -3151,8 +3266,10 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             recipe->targetViews = targetViews;
             recipe->passKey = DrawRenderPassKey(context, state, targetViews);
             recipe->vertexInput = inputs.VertexLayout();
-            recipe->pushStages = PushConstantStages(shaders);
-            if (recipe->pushStages != 0) {
+            recipe->pushStages = prepared.prepUsed ? prepared.prep->pushStages : PushConstantStages(shaders);
+            if (prepared.prepUsed) {
+                if (recipe->pushStages != 0) recipe->pushBytes = preparedPush;
+            } else if (recipe->pushStages != 0) {
                 recipe->pushBytes = AssemblePushConstants(shaders);
                 resources->PatchPushConstants(recipe->pushBytes);
             }
@@ -3507,7 +3624,94 @@ void drawTessellationGeometry(const Context& context, const State& state, const 
     Draw(context, meshed, captured, second, snapshots, nullptr, trace);
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape) {
+std::optional<DrawPrep> PrepareDrawPure(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawPrepSkip* skip) {
+    const auto skipped = [&](DrawPrepSkip why) -> std::optional<DrawPrep> {
+        if (skip != nullptr) *skip = why;
+        return std::nullopt;
+    };
+    if (skip != nullptr) *skip = DrawPrepSkip::None;
+    if (shaders.empty() || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program == nullptr; })) return skipped(DrawPrepSkip::NoProgram);
+    if (draw.indirect) return skipped(DrawPrepSkip::Indirect);
+    if (draw.indexCount == 0 || draw.instanceCount == 0) return skipped(DrawPrepSkip::Empty);
+    if (state.stages.mesh) return skipped(DrawPrepSkip::Mesh);
+    if (state.stages.tessellation || state.stages.tessellationGeometry || state.tessellationCapture != nullptr) return skipped(DrawPrepSkip::Tessellation);
+    if (state.quadList || StripPatches(state, shaders)) return skipped(DrawPrepSkip::QuadOrStrip);
+    if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return !shader.program->stencilReferences.empty(); })) return skipped(DrawPrepSkip::StencilReplay);
+    if (std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.samples > 1; })) return skipped(DrawPrepSkip::Multisampled);
+    if (std::ranges::any_of(state.colors, [&](const ColorTarget& color) { return AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED; })) return skipped(DrawPrepSkip::Proxied);
+    if (context.descriptorCache == nullptr) return skipped(DrawPrepSkip::NoDescriptorCache);
+    // prepareDraw's lean conditions that need no recorder or import state.
+    static const bool drawTransitions = std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
+    static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
+    static const bool residentLinear = std::getenv("APS5_NO_RESIDENT_LINEAR") == nullptr;
+    const auto residentCandidate = [&](const ColorTarget& color) { return residentTargets && context.detiler != nullptr && (color.tileMode != ColorTileMode::Linear || residentLinear); };
+    if (!RecordDraws() || drawTransitions || DumpTargetLimit() != 0 || !std::ranges::all_of(state.colors, residentCandidate)) return skipped(DrawPrepSkip::NotLean);
+    // resolveDrawResources' key switches.
+    static const bool noResourceKey = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+    DrawPrep prep;
+    try {
+        prep.device = context.device;
+        prep.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, prep.validateMemoized, prep.validateHit);
+        prep.shaderStages = PipelineStages(shaders);
+        const auto& attributes = shaders.front().program->vertexAttributes;
+        if (!attributes.empty()) {
+            if (context.vertexInputs != nullptr) prep.vertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
+            if (prep.vertexInput == nullptr) prep.vertexInput = std::make_shared<const VertexInputLayout>(BuildVertexInputLayout(context, attributes));
+        }
+        prep.keyed = !noResourceKey && std::ranges::all_of(shaders, [](const CompiledShader& shader) { return shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+        if (prep.keyed) prep.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey);
+        prep.layouts = DescribeSetLayouts(context, shaders);
+        prep.masked = maskedState(state, prep.fragmentOutputs);
+        static const VertexInputLayout noInput{};
+        prep.pipeline = CachedPipeline(context, prep.masked.has_value() ? *prep.masked : state, prep.vertexInput != nullptr ? *prep.vertexInput : noInput, prep.layouts.View(), shaders, VK_IMAGE_LAYOUT_GENERAL, nullptr, &prep.storeHash);
+        prep.pushStages = PushConstantStages(shaders);
+        prep.pushBytes = AssemblePushConstants(shaders);
+    } catch (const std::exception&) {
+        return skipped(DrawPrepSkip::Threw);
+    }
+    return prep;
+}
+
+DrawPrepReject CheckDrawPrep(const Context& context, const DrawPrep& prep, const PipelineSetLayouts& built, bool lean, bool plainTargets) {
+    if (prep.device != context.device) return DrawPrepReject::Device;
+    if (!lean) return DrawPrepReject::NotLean;
+    if (!plainTargets) return DrawPrepReject::Target;
+    const auto& described = prep.layouts;
+    if (described.layouts.main != built.main || described.layouts.fragment != built.fragment || described.layouts.split != built.split || !std::ranges::equal(described.mainKey, built.mainKey) || !std::ranges::equal(described.fragmentKey, built.fragmentKey)) return DrawPrepReject::Layouts;
+    // A private pipeline (hash collision) is the draw's own; a stored one must still be the entry.
+    if (prep.pipeline == nullptr || (prep.storeHash != 0 && TouchCachedPipeline(context, prep.storeHash, prep.pipeline, false) != prep.pipeline)) return DrawPrepReject::PipelineGone;
+    return DrawPrepReject::None;
+}
+
+const char* DrawPrepDifference(const DrawPrep& a, const DrawPrep& b, bool full) {
+    // A private pipeline (no store hash: a collision or APS5_NO_PIPELINE_CACHE) is new on every call.
+    if (a.storeHash != 0 && b.storeHash != 0 && a.pipeline != b.pipeline) return "pipeline";
+    if (a.storeHash != b.storeHash) return "pipeline key";
+    if (a.keyed != b.keyed || a.contentKey != b.contentKey) return "resource key";
+    if (!full) return nullptr;
+    if (a.device != b.device) return "device";
+    if (a.fragmentOutputs != b.fragmentOutputs) return "fragment outputs";
+    if (a.shaderStages != b.shaderStages) return "shader stages";
+    static const VertexInputLayout none{};
+    const auto& inputA = a.vertexInput != nullptr ? *a.vertexInput : none;
+    const auto& inputB = b.vertexInput != nullptr ? *b.vertexInput : none;
+    const auto sameBinding = [](const VkVertexInputBindingDescription& x, const VkVertexInputBindingDescription& y) { return x.binding == y.binding && x.stride == y.stride && x.inputRate == y.inputRate; };
+    const auto sameAttribute = [](const VkVertexInputAttributeDescription& x, const VkVertexInputAttributeDescription& y) { return x.location == y.location && x.binding == y.binding && x.format == y.format && x.offset == y.offset; };
+    if (!std::ranges::equal(inputA.bindings, inputB.bindings, sameBinding) || !std::ranges::equal(inputA.attributes, inputB.attributes, sameAttribute)) return "vertex input";
+    if (a.layouts.layouts.main != b.layouts.layouts.main || a.layouts.layouts.fragment != b.layouts.layouts.fragment || a.layouts.layouts.split != b.layouts.layouts.split || a.layouts.mainKey != b.layouts.mainKey || a.layouts.fragmentKey != b.layouts.fragmentKey) return "set layouts";
+    if (a.masked.has_value() != b.masked.has_value()) return "masked state";
+    if (a.masked.has_value() && !std::ranges::equal(a.masked->blends, b.masked->blends, [](const auto& x, const auto& y) { return x.colorWriteMask == y.colorWriteMask; })) return "masked state";
+    if (a.pushStages != b.pushStages || a.pushBytes != b.pushBytes) return "push constants";
+    return nullptr;
+}
+
+void NoteDrawPrepSkip(DrawPrepSkip skip) {
+    drawPrepCounts().skipped[static_cast<std::size_t>(skip)].fetch_add(1, std::memory_order_relaxed);
+    reportDrawPrep();
+}
+
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, const DrawPrep* prep) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (state.stages.tessellationGeometry) {
         drawTessellationGeometry(context, state, draw, shaders, snapshots, trace);
@@ -3518,6 +3722,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     prepared.recipeOut = recipeOut;
     prepared.trace = trace;
     prepared.shape = shape;
+    prepared.prep = prep;
     if (prepareDraw(context, state, draw, shaders, snapshots, prepared)) recordPreparedDraw(context, state, draw, shaders, prepared);
 }
 

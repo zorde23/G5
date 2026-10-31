@@ -1337,7 +1337,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     return pipeline;
 }
 
-std::shared_ptr<Pipeline> TouchCachedPipeline(const Context& context, std::uint64_t hash, const std::weak_ptr<Pipeline>& expected) {
+std::shared_ptr<Pipeline> TouchCachedPipeline(const Context& context, std::uint64_t hash, const std::weak_ptr<Pipeline>& expected, bool countHit) {
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
     reportPipelines(store);
@@ -1346,8 +1346,10 @@ std::shared_ptr<Pipeline> TouchCachedPipeline(const Context& context, std::uint6
     const auto it = found->second;
     if (it->pipeline.owner_before(expected) || expected.owner_before(it->pipeline) || !alive(*it, context)) return nullptr;
     store.entries.splice(store.entries.end(), store.entries, it);
-    ++store.hits;
-    ++store.totals.hits;
+    if (countHit) {
+        ++store.hits;
+        ++store.totals.hits;
+    }
     return it->pipeline;
 }
 
