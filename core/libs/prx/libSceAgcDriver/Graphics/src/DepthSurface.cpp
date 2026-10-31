@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
@@ -1942,6 +1943,136 @@ void retireStoringStale(DepthSurface& surface) {
     const auto [begin, end] = surface.UnitHull(units, planeBytes);
     if (StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "depth plane store")) surface.NoteStored(units, GuestMemory::TrackerGeneration());
 }
+
+// APS5_DEPTH_VIEW_MEMO: the last single-sample DepthSurfaceView call and every counter its
+// bookkeeping reads. A call with the same target while none of them moved would only repeat it.
+// Guarded by surfacesMutex.
+struct DepthViewMemo {
+    DepthSurface* surface = nullptr;
+    VkDevice device = VK_NULL_HANDLE;
+    DepthTarget target{};
+    bool depthWritten = false;
+    std::uint64_t planeBytes = 0;
+    std::array<std::uint64_t, 6> counters{};
+    std::array<std::uint64_t, 4> proof{};
+};
+
+DepthViewMemo depthViewMemo;
+std::atomic<std::uint64_t> depthViewMemoHits{0};
+
+bool sameDepthTarget(const DepthTarget& a, const DepthTarget& b) {
+    const auto fields = [](const DepthTarget& t) { return std::tie(t.address, t.stencilAddress, t.extent.width, t.extent.height, t.format, t.clearStencil, t.htileAddress, t.htileStencil, t.samples, t.depthSwizzle, t.pipeBankXor, t.firstSlice, t.lastSlice, t.iterate256, t.htilePipeAligned, t.htileVrsEncoding, t.htileDepthOnly); };
+    return fields(a) == fields(b) && std::bit_cast<std::uint32_t>(a.clearDepth) == std::bit_cast<std::uint32_t>(b.clearDepth);
+}
+
+std::array<std::uint64_t, 6> depthViewCounters() {
+    return {surfacesSerial.load(std::memory_order_acquire), surfacesReleased.load(std::memory_order_acquire), mirrorEpoch, depthWrites, planeBinds, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(drawnDepth))};
+}
+
+// The collect epoch, proof serial and pending-store serial (as ShaderResources::Revalidate), and
+// the HTILE generation storeBackClearedHtile last read: a guest, driver or GPU write moves one.
+std::array<std::uint64_t, 4> depthViewProof(const DepthTarget& target) {
+    std::uint64_t htile = 0;
+    if (target.htileAddress != 0) {
+        std::lock_guard lock(htileReadsMutex());
+        const auto found = htileReads().find(target.htileAddress);
+        htile = found == htileReads().end() ? 0 : found->second;
+    }
+    return {GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), htile};
+}
+
+void rememberDepthView(const Context& context, const DepthTarget& target, bool depthWritten, DepthSurface* surface) {
+    auto& memo = depthViewMemo;
+    // Multisample surfaces settle clears through their sampling state each call; never memoized.
+    memo.surface = target.samples == 1u ? surface : nullptr;
+    if (memo.surface == nullptr) return;
+    memo.device = context.device;
+    memo.target = target;
+    memo.depthWritten = depthWritten;
+    memo.planeBytes = mirrorable(target) ? DescribeSurface(mirrorResource(target)).guestBytes : 0;
+    memo.counters = depthViewCounters();
+    memo.proof = depthViewProof(target);
+}
+
+// The memoized surface when DepthSurfaceView's slow path would find it again and change nothing
+// but the side effects depthViewMemoRepeat runs; null otherwise. Runs under surfacesMutex after
+// storeBackClearedHtile reported no clear and settlePendingHtileClear ran.
+DepthSurface* depthViewMemoHit(const Context& context, const DepthTarget& target, bool depthWritten) {
+    const auto& memo = depthViewMemo;
+    if (memo.surface == nullptr || memo.device != context.device || memo.depthWritten != depthWritten || !sameDepthTarget(memo.target, target)) return nullptr;
+    // Counters before the pointer is read: a surface is created or released only with surfacesSerial
+    // or surfacesReleased moving, and drawnDepth still naming it rules out a reused address.
+    if (memo.counters != depthViewCounters()) return nullptr;
+    const auto proof = depthViewProof(target);
+    if (proof[0] == 0 || proof != memo.proof || !clearedHtiles().empty()) return nullptr;
+    auto* surface = memo.surface;
+    // retire() moves no counter, and a fast clear noted since sets pendingClear.
+    if (!surface->active->load(std::memory_order_acquire) || surface->retired || surface->pendingClear != 0 || surface->samplingActive) return nullptr;
+    const auto owns = [&](PlaneOwners& owners, std::uint64_t address) {
+        const auto found = owners.find({context.device, address});
+        return found != owners.end() && found->second.surface == surface;
+    };
+    if (!owns(depthOwners(), target.address) || (target.stencilAddress != 0 && !owns(stencilOwners(), target.stencilAddress))) return nullptr;
+    if (mirrorable(target)) {
+        // SyncFromMemory's first step; a collect of an overlapping range can stamp the plane within
+        // the epoch without moving the proof serial.
+        std::uint64_t generation = 0;
+        const auto changed = surface->WrittenUnits(mirrorResource(target), generation);
+        if (anyUnit(changed)) return nullptr;
+        surface->unitGeneration.assign(surface->unitGeneration.size(), generation);
+    }
+    return surface;
+}
+
+// What the slow path still does for an unchanged surface: the write order, the memory generation
+// and the stale marks of a written depth plane. `target` is the call's: sameSurface ignores the
+// swizzle and HTILE fields of a single-sample surface's own target.
+void depthViewMemoRepeat(DepthSurface& surface, const DepthTarget& target, bool depthWritten) {
+    surface.written = ++depthWrites;
+    surface.NoteMemory();
+    if (depthWritten && mirrorable(target)) {
+        surface.MarkAllStale(depthViewMemo.planeBytes);
+        noteStalePlane(target.address, target.address + depthViewMemo.planeBytes);
+    }
+    depthViewMemo.counters = depthViewCounters();
+    depthViewMemo.proof = depthViewProof(target);
+}
+
+struct DepthViewState {
+    std::array<std::uint64_t, 6> counters;
+    std::vector<bool> staleUnits;
+    std::size_t staleCount;
+    std::uint64_t unitBytes;
+    std::vector<std::uint64_t> unitGeneration;
+};
+
+DepthViewState depthViewState(const DepthSurface& surface) {
+    return {depthViewCounters(), surface.staleUnits, surface.staleCount, surface.unitBytes, surface.unitGeneration};
+}
+
+// The 1-in-64 verify: the repeat's result is kept and the surface's stale state put back, so the
+// full path that follows must reach the same surface and stale state with only its own write order
+// bump and same-surface plane rebinds (no clear recorded, no units synced, no surface or mirror made).
+DepthViewState depthViewMemoVerifyStart(DepthSurface& surface, const DepthTarget& target, bool depthWritten) {
+    const auto before = depthViewState(surface);
+    depthViewMemoRepeat(surface, target, depthWritten);
+    auto repeated = depthViewState(surface);
+    surface.staleUnits = before.staleUnits;
+    surface.staleCount = before.staleCount;
+    surface.unitBytes = before.unitBytes;
+    surface.unitGeneration = before.unitGeneration;
+    return repeated;
+}
+
+void depthViewMemoVerifyEnd(const DepthViewState& repeated, const DepthSurface& memoized, const DepthSurface& surface, const DepthTarget& target) {
+    auto expected = repeated.counters;
+    expected[3] += 1;
+    expected[4] += target.stencilAddress != 0 ? 2u : 1u;
+    const auto full = depthViewState(surface);
+    if (&memoized == &surface && full.counters == expected && full.staleUnits == repeated.staleUnits && full.staleCount == repeated.staleCount && full.unitBytes == repeated.unitBytes) return;
+    std::fprintf(stderr, "[depth-view-memo] verify: depth 0x%llx: the memo returned surface %p, the full path %p; surfaces +%llu, mirrors +%llu, depth writes +%llu (want 1), plane binds +%llu (want %llu); stale units %zu of %llu bytes, the memo left %zu of %llu\n", static_cast<unsigned long long>(target.address), static_cast<const void*>(&memoized), static_cast<const void*>(&surface), static_cast<unsigned long long>(full.counters[0] - repeated.counters[0]), static_cast<unsigned long long>(full.counters[2] - repeated.counters[2]), static_cast<unsigned long long>(full.counters[3] - repeated.counters[3]), static_cast<unsigned long long>(full.counters[4] - repeated.counters[4]), static_cast<unsigned long long>(expected[4] - repeated.counters[4]), full.staleCount, static_cast<unsigned long long>(full.unitBytes), repeated.staleCount, static_cast<unsigned long long>(repeated.unitBytes));
+    std::abort();
+}
 }
 
 std::uint64_t DepthSurfacesSerial() {
@@ -2071,6 +2202,20 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
     std::lock_guard gpu(GuestMemory::GpuMutex());
     settlePendingHtileClear(context, target.address);
     std::unique_lock lock(surfacesMutex());
+    const bool memo = RuntimeSwitches::Set(RuntimeSwitch::DepthViewMemo);
+    DepthSurface* memoized = nullptr;
+    std::optional<DepthViewState> repeated;
+    if (!memo) depthViewMemo.surface = nullptr;
+    else if (htileCleared == 0 && (memoized = depthViewMemoHit(context, target, depthWritten)) != nullptr) {
+        static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
+        thread_local std::uint64_t hits = 0;
+        if (!verify || ++hits % 64u != 0u) {
+            depthViewMemoRepeat(*memoized, target, depthWritten);
+            depthViewMemoHits.fetch_add(1, std::memory_order_relaxed);
+            return memoized->view;
+        }
+        repeated = depthViewMemoVerifyStart(*memoized, target, depthWritten);
+    }
     const bool cleared = takeClearedHtile(target);
     DepthSurface* surface = nullptr;
     for (const auto& candidate : surfaces()) {
@@ -2143,7 +2288,13 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         noteStalePlane(plane, plane + planeBytes);
     }
     drawnDepth = surface;
+    if (repeated.has_value()) depthViewMemoVerifyEnd(*repeated, *memoized, *surface, target);
+    if (memo) rememberDepthView(context, target, depthWritten, surface);
     return surface->view;
+}
+
+std::uint64_t DepthViewMemoHits() {
+    return depthViewMemoHits.load(std::memory_order_relaxed);
 }
 
 SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTarget& target) {
