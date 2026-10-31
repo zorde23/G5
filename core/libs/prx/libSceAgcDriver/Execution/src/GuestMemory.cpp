@@ -1938,6 +1938,19 @@ bool Watched(std::uint64_t address, std::size_t bytes) {
     return tracker.watched && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address && tracker.covers(address, bytes);
 }
 
+bool AnyComparedWhenShared(std::uint64_t address, std::size_t bytes) {
+#ifdef _WIN32
+    void* page = nullptr;
+    std::size_t count = 1;
+    GuestArena::GuestArenaComparedPages_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, &page, &count);
+    return count != 0;
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    return false;
+#endif
+}
+
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& tracker = Tracker();

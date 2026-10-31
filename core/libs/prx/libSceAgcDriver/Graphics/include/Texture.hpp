@@ -27,6 +27,7 @@ namespace AgcDriver::Graphics {
 class Buffer;
 class ResidentColor;
 class CommandBatch;
+class Recorder;
 class StorageTexture;
 struct HostImport;
 
@@ -173,6 +174,27 @@ VkFormat SrgbTwinFormat(const Context& context, VkFormat format);
 // either at once (WriteBack) or deferred: MarkDirty keeps them on the GPU until something reads that
 // memory (FlushPending, through the GuestMemory flush hook), the image is refreshed after a CPU write,
 // or it leaves the cache. Dispatches reusing the image meanwhile skip the round trip entirely.
+// Who reads the range a FlushPending stores: a GPU reader is recorded after the stores, in the
+// same batch order, so with APS5_FLUSH_SKIP_SYNC the stores need not wait for the open batch that
+// wrote the images; a CPU reader always does.
+enum class FlushReader : std::uint8_t { Cpu, Gpu };
+
+// The rule for skipping that wait, over facts gathered
+// per image and for the batch: (a) an import covers the stored span, (b) the span is in the write
+// watch, (d) no page of it is compared when shared, (c) no block the CPU wrote lies on a write range
+// of the open batch, (e) no use of the open batch stores through addresses. The first condition
+// that fails names the blocker; None lets the wait be skipped.
+struct WriterWaitFacts {
+    bool stored = false;
+    bool imported = false;
+    bool watched = false;
+    bool compared = false;
+    bool cpuBlockOnOpenWrite = false;
+    bool addressStore = false;
+};
+enum class WriterWaitBlocker : std::uint8_t { None, NothingStored, Import, Watch, Compared, CpuBlock, AddressStore, Count };
+WriterWaitBlocker BlockerOf(const WriterWaitFacts& facts);
+
 class StorageTexture : public std::enable_shared_from_this<StorageTexture> {
 public:
     static std::shared_ptr<StorageTexture> Create(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel);
@@ -214,9 +236,14 @@ public:
     // UnitShadow.hpp; the reason string picks the publish reason), `published` receiving whether
     // any unit was: a reader of the import must sync for a publish as for a store. Only images
     // with a pending unit inside the range are stored (APS5_NO_FLUSH_PRETEST=1 lists every
-    // overlapping pending image, as before).
-    static bool FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr, const char* reason = "memory access", PublishScope scope = PublishScope::Whole, bool* published = nullptr, bool waited = false);
+    // overlapping pending image, as before). A GPU `reader` lets the stores skip the wait for the
+    // open batch (APS5_FLUSH_SKIP_SYNC) when BlockerOf finds no blocker for every image;
+    // APS5_FLUSH_SKIP_SYNC_VERIFY waits anyway and counts the flushes whose keep decision changed
+    // across the wait.
+    static bool FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr, const char* reason = "memory access", PublishScope scope = PublishScope::Whole, bool* published = nullptr, bool waited = false, FlushReader reader = FlushReader::Cpu);
     static void FlushAllPending(const char* reason);
+    // Flushes whose wait for the open batch APS5_FLUSH_SKIP_SYNC skipped (cumulative).
+    static std::uint64_t WriterWaitsSkipped();
     static bool WaitForFlushing(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr);
     static void SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes);
     static constexpr std::uint64_t SmallStoreBytes = 64 * 1024;
@@ -504,6 +531,32 @@ private:
         std::vector<DrawnRect> rects;
     };
     DrawnArea drawnArea() const;
+    // What a write-back of the pending units over [address, address + bytes) stores: the units, the
+    // stored span with its 64 KiB blocks' write state against the units' generations (`tracked`
+    // false: the span is outside the write watch), and the plan of kept (CPU-written) blocks.
+    struct WriteBackBlocks {
+        std::vector<bool> layers;
+        std::uint64_t firstStored = 0;
+        std::uint64_t lastStored = 0;
+        std::uint64_t spanBegin = 0;
+        std::vector<std::uint8_t> changedBlocks;
+        std::vector<std::uint8_t> cpuBlocks;
+        DrawnArea drawn;
+        bool tracked = false;
+    };
+    struct KeepPlan {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> keep;
+        std::vector<bool> skippedLayer;
+        std::size_t skipped = 0;
+        bool unsavedOutsideWatch = false;
+    };
+    std::vector<bool> storedLayers(std::uint64_t address, std::size_t bytes) const;
+    WriteBackBlocks writeBackBlocks(const std::vector<bool>& layers) const;
+    KeepPlan planKeep(const WriteBackBlocks& blocks, const std::vector<bool>& compared) const;
+    // The facts of BlockerOf for this image's store of the range (the batch's address stores too).
+    WriterWaitFacts writerWaitFacts(std::uint64_t address, std::size_t bytes, const Recorder& recorder) const;
+    // The keep plan the write-back would follow now, hashed (the verify of the skip).
+    std::uint64_t keepDecision(std::uint64_t address, std::size_t bytes) const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> drawnSpans(const DrawnArea& area, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep) const;
     std::uint64_t storeDrawnRect(const DrawnArea& area, std::span<const ImportSegment> segments, std::span<const std::pair<std::uint64_t, std::uint64_t>> stores, const std::vector<std::uint32_t>& saveUnits);
     void addDrawnRect(DrawnRect rect);

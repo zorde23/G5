@@ -184,6 +184,10 @@ public:
     static ReadStatistics ReadCounts();
     // Whether the OPEN (unsubmitted) batch writes the range: a wait on such a range must submit it.
     bool OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
+    // A use recorded into the open batch stores through addresses (no range is noted for it): the
+    // batch may write any memory, so no flush skips its wait for the batch (APS5_FLUSH_SKIP_SYNC).
+    void NoteAddressStore() { addressStoreSerial = OpenSerial(); }
+    bool OpenAddressStore() const { return addressStoreSerial != 0 && addressStoreSerial == OpenSerial(); }
     std::uint64_t PendingWriterSerial(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t PendingWriterSerial(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> exceptNotes) const;
     // What SyncThrough(address, bytes) would wait for, for the [hooksync] attribution: the newest
@@ -856,6 +860,8 @@ private:
     std::vector<const Batch*> finishing;
     mutable std::shared_ptr<const WriteRanges> published;
     std::uint64_t submissions = 0;
+    // The serial of the open batch when a use stored through addresses into it (NoteAddressStore).
+    std::uint64_t addressStoreSerial = 0;
     std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
     std::shared_ptr<Buffer> drawUpload;
