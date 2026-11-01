@@ -512,6 +512,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             GuestMemory::SetCurrentPacket(0x15, queueId);
             const auto& compiledCommit = *result;
             const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
+            struct ProgramScope {
+                explicit ProgramScope(std::uint64_t program) { GuestMemory::SetCurrentProgram(program); }
+                ~ProgramScope() { GuestMemory::SetCurrentProgram(0); }
+            } programScope(address);
             try {
                 std::shared_ptr<RecipeHit> recipeHit = htileClearCompletion.has_value() ? nullptr : localDevice->PrepareRecipe(recipe, false);
                 std::shared_ptr<const Recipe> builtRecipe;

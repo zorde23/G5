@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/Shutdown.hpp"
@@ -20,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -254,6 +256,55 @@ int main() {
             std::printf("pipelined dispatch: scalar read round %zu, fill 0x%08x, dispatch drains %llu\n", round, value, static_cast<unsigned long long>(drains));
             if (!pipelinedDispatch) check(drains >= 1, "a dispatch did not drain the pipeline, and APS5_PIPELINE_DISPATCH is off");
             if (pipelinedDispatch) check(drains <= 1, "a dispatch drained the pipeline more than once (" + std::to_string(drains) + ")");
+        }
+        if (pipelinedDispatch) {
+            std::size_t pending = 0;
+            for (std::size_t round = 0; round < 3; ++round) {
+                WaitUntil([] { return DrawPipeline::QueuedItems() == 0; }, "the pipeline to empty before program round " + std::to_string(round));
+                struct Seen {
+                    std::atomic<bool> released{false};
+                    std::atomic<bool> checked{false};
+                    bool overlaps = false;
+                    std::uint64_t program = 0;
+                    std::uint64_t inherited = ~0ull;
+                };
+                const auto seen = std::make_shared<Seen>();
+                struct Release {
+                    std::shared_ptr<Seen> seen;
+                    ~Release() { seen->released.store(true, std::memory_order_release); }
+                } release{seen};
+                DrawPipeline::Queue0().Enqueue([seen] {
+                    while (!seen->released.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }, {});
+                auto words = Round(Input, 0x5eed0000u + static_cast<std::uint32_t>(round), Code.data());
+                Submit(words);
+                std::size_t queued = 0;
+                WaitUntil([&queued] {
+                    const auto now = DrawPipeline::QueuedItems();
+                    const bool settled = now >= 2 && now == queued;
+                    queued = now;
+                    if (!settled) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    return settled;
+                }, "the fill and the dispatch queued behind the gate");
+                DrawPipeline::Queue0().Enqueue([seen] {
+                    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+                    if (const auto* recorder = AgcDriver::Graphics::Recorder::Active()) {
+                        seen->overlaps = recorder->PendingWriteOverlaps(reinterpret_cast<std::uintptr_t>(Output), BufferBytes);
+                        seen->program = recorder->NewestWriteProgram(reinterpret_cast<std::uintptr_t>(Output), BufferBytes);
+                    }
+                    seen->inherited = AgcDriver::GuestMemory::CurrentProgram();
+                    seen->checked.store(true, std::memory_order_release);
+                }, {});
+                seen->released.store(true, std::memory_order_release);
+                AgcDriverWaitIdle_nid_postfix();
+                check(seen->checked.load(std::memory_order_acquire), "the program check did not run on the committer");
+                check(seen->inherited == 0, "an item committed after a pipelined dispatch inherited its program");
+                if (!seen->overlaps) continue;
+                ++pending;
+                check(seen->program == reinterpret_cast<std::uintptr_t>(Code.data()), "a pipelined dispatch's pending write was noted under program " + std::to_string(seen->program) + ", not under its own");
+            }
+            std::printf("pipelined dispatch: program noted on %zu of 3 pending dispatch writes\n", pending);
+            check(pending > 0, "no pipelined dispatch write was still pending when the committer checked it");
         }
         LibcRunShutdown_nid_postfix();
         std::puts("pipelined dispatch tests passed");
