@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "Recompiler.hpp"
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -193,6 +194,7 @@ void DrawFinisher::run() {
     for (;;) {
         Job* job = nullptr;
         bool failed = false;
+        if (outstanding.load(std::memory_order_acquire) == 0) ShaderRecompiler::ReleaseDeferredResults();
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);

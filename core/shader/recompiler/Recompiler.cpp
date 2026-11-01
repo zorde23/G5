@@ -398,6 +398,18 @@ constexpr std::size_t ResultMemoSets = 64;
 constexpr std::size_t ResultMemoWays = 4;
 using ResultMemoTable = std::array<ResultMemoEntry, ResultMemoSets * ResultMemoWays>;
 
+// APS5_RESULT_MEMO_ADMISSION: the last result patched from a donor for each slot, by its exact memo
+// key, without keeping it alive. A later miss with the same key admits its result to the memo; a
+// different key overwrites the slot, so the table ages with the traffic instead of growing.
+struct ResultMemoSighting {
+    std::uint64_t variantId = 0;
+    std::uint64_t hash = 0;
+    bool seen = false;
+    std::weak_ptr<const RecompileResult> result;
+};
+constexpr std::size_t ResultMemoSightings = 256;
+using ResultMemoSightingTable = std::array<ResultMemoSighting, ResultMemoSightings>;
+
 struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::mutex mutex;
     // The code the entry was built for: the key carries only a hash of it, so a candidate entry is
@@ -416,6 +428,7 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::vector<EmissionFailure> emissionFailures;
     std::unique_ptr<ResultMemoTable> memo;
     std::unique_ptr<ResultMemoTable> maskedMemo;
+    std::unique_ptr<ResultMemoSightingTable> sightings;
 };
 
 namespace {
@@ -1469,6 +1482,38 @@ bool VerifyMaskedResultMemo() {
     return verify;
 }
 
+// APS5_RESULT_MEMO_ADMISSION: a result patched from a donor enters the memo only when its key was
+// seen before (ResultMemoSighting), and evicted results are released by ReleaseDeferredResults.
+bool ResultMemoAdmission() {
+    static const bool admission = std::getenv("APS5_RESULT_MEMO_ADMISSION") != nullptr;
+    return admission;
+}
+
+struct DeferredResults {
+    std::mutex mutex;
+    std::vector<std::shared_ptr<const RecompileResult>> results;
+    std::atomic<std::size_t> count{0};
+};
+
+DeferredResults& deferredResults() {
+    static auto* deferred = new DeferredResults();
+    return *deferred;
+}
+
+// Holds evicted results for ReleaseDeferredResults; past 1024 the caller releases them itself.
+void deferRelease(std::vector<std::shared_ptr<const RecompileResult>>& evicted) {
+    if (evicted.empty()) return;
+    auto& deferred = deferredResults();
+    std::vector<std::shared_ptr<const RecompileResult>> released;
+    {
+        std::lock_guard lock(deferred.mutex);
+        deferred.results.insert(deferred.results.end(), std::make_move_iterator(evicted.begin()), std::make_move_iterator(evicted.end()));
+        if (deferred.results.size() > 1024) released.swap(deferred.results);
+        deferred.count.store(deferred.results.size(), std::memory_order_relaxed);
+    }
+    evicted.clear();
+}
+
 ResultMemoEntry* memoSet(const std::unique_ptr<ResultMemoTable>& table, std::uint64_t index) {
     if (table == nullptr) return nullptr;
     return table->data() + static_cast<std::size_t>((index ^ (index >> 32u)) % ResultMemoSets) * ResultMemoWays;
@@ -1796,6 +1841,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     const auto maskedIndex = (variantId * 0x9e3779b97f4a7c15ull) ^ maskedHash;
     std::shared_ptr<const RecompileResult> donor;
     std::shared_ptr<const MemoPatch> donorPatch;
+    const bool admission = ResultMemoAdmission();
     if (masking) {
         std::lock_guard lock(source.mutex);
         if (auto* set = memoSet(source.maskedMemo, maskedIndex)) {
@@ -1809,10 +1855,42 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
             }
         }
     }
+    // APS5_RESULT_MEMO_ADMISSION: a donor miss whose exact key is the slot's sighting is admitted,
+    // with the sighted result itself while a holder keeps it alive; any other key replaces the
+    // sighting and the patched result is served without entering the memo.
+    bool admitted = true;
+    std::shared_ptr<const RecompileResult> sighted;
+    if (admission && donor != nullptr) {
+        std::lock_guard lock(source.mutex);
+        if (source.sightings == nullptr) source.sightings = std::make_unique<ResultMemoSightingTable>();
+        auto& sighting = (*source.sightings)[static_cast<std::size_t>((index ^ (index >> 32u)) % ResultMemoSightings)];
+        if (sighting.seen && sighting.variantId == variantId && sighting.hash == hash) {
+            sighted = sighting.result.lock();
+            sighting = {};
+        } else {
+            sighting = {variantId, hash, true, {}};
+            admitted = false;
+        }
+    }
+    static const bool verifyAdmission = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
+    thread_local std::uint64_t admissionChecks = 0;
+    if (admission && donor != nullptr && verifyAdmission && ++admissionChecks % 64u == 0u) {
+        const auto full = materializeResult(*variant, request, snapshot);
+        std::shared_ptr<RecompileResult> patched;
+        if (sighted == nullptr) {
+            patched = std::make_shared<RecompileResult>(*donor);
+            applyMemoPatch(*patched, *donorPatch, snapshot);
+        }
+        if (const auto* difference = patchedResultDifference(sighted != nullptr ? *sighted : *patched, full); difference != nullptr) {
+            throw std::runtime_error(std::string("ShaderRecompiler: APS5_RESULT_MEMO_ADMISSION verify: the ") + (sighted != nullptr ? "sighted" : "patched") + " result of variant " + std::to_string(variantId) + " differs from a full materialization in its " + difference);
+        }
+    }
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::shared_ptr<RecompileResult> result;
     std::shared_ptr<MemoPatch> patch;
-    if (donor != nullptr) {
+    if (sighted != nullptr) {
+        counters.patched.fetch_add(1, std::memory_order_relaxed);
+    } else if (donor != nullptr) {
         result = std::make_shared<RecompileResult>(*donor);
         applyMemoPatch(*result, *donorPatch, snapshot);
         if (VerifyMaskedResultMemo()) verifyPatchedResult(*result, materializeResult(*variant, request, snapshot), variantId);
@@ -1824,9 +1902,21 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         if (profile) counters.populateNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
         counters.misses.fetch_add(1, std::memory_order_relaxed);
     }
-    result->cacheHit = cacheHit;
-    std::shared_ptr<const RecompileResult> shared = std::move(result);
+    std::shared_ptr<const RecompileResult> shared;
+    if (sighted != nullptr) {
+        shared = std::move(sighted);
+    } else {
+        result->cacheHit = cacheHit;
+        shared = std::move(result);
+    }
+    if (!admitted) {
+        std::lock_guard lock(source.mutex);
+        auto& sighting = (*source.sightings)[static_cast<std::size_t>((index ^ (index >> 32u)) % ResultMemoSightings)];
+        if (sighting.seen && sighting.variantId == variantId && sighting.hash == hash) sighting.result = shared;
+        return shared;
+    }
     const auto bytes = resultBytes(*shared);
+    std::vector<std::shared_ptr<const RecompileResult>> evicted;
     const auto insert = [&](std::unique_ptr<ResultMemoTable>& table, std::uint64_t at, std::uint64_t key, std::shared_ptr<const MemoPatch> recipe, bool count) {
         if (table == nullptr) {
             table = std::make_unique<ResultMemoTable>();
@@ -1847,6 +1937,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
             if (entry.used < victim->used) victim = &entry;
         }
         if (victim->result != nullptr) {
+            if (admission) evicted.push_back(std::move(victim->result));
             if (count) counters.evictions.fetch_add(1, std::memory_order_relaxed);
             counters.heldBytes.fetch_sub(victim->bytes, std::memory_order_relaxed);
             counters.heldEntries.fetch_sub(1, std::memory_order_relaxed);
@@ -1862,6 +1953,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         shared = insert(source.memo, index, hash, nullptr, true);
         if (patch != nullptr && patch->valid) static_cast<void>(insert(source.maskedMemo, maskedIndex, maskedHash, patch, false));
     }
+    deferRelease(evicted);
     if (const auto budget = resultMemoBudget(); budget != 0 && counters.heldBytes.load(std::memory_order_relaxed) > budget) trimResultMemo(budget);
     reportResultMemo();
     return shared;
@@ -2105,6 +2197,17 @@ void SetResultMemoBudget(std::uint64_t bytes) {
 void SetResultMemoTrimHook(std::function<void()> hook) {
     std::lock_guard lock(resultMemoTrimMutex());
     resultMemoTrimHook() = std::move(hook);
+}
+
+void ReleaseDeferredResults() {
+    auto& deferred = deferredResults();
+    if (deferred.count.load(std::memory_order_relaxed) == 0) return;
+    std::vector<std::shared_ptr<const RecompileResult>> released;
+    {
+        std::lock_guard lock(deferred.mutex);
+        released.swap(deferred.results);
+        deferred.count.store(0, std::memory_order_relaxed);
+    }
 }
 
 std::uint64_t ResultMemoBytes() {

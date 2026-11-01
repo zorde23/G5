@@ -279,6 +279,7 @@ function(add_shader_recompiler target runtimeTarget)
             ResolveSource
             ResourceMaterializer::EvaluateNanoseconds
             ResourceMaterializer::MaterializeNanoseconds
+            ReleaseDeferredResults
             ReleaseUndrawnResourcePlan
             ResourceMaterializer::SpecializationNanoseconds
             RuntimeAbi::RequireVersion

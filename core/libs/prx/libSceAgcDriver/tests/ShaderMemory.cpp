@@ -492,6 +492,8 @@ void verifyResultMemoBudgetMasked() {
     require(!compileResultMemoPixel(1u), "result memo budget masked: the first compile hit the memo");
     const auto first = ResultMemoBytes();
     require(!compileResultMemoPixel(2u), "result memo budget masked: a new snapshot hit the memo");
+    // APS5_RESULT_MEMO_ADMISSION memoizes a patched result at the second sighting of its snapshot.
+    if (std::getenv("APS5_RESULT_MEMO_ADMISSION") != nullptr) require(!compileResultMemoPixel(2u), "result memo budget masked: an unadmitted snapshot hit the memo");
     const auto second = ResultMemoBytes() - first;
     require(second != 0u && second < first, std::string("result memo budget masked: the masked table's entry was not counted (first result " + std::to_string(first) + " bytes, patched result " + std::to_string(second) + ")").c_str());
     SetResultMemoBudget(1u);
@@ -499,6 +501,24 @@ void verifyResultMemoBudgetMasked() {
     SetResultMemoBudget(0u);
     require(!compileResultMemoPixel(3u), "result memo budget masked: a snapshot after the trim hit the memo");
     require(ResultMemoBytes() == first, std::string("result memo budget masked: the trim left a masked entry to patch from (" + std::to_string(ResultMemoBytes()) + " bytes after one compile, " + std::to_string(first) + " for a full one)").c_str());
+}
+
+// APS5_RESULT_MEMO_ADMISSION (assigned by the test): a result patched from a donor stays out of the
+// memo at the first sighting of its snapshot, enters it at the second, and hits from then on.
+void verifyResultMemoAdmission() {
+    using namespace ShaderRecompiler;
+    require(std::getenv("APS5_RESULT_MEMO_ADMISSION") != nullptr, "result memo admission: the test runs with APS5_RESULT_MEMO_ADMISSION");
+    require(!compileResultMemoPixel(1u) && compileResultMemoPixel(1u), "result memo admission: a full build was not memoized");
+    const auto full = ResultMemoBytes();
+    require(!compileResultMemoPixel(2u), "result memo admission: a new snapshot hit the memo");
+    require(ResultMemoBytes() == full, "result memo admission: a patched result entered the memo at its first sighting");
+    require(!compileResultMemoPixel(2u), "result memo admission: an unadmitted snapshot hit the memo");
+    require(ResultMemoBytes() > full, "result memo admission: a patched result seen twice was not memoized");
+    require(compileResultMemoPixel(2u), "result memo admission: an admitted snapshot missed the memo");
+    require(!compileResultMemoPixel(3u) && !compileResultMemoPixel(4u) && !compileResultMemoPixel(3u), "result memo admission: a snapshot hit the memo before it was admitted");
+    require(compileResultMemoPixel(3u), "result memo admission: a snapshot seen again after another one was not admitted");
+    ReleaseDeferredResults();
+    require(compileResultMemoPixel(1u) && compileResultMemoPixel(2u), "result memo admission: releasing the evicted results dropped memoized ones");
 }
 
 void verifyResultMemoBudget() {
@@ -8688,6 +8708,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--result-memo-budget") {
             verifyResultMemoBudget();
             std::cout << "The result memo keeps its most recently used results within its byte budget\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--result-memo-admission") {
+            verifyResultMemoAdmission();
+            std::cout << "result memo admission passed" << std::endl;
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--result-memo-budget-masked") {
