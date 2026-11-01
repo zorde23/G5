@@ -1636,6 +1636,8 @@ if(BUILD_TESTING)
     add_test(NAME agc_pipeline_cache COMMAND agc_driver_recorder_tests --pipeline-cache-only)
     add_test(NAME agc_pipeline_cache_file COMMAND agc_driver_recorder_tests --pipeline-cache-file-only)
     add_test(NAME agc_pipeline_cache_header COMMAND agc_driver_recorder_tests --pipeline-cache-header-only)
+    add_test(NAME agc_pipeline_cache_file_shared COMMAND agc_driver_recorder_tests --pipeline-cache-file-only)
+    set_tests_properties(agc_pipeline_cache_file_shared PROPERTIES ENVIRONMENT "APS5_PIPELINE_CACHE_SHARED=1")
     set_tests_properties(agc_pipeline_cache_header PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
     if(WIN32)
         set_tests_properties(agc_pipeline_cache_header PROPERTIES ENVIRONMENT_MODIFICATION
@@ -1655,9 +1657,9 @@ if(BUILD_TESTING)
         set_tests_properties(agc_pipeline_library agc_pipeline_library_off agc_pipeline_library_fast_only agc_pipeline_library_lto_info agc_pipeline_library_lto_info_fast_only PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
-    set_tests_properties(agc_pipeline_cache agc_pipeline_cache_file PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(agc_pipeline_cache agc_pipeline_cache_file agc_pipeline_cache_file_shared PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
-        set_tests_properties(agc_pipeline_cache agc_pipeline_cache_file PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_pipeline_cache agc_pipeline_cache_file agc_pipeline_cache_file_shared PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_import_watch COMMAND agc_driver_recorder_tests --import-watch-only)

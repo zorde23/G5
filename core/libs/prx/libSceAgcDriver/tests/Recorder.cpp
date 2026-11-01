@@ -10771,7 +10771,7 @@ int pipelineCacheFileTests(const Device& device) {
         for (const auto& entry : std::filesystem::directory_iterator(directory)) Require(entry.is_directory(), "a pipeline cache file lives in the shader cache root");
         char version[17];
         std::snprintf(version, sizeof(version), "%016llx", static_cast<unsigned long long>(ShaderRecompiler::ShaderDiskCache::Generated::SourceVersion));
-        const auto versionDirectory = directory / version;
+        const auto versionDirectory = directory / (std::getenv("APS5_PIPELINE_CACHE_SHARED") != nullptr ? std::string("pipelines") : std::string(version));
         Require(std::filesystem::is_directory(versionDirectory), "the current shader cache version has no directory");
         std::vector<std::filesystem::path> found;
         for (const auto& entry : std::filesystem::directory_iterator(versionDirectory)) found.push_back(entry.path());
@@ -10845,6 +10845,23 @@ int pipelineCacheFileTests(const Device& device) {
     {
         PipelineCache reloaded(context, properties);
         Require(holds(reloaded.Handle(), 0) && holds(reloaded.Handle(), 1), "a cache that saved over an unchanged file lost pipelines");
+    }
+    {
+        auto foreign = contents(path);
+        constexpr std::size_t VulkanHeader = 24;
+        Require(foreign.size() >= VulkanHeader + 32, "the cache file is shorter than its headers");
+        for (std::size_t byte = VulkanHeader + 12; byte < VulkanHeader + 32; ++byte) foreign[byte] = static_cast<char>(~foreign[byte]);
+        std::ofstream rewritten(path, std::ios::binary | std::ios::trunc);
+        rewritten.write(foreign.data(), static_cast<std::streamsize>(foreign.size()));
+    }
+    {
+        PipelineCache foreign(context, properties);
+        Require(!holds(foreign.Handle(), 0), "a cache file made for another device or driver was loaded");
+        build(foreign.Handle(), 1);
+    }
+    {
+        PipelineCache reloaded(context, properties);
+        Require(holds(reloaded.Handle(), 1), "a cache file made for another device or driver was not replaced by the saving object's pipelines");
     }
     {
         std::ofstream corrupt(path, std::ios::binary | std::ios::trunc);
