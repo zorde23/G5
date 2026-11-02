@@ -171,13 +171,14 @@ constexpr std::size_t FinisherDepth = 16;
 std::atomic<std::uint64_t> wakeSafetyTimeouts{0};
 
 template <class Ready>
-void waitCounted(std::condition_variable& condition, std::unique_lock<std::mutex>& lock, Ready ready) {
+void waitCounted(std::condition_variable& condition, std::unique_lock<std::mutex>& lock, const std::uint64_t& notifies, Ready ready) {
     if (!DrawPipeline::WakeHysteresis()) {
         condition.wait(lock, ready);
         return;
     }
     while (!ready()) {
-        if (condition.wait_for(lock, std::chrono::milliseconds(250)) != std::cv_status::timeout || !ready()) continue;
+        const auto before = notifies;
+        if (condition.wait_for(lock, std::chrono::milliseconds(250)) != std::cv_status::timeout || !ready() || notifies != before) continue;
         const auto count = wakeSafetyTimeouts.fetch_add(1, std::memory_order_relaxed) + 1;
         std::fprintf(stderr, "[draw] wake hysteresis: a pipeline wait found its condition already met at its 250 ms safety timeout, a possible missed wake (%llu so far)\n", static_cast<unsigned long long>(count));
     }
@@ -210,8 +211,11 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     if (jobs.size() >= depth) {
         const std::size_t resume = DrawPipeline::WakeHysteresis() ? depth / 2 : depth - 1;
         ++fullWaiters;
-        waitCounted(idle, lock, [&] { return jobs.size() <= resume; });
-        --fullWaiters;
+        struct Waiting {
+            std::uint32_t& count;
+            ~Waiting() { --count; }
+        } waiting{fullWaiters};
+        waitCounted(idle, lock, idleNotifies, [&] { return jobs.size() <= resume; });
     }
     jobs.push_back(std::move(job));
     pending.push_back(std::move(held));
@@ -253,7 +257,10 @@ void DrawFinisher::run() {
         jobs.pop_front();
         pending.pop_front();
         outstanding.fetch_sub(1, std::memory_order_release);
-        if (!DrawPipeline::WakeHysteresis() || jobs.empty() || (fullWaiters != 0 && jobs.size() <= FinisherDepth / 2)) idle.notify_all();
+        if (!DrawPipeline::WakeHysteresis() || jobs.empty() || failure != nullptr || (fullWaiters != 0 && jobs.size() <= FinisherDepth / 2)) {
+            ++idleNotifies;
+            idle.notify_all();
+        }
     }
 }
 
@@ -261,7 +268,7 @@ void DrawFinisher::Settle() {
     if (!Busy() || OnFinisherThread()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher settle under the GPU lock");
     std::unique_lock lock(mutex);
-    waitCounted(idle, lock, [&] { return jobs.empty(); });
+    waitCounted(idle, lock, idleNotifies, [&] { return jobs.empty(); });
 }
 
 void DrawFinisher::Drain() {
@@ -269,7 +276,7 @@ void DrawFinisher::Drain() {
     if (Busy() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
     SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
     std::unique_lock lock(mutex);
-    if (!jobs.empty()) waitCounted(idle, lock, [&] { return jobs.empty(); });
+    if (!jobs.empty()) waitCounted(idle, lock, idleNotifies, [&] { return jobs.empty(); });
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
 }
 
@@ -350,8 +357,11 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         if (WakeHysteresis()) {
             const auto resume = Depth() / 2;
             ++fullWaiters;
-            waitCounted(idle, lock, [&] { return items.size() <= resume; });
-            --fullWaiters;
+            struct Waiting {
+                std::uint32_t& count;
+                ~Waiting() { --count; }
+            } waiting{fullWaiters};
+            waitCounted(idle, lock, idleNotifies, [&] { return items.size() <= resume; });
         } else {
             resumeAt = Depth() - 1;
             ++idleWaiters;
@@ -465,8 +475,10 @@ void DrawPipeline::run() {
         if (failed) ++commitErrors;
         if (fatal != nullptr && failure == nullptr) failure = fatal;
         outstanding.fetch_sub(1, std::memory_order_release);
-        if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
-        else if (fullWaiters != 0 && items.size() <= Depth() / 2) idle.notify_all();
+        if ((idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) || (fullWaiters != 0 && (items.size() <= Depth() / 2 || failure != nullptr))) {
+            ++idleNotifies;
+            idle.notify_all();
+        }
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -500,7 +512,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
     std::unique_lock lock(mutex);
     ++idleWaiters;
-    waitCounted(idle, lock, [&] { return items.empty(); });
+    waitCounted(idle, lock, idleNotifies, [&] { return items.empty(); });
     --idleWaiters;
     const auto index = static_cast<std::size_t>(reason);
     ++drains[index];
