@@ -33,6 +33,8 @@ public:
 
     static DrawPipeline& Queue0();
     static std::size_t Depth();
+    static bool WakeHysteresis();
+    static std::uint64_t WakeSafetyTimeouts();
     static std::size_t QueuedItems();
     static bool& Active();
     static std::atomic<std::uint64_t>& EpochToken();
@@ -88,6 +90,7 @@ private:
     std::atomic<std::uint64_t> decodeDrains{0};
     std::uint64_t reportedDecodeDrains = 0;
     std::uint32_t idleWaiters = 0;
+    std::uint32_t fullWaiters = 0;
     std::size_t resumeAt = 0;
     bool committerWaiting = false;
     bool stopped = false;
@@ -154,6 +157,7 @@ private:
     std::exception_ptr failure;
     bool running = false;
     bool sleeping = false;
+    std::uint32_t fullWaiters = 0;
     std::thread thread;
 };
 

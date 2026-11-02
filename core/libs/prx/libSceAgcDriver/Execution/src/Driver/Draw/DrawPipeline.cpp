@@ -165,9 +165,41 @@ void DrawFinisher::Enqueue(Job job) {
     Enqueue(std::move(job), Pending{});
 }
 
+namespace {
+
+constexpr std::size_t FinisherDepth = 16;
+std::atomic<std::uint64_t> wakeSafetyTimeouts{0};
+
+template <class Ready>
+void waitCounted(std::condition_variable& condition, std::unique_lock<std::mutex>& lock, Ready ready) {
+    if (!DrawPipeline::WakeHysteresis()) {
+        condition.wait(lock, ready);
+        return;
+    }
+    while (!ready()) {
+        if (condition.wait_for(lock, std::chrono::milliseconds(250)) != std::cv_status::timeout || !ready()) continue;
+        const auto count = wakeSafetyTimeouts.fetch_add(1, std::memory_order_relaxed) + 1;
+        std::fprintf(stderr, "[draw] wake hysteresis: a pipeline wait found its condition already met at its 250 ms safety timeout, a possible missed wake (%llu so far)\n", static_cast<unsigned long long>(count));
+    }
+}
+
+}
+
+bool DrawPipeline::WakeHysteresis() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_PIPELINE_WAKE_HYSTERESIS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+std::uint64_t DrawPipeline::WakeSafetyTimeouts() {
+    return wakeSafetyTimeouts.load(std::memory_order_relaxed);
+}
+
 void DrawFinisher::Enqueue(Job job, Pending held) {
     finisherProducer = true;
-    constexpr std::size_t depth = 16;
+    constexpr std::size_t depth = FinisherDepth;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Job>, ReclaimStorage>();
     reclaim.clear();
@@ -175,7 +207,12 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     if (!ran.empty()) std::swap(ran, reclaim);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
     if (jobs.size() >= depth && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
-    idle.wait(lock, [&] { return jobs.size() < depth; });
+    if (jobs.size() >= depth) {
+        const std::size_t resume = DrawPipeline::WakeHysteresis() ? depth / 2 : depth - 1;
+        ++fullWaiters;
+        waitCounted(idle, lock, [&] { return jobs.size() <= resume; });
+        --fullWaiters;
+    }
     jobs.push_back(std::move(job));
     pending.push_back(std::move(held));
     outstanding.fetch_add(1, std::memory_order_release);
@@ -216,7 +253,7 @@ void DrawFinisher::run() {
         jobs.pop_front();
         pending.pop_front();
         outstanding.fetch_sub(1, std::memory_order_release);
-        idle.notify_all();
+        if (!DrawPipeline::WakeHysteresis() || jobs.empty() || (fullWaiters != 0 && jobs.size() <= FinisherDepth / 2)) idle.notify_all();
     }
 }
 
@@ -224,7 +261,7 @@ void DrawFinisher::Settle() {
     if (!Busy() || OnFinisherThread()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher settle under the GPU lock");
     std::unique_lock lock(mutex);
-    idle.wait(lock, [&] { return jobs.empty(); });
+    waitCounted(idle, lock, [&] { return jobs.empty(); });
 }
 
 void DrawFinisher::Drain() {
@@ -232,7 +269,7 @@ void DrawFinisher::Drain() {
     if (Busy() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
     SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
     std::unique_lock lock(mutex);
-    if (!jobs.empty()) idle.wait(lock, [&] { return jobs.empty(); });
+    if (!jobs.empty()) waitCounted(idle, lock, [&] { return jobs.empty(); });
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
 }
 
@@ -310,11 +347,18 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     if (items.size() >= Depth()) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
-        resumeAt = Depth() - 1;
-        ++idleWaiters;
-        idle.wait(lock, [&] { return items.size() <= resumeAt; });
-        --idleWaiters;
-        resumeAt = 0;
+        if (WakeHysteresis()) {
+            const auto resume = Depth() / 2;
+            ++fullWaiters;
+            waitCounted(idle, lock, [&] { return items.size() <= resume; });
+            --fullWaiters;
+        } else {
+            resumeAt = Depth() - 1;
+            ++idleWaiters;
+            idle.wait(lock, [&] { return items.size() <= resumeAt; });
+            --idleWaiters;
+            resumeAt = 0;
+        }
         fullWaitNs += elapsedNs(start);
         rethrowFailure();
     }
@@ -422,6 +466,7 @@ void DrawPipeline::run() {
         if (fatal != nullptr && failure == nullptr) failure = fatal;
         outstanding.fetch_sub(1, std::memory_order_release);
         if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
+        else if (fullWaiters != 0 && items.size() <= Depth() / 2) idle.notify_all();
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -455,7 +500,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
     std::unique_lock lock(mutex);
     ++idleWaiters;
-    idle.wait(lock, [&] { return items.empty(); });
+    waitCounted(idle, lock, [&] { return items.empty(); });
     --idleWaiters;
     const auto index = static_cast<std::size_t>(reason);
     ++drains[index];
