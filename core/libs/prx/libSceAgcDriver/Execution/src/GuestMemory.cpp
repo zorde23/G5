@@ -2258,7 +2258,17 @@ bool CpuWrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t gen
     const auto first = tracker.blockOf(address);
     const auto last = tracker.blockOf(address + bytes - 1);
     for (auto block = first; block <= last; ++block) {
-        if (tracker.cpuStampOf(block) > generation) return true;
+        const auto pages = tracker.cpuPages.find(block);
+        if (pages == tracker.cpuPages.end()) {
+            if (tracker.cpuStampOf(block) > generation) return true;
+            continue;
+        }
+        const auto begin = tracker.blockBegin(block);
+        const auto from = std::max(address, begin) - begin;
+        const auto to = std::min<std::uint64_t>(address + bytes, begin + WriteBlockBytes) - begin;
+        for (auto page = from / WritePageBytes; page <= (to - 1) / WritePageBytes; ++page) {
+            if (pages->second.pages[page] > generation) return true;
+        }
     }
     return false;
 }

@@ -1914,8 +1914,8 @@ bool speculateHtileNotCleared(Recorder& recorder, const HtileSpeculationKey& key
     if (found == htileSpeculations().end() || found->second.banned || !found->second.notCleared) return false;
     const auto speculatedAt = GuestMemory::CollectWritesUncached(key.address, key.bytes);
     if (GuestMemory::CpuWrittenSince(key.address, key.bytes, found->second.observed)) return false;
+    if (!recorder.AfterPendingWrite(key.address, key.bytes, [recorder = &recorder, key, speculatedAt, note = recorder.WriteNoteCount()] { verifyHtileSpeculation(*recorder, key, speculatedAt, note); })) return false;
     htileSpeculated.fetch_add(1, std::memory_order_relaxed);
-    recorder.OnComplete([recorder = &recorder, key, speculatedAt, note = recorder.WriteNoteCount()] { verifyHtileSpeculation(*recorder, key, speculatedAt, note); });
     return true;
 }
 

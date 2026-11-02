@@ -3222,6 +3222,20 @@ std::uint64_t Recorder::NewestWriteProgram(std::uint64_t address, std::size_t by
     return program;
 }
 
+bool Recorder::AfterPendingWrite(std::uint64_t address, std::size_t bytes, std::function<void()> action) {
+    if (bytes == 0) return false;
+    const auto end = address + bytes;
+    Batch* target = open != nullptr && overlaps(*open, address, end) ? open.get() : nullptr;
+    for (auto it = inFlight.rbegin(); target == nullptr && it != inFlight.rend(); ++it) {
+        if (overlaps(**it, address, end)) target = it->get();
+    }
+    if (target == nullptr) return false;
+    target->completions.push_back(std::move(action));
+    ++target->writeBackCompletionCount;
+    writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
+    return true;
+}
+
 bool Recorder::WrittenAfterNote(std::uint64_t address, std::size_t bytes, std::uint64_t note) const {
     if (bytes == 0) return false;
     const auto end = address + bytes;

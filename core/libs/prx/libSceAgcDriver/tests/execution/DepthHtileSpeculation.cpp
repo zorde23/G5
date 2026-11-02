@@ -172,6 +172,38 @@ int main() {
         Require(Draw(*device, shaders, depth, {}) == 0u, "the draw after a partial HTILE write cleared the depth");
         Require(HtileStoreBackReads() == reads + 1u && HtileSpeculationCounters().speculated == beforePartial.speculated, "a writer covering only part of the HTILE was speculated");
 
+        QueueHtileWriteBack(context, *recorder, htileAddress, Expanded, 9u);
+        Require(Draw(*device, shaders, depth, {}) == 0u, "an expanded HTILE of a ninth writer cleared the depth");
+        const auto beforeEarlier = HtileSpeculationCounters();
+        QueueHtileWriteBack(context, *recorder, htileAddress, Cleared, 9u);
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            recorder->Submit();
+        }
+        static_cast<void>(AgcDriver::Graphics::DepthSurfaceView(context, target, false));
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            recorder->SyncThrough(htileAddress, HtileBytes);
+        }
+        const auto earlier = HtileSpeculationCounters();
+        Require(earlier.speculated == beforeEarlier.speculated + 1u && earlier.diverged == beforeEarlier.diverged + 1u && earlier.rewritten == beforeEarlier.rewritten + 1u, "a divergence of a writer in an earlier batch was not checked when that batch finished");
+        Require(Holds(htile, Expanded), "the missed fast clear of a writer in an earlier batch was left in the HTILE");
+        reads = HtileStoreBackReads();
+        static_cast<void>(AgcDriver::Graphics::DepthSurfaceView(context, target, false));
+        Require(HtileStoreBackReads() == reads, "the bind after the earlier batch finished read the HTILE again and could apply the clear late");
+        device->WaitIdle();
+
+        QueueHtileWriteBack(context, *recorder, htileAddress, Expanded, 10u);
+        Require(Draw(*device, shaders, depth, {}) == 0u, "an expanded HTILE of a tenth writer cleared the depth");
+        const auto beforeNeighbour = HtileSpeculationCounters();
+        QueueHtileWriteBack(context, *recorder, htileAddress, Cleared, 10u);
+        static_cast<void>(AgcDriver::Graphics::DepthSurfaceView(context, target, false));
+        reinterpret_cast<volatile std::uint32_t*>(htileAddress + HtileBytes)[0] = 1u;
+        AgcDriver::GuestMemory::CollectWrites(htileAddress + HtileBytes, 4u);
+        device->WaitIdle();
+        const auto neighbour = HtileSpeculationCounters();
+        Require(neighbour.diverged == beforeNeighbour.diverged + 1u && neighbour.rewritten == beforeNeighbour.rewritten + 1u, "a CPU store next to the HTILE, in the same watch block, kept the missed fast clear from being consumed");
+
         const auto stencilAddress = reinterpret_cast<std::uint64_t>(AllocateWatched(Block));
         std::fill(htile.begin(), htile.end(), StencilExpanded);
         const Surface stencil{depthAddress, stencilAddress, htileAddress, true, VK_FORMAT_D32_SFLOAT_S8_UINT};
