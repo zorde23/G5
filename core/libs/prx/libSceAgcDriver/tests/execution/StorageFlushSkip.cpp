@@ -364,6 +364,28 @@ void LabelReaderCompletionLabelWaits(AgcDriver::VulkanDevice& device, const Gues
     RequireWaits(device, gate, image, what);
 }
 
+void LabelReaderLaterCompletionGap(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
+    const std::string what = "storage flush skip, label reader with a completion that may write the span in a batch after the writer: ";
+    AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::FlushSkipSyncLabel, false);
+    SubmissionGate gate(device);
+    const auto image = guest.Address() + SlotBytes;
+    HeldWriter(device, gate, image, what, [] {});
+    std::atomic<bool> ran{false};
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto* recorder = AgcDriver::Graphics::Recorder::Active();
+        recorder->OnComplete([&ran] { ran = true; });
+        Require(recorder->PendingWriterSerial(image, ImageBytes) != recorder->OpenSerial(), what + "the batch holding the completion became the writer of the range");
+    }
+    gate.ReleaseAfter(HeldFor);
+    Require(!Flush(image, AgcDriver::Graphics::FlushReader::Label, what), what + "the flush skipped the wait");
+    const bool pendingAtStore = !ran.load();
+    gate.Finish();
+    AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::FlushSkipSyncLabel, true);
+    Require(ran.load(), what + "the completion never ran");
+    Require(pendingAtStore, what + "the known gap changed (the readback now waits for a later batch's completion); update this test and its debt entry");
+}
+
 void LabelReaderOpenNoteOverInFlightAddressStore(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
     const std::string what = "storage flush skip, label reader with an open note over an in-flight address store: ";
     SubmissionGate gate(device);
@@ -501,6 +523,10 @@ int main() {
             LabelReaderOpenNoteOverInFlightAddressStore(*device, images);
             LabelReaderAfterInFlightRead(*device, images, results);
             LabelVisibleAfterImage(*device, images, results);
+        }
+        {
+            GuestBlock gap;
+            LabelReaderLaterCompletionGap(*device, gap);
         }
         std::puts("storage flush skip tests passed");
         return 0;
