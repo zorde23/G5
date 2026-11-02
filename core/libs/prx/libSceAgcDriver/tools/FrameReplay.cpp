@@ -62,6 +62,7 @@ struct Options {
     std::filesystem::path directory;
     std::vector<Dump> dumps;
     std::filesystem::path frames;
+    std::uint64_t framesEvery = 0;
     bool pace = true;
     bool strict = false;
     std::chrono::milliseconds paceTimeout{10000};
@@ -295,6 +296,26 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
     return skipped;
 }
 
+void writeFrame(const std::filesystem::path& path, const AgcDriver::DisplayBuffer& buffer, std::span<const std::byte> pixels) {
+    std::FILE* file = std::fopen(path.string().c_str(), "wb");
+    const auto failure = file != nullptr ? AgcDriver::WriteBmpAndClose_nid_no_patch(file, buffer.width, buffer.height, pixels) : AgcDriver::FrameDumpIoFailure{"open", errno};
+    if (failure) std::fprintf(stderr, "[frame-replay] cannot write %s (%s failed)\n", path.string().c_str(), failure.operation);
+}
+
+AgcDriver::DisplayBuffer displayBuffer(const FrameCall& call) {
+    AgcDriver::DisplayBuffer buffer{};
+    buffer.address = call.address;
+    buffer.pixelFormat = call.values[1];
+    buffer.width = static_cast<std::uint32_t>(call.values[2]);
+    buffer.height = static_cast<std::uint32_t>(call.values[3]);
+    buffer.tilingMode = static_cast<std::uint32_t>(call.values[4]);
+    buffer.pitchInPixel = static_cast<std::uint32_t>(call.values[5]);
+    buffer.dccAddress = call.values[6];
+    buffer.dccClearColor = call.values[7];
+    buffer.alignment = static_cast<std::uint32_t>(call.values[8]);
+    return buffer;
+}
+
 std::pair<std::uint64_t, std::uint64_t> progress() {
     std::uint64_t accepted = 0;
     std::uint64_t completed = 0;
@@ -324,6 +345,7 @@ struct Replay {
     std::atomic<std::size_t> sequenced{0};
     std::uint64_t unfinished = 0;
     std::size_t threads = 0;
+    std::atomic<std::uint64_t> flips{0};
     bool recording = false;
     Clock::time_point startedAt{};
     Clock::time_point endedAt{};
@@ -372,6 +394,21 @@ struct Replay {
         }
     }
 
+    // --frames-every <n>: after every n-th flip inside the window, waits for the GPU and writes the flipped
+    // display buffer as flip-<n>.bmp (the wait changes the timing the title had).
+    void writeFlipFrame(const FrameCall& call) {
+        if (!recording || options.framesEvery == 0 || options.frames.empty()) return;
+        const auto flip = ++flips;
+        if (flip % options.framesEvery != 0) return;
+        const auto index = static_cast<std::uint64_t>(flipInfo(call).index);
+        const auto found = std::find_if(reader.Calls().begin(), reader.Calls().end(), [&](const FrameCall& candidate) { return candidate.kind == FrameCallKind::DisplayBuffer && candidate.values.size() >= 9 && candidate.values[0] == index; });
+        if (found == reader.Calls().end()) throw std::runtime_error("frame replay: no display buffer " + std::to_string(index) + " for --frames-every");
+        drain();
+        const auto buffer = displayBuffer(*found);
+        std::filesystem::create_directories(options.frames);
+        writeFrame(options.frames / ("flip-" + std::to_string(flip) + ".bmp"), buffer, AgcDriver::ReadDisplayBuffer(buffer));
+    }
+
     void execute(const FrameCall& call) {
         pace(call);
         switch (call.kind) {
@@ -415,10 +452,12 @@ struct Replay {
         }
         case FrameCallKind::Flip:
             AgcDriverSubmitFlip_nid_postfix(flipInfo(call));
+            writeFlipFrame(call);
             return;
         case FrameCallKind::ReserveEopFlip: {
             const auto token = static_cast<std::uint32_t>(call.values.at(4));
             if (AgcDriverReserveEopFlipAt_nid_postfix(flipInfo(call), token) != token) throw std::runtime_error("frame replay: EOP flip token " + std::to_string(token) + " was not reserved");
+            writeFlipFrame(call);
             return;
         }
         case FrameCallKind::Suspend:
@@ -635,7 +674,8 @@ int usage() {
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
-                         "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n");
+                         "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n"
+                         "  --frames-every <n>  also writes the display buffer of every n-th flip as flip-<n>.bmp into the --frames directory\n");
     return 2;
 }
 
@@ -667,27 +707,12 @@ struct FrameCheck {
     int maxDifference = 0;
 };
 
-void writeFrame(const std::filesystem::path& path, const AgcDriver::DisplayBuffer& buffer, std::span<const std::byte> pixels) {
-    std::FILE* file = std::fopen(path.string().c_str(), "wb");
-    const auto failure = file != nullptr ? AgcDriver::WriteBmpAndClose_nid_no_patch(file, buffer.width, buffer.height, pixels) : AgcDriver::FrameDumpIoFailure{"open", errno};
-    if (failure) std::fprintf(stderr, "[frame-replay] cannot write %s (%s failed)\n", path.string().c_str(), failure.operation);
-}
-
 FrameCheck compareFrames(const FrameCaptureReader& reader, const Options& options) {
     FrameCheck check;
     if (!options.frames.empty()) std::filesystem::create_directories(options.frames);
     for (const auto& call : reader.Calls()) {
         if (call.kind != FrameCallKind::DisplayBuffer || call.values.size() < 9) continue;
-        AgcDriver::DisplayBuffer buffer{};
-        buffer.address = call.address;
-        buffer.pixelFormat = call.values[1];
-        buffer.width = static_cast<std::uint32_t>(call.values[2]);
-        buffer.height = static_cast<std::uint32_t>(call.values[3]);
-        buffer.tilingMode = static_cast<std::uint32_t>(call.values[4]);
-        buffer.pitchInPixel = static_cast<std::uint32_t>(call.values[5]);
-        buffer.dccAddress = call.values[6];
-        buffer.dccClearColor = call.values[7];
-        buffer.alignment = static_cast<std::uint32_t>(call.values[8]);
+        const auto buffer = displayBuffer(call);
         const auto chunk = std::find_if(reader.Chunks().begin(), reader.Chunks().end(), [&](const FrameMemoryChunk& candidate) { return candidate.kind == FrameMemoryKind::Reference && candidate.group == call.values[0]; });
         if (chunk == reader.Chunks().end()) continue;
         const auto reference = reader.Read(*chunk);
@@ -773,6 +798,7 @@ int main(int argc, char** argv) {
         else if (argument == "--strict") options.strict = true;
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
+        else if (argument == "--frames-every" && index + 1 < argc) options.framesEvery = std::strtoull(argv[++index], nullptr, 10);
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
         else return usage();
     }
