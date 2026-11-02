@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordedDrawState.hpp"
 #include <set>
 
 namespace AgcDriver::Graphics {
@@ -77,7 +78,7 @@ private:
         std::shared_ptr<Framebuffer> framebuffer;
     };
     void release() noexcept;
-    void setLibraryState(VkCommandBuffer commands, const State& state) const;
+    void setLibraryState(VkCommandBuffer commands, const State& state, RecordedDrawState* recorded) const;
     Context context;
     std::vector<VkShaderModule> _modules;
     VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -92,6 +93,7 @@ private:
     bool depthBounds = false;
     bool depthBias = false;
     bool libraries = false;
+    std::uint32_t dynamicSlots = 0;
     std::shared_ptr<OptimizedPipeline> optimized;
     bool dynamicRendering = false;
     VkFormat depthFormat = VK_FORMAT_UNDEFINED;

@@ -7747,6 +7747,117 @@ PFN_vkVoidFunction VKAPI_CALL sampleLocationProc(VkDevice device, const char* na
     return it != table.end() ? it->second : mockProc(device, name);
 }
 
+struct RecordedStateCalls {
+    std::uint32_t binds = 0;
+    std::uint32_t viewports = 0;
+    std::uint32_t scissors = 0;
+    std::uint32_t biases = 0;
+    std::uint32_t bounds = 0;
+};
+
+RecordedStateCalls recordedStateCalls;
+
+VKAPI_ATTR void VKAPI_CALL recordedStateBind(VkCommandBuffer, VkPipelineBindPoint, VkPipeline) { ++recordedStateCalls.binds; }
+VKAPI_ATTR void VKAPI_CALL recordedStateViewport(VkCommandBuffer, std::uint32_t, std::uint32_t, const VkViewport*) { ++recordedStateCalls.viewports; }
+VKAPI_ATTR void VKAPI_CALL recordedStateScissor(VkCommandBuffer, std::uint32_t, std::uint32_t, const VkRect2D*) { ++recordedStateCalls.scissors; }
+VKAPI_ATTR void VKAPI_CALL recordedStateBias(VkCommandBuffer, float, float, float) { ++recordedStateCalls.biases; }
+VKAPI_ATTR void VKAPI_CALL recordedStateBounds(VkCommandBuffer, float, float) { ++recordedStateCalls.bounds; }
+
+PFN_vkVoidFunction VKAPI_CALL recordedStateProc(VkDevice device, const char* name) {
+    static const std::map<std::string_view, PFN_vkVoidFunction> table{
+        {"vkCmdBindPipeline", reinterpret_cast<PFN_vkVoidFunction>(recordedStateBind)},
+        {"vkCmdSetViewport", reinterpret_cast<PFN_vkVoidFunction>(recordedStateViewport)},
+        {"vkCmdSetScissor", reinterpret_cast<PFN_vkVoidFunction>(recordedStateScissor)},
+        {"vkCmdSetDepthBias", reinterpret_cast<PFN_vkVoidFunction>(recordedStateBias)},
+        {"vkCmdSetDepthBounds", reinterpret_cast<PFN_vkVoidFunction>(recordedStateBounds)}
+    };
+    const auto it = table.find(name);
+    return it != table.end() ? it->second : sampleLocationProc(device, name);
+}
+
+void recordedDrawStateTests() {
+    using namespace AgcDriver::Graphics;
+    const bool filter = RecordStateFilter();
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.deviceProc = recordedStateProc;
+    context.device = makeHandle<VkDevice>();
+    context.depthBounds = true;
+    context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    context.limits.framebufferDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    context.limits.maxFramebufferWidth = 64;
+    context.limits.maxFramebufferHeight = 64;
+    context.limits.maxFramebufferLayers = 1;
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.spirv = makeModule({});
+    fragment.spirv = makeModule({.fragment = true});
+    vertex.variantId = 1;
+    fragment.variantId = 2;
+    const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}}};
+    const std::array<std::uint32_t, 1> mainKey{41};
+    const PipelineSetLayouts resources{makeHandle<VkDescriptorSetLayout>(), VK_NULL_HANDLE, false, mainKey, {}};
+    State biased{};
+    biased.depth = DepthTarget{0, 0, {64, 64}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    biased.depthTest = true;
+    biased.depthCompare = VK_COMPARE_OP_LESS;
+    biased.depthBias = true;
+    biased.depthBiasConstant = 2.0f;
+    biased.depthBiasSlope = 1.0f;
+    biased.depthBoundsTest = true;
+    biased.minDepthBounds = 0.25f;
+    biased.maxDepthBounds = 0.75f;
+    biased.viewport = {0, 0, 64, 64, 0, 1};
+    biased.scissor = {{0, 0}, {64, 64}};
+    auto plain = biased;
+    plain.depthBias = false;
+    plain.depthBoundsTest = false;
+    {
+        Pipeline dynamicBias(context, biased, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+        Pipeline staticBias(context, plain, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+        const std::array<VkImageView, 1> depthView{makeHandle<VkImageView>()};
+        const auto framebuffer = dynamicBias.AcquireFramebuffer(depthView, {}, {64, 64});
+        const auto first = makeHandle<VkCommandBuffer>();
+        const auto second = makeHandle<VkCommandBuffer>();
+        const auto expect = [&](const RecordedStateCalls& calls, const RecordedStateCalls& unfiltered, const char* what) {
+            const auto& wanted = filter ? calls : unfiltered;
+            const auto& got = recordedStateCalls;
+            Require(got.binds == wanted.binds && got.viewports == wanted.viewports && got.scissors == wanted.scissors && got.biases == wanted.biases && got.bounds == wanted.bounds,
+                std::string(what) + (filter ? " (state filter on)" : " (state filter off)") + ": recorded " + std::to_string(got.binds) + " binds, " + std::to_string(got.viewports) + " viewports, " + std::to_string(got.scissors) + " scissors, " + std::to_string(got.biases) + " biases, " + std::to_string(got.bounds) + " bounds");
+            recordedStateCalls = {};
+        };
+        const RecordedStateCalls everything{1, 1, 1, 1, 1};
+        dynamicBias.Begin(first, *framebuffer, {64, 64}, biased);
+        expect(everything, everything, "a pass begin");
+        dynamicBias.Continue(first, biased);
+        expect({}, everything, "the same draw state again");
+        auto moved = biased;
+        moved.viewport.x = 1;
+        dynamicBias.Continue(first, moved);
+        expect({0, 1, 0, 0, 0}, everything, "a moved viewport");
+        auto movedPlain = plain;
+        movedPlain.viewport = moved.viewport;
+        staticBias.Continue(first, movedPlain);
+        expect({1, 0, 0, 0, 0}, {1, 1, 1, 0, 0}, "a pipeline with the bias and bounds static");
+        dynamicBias.Continue(first, moved);
+        expect({1, 0, 0, 1, 1}, everything, "back to the pipeline with them dynamic");
+        dynamicBias.Continue(second, moved);
+        expect(everything, everything, "another command buffer");
+        ForgetRecordedDrawState();
+        dynamicBias.Continue(second, moved);
+        expect(everything, everything, "a bind or set recorded outside the pipeline");
+        dynamicBias.Continue(second, moved);
+        expect({}, everything, "the same draw state after the forget");
+        dynamicBias.Begin(second, *framebuffer, {64, 64}, moved);
+        expect(everything, everything, "a pass begin on the same command buffer");
+    }
+    const std::array<VkDynamicState, 2> stencil{VK_DYNAMIC_STATE_STENCIL_OP_EXT, VK_DYNAMIC_STATE_STENCIL_REFERENCE};
+    Require(RecordedSlotsOf(stencil) == ((1u << KeptStencilOpFront) | (1u << KeptStencilOpBack) | (1u << KeptReferenceFront) | (1u << KeptReferenceBack)), "a stencil state covers both faces");
+    Require(RecordedSlotsOf(PipelineLibraryDynamicStates()) == (1u << RecordedSlotCount) - 1u, "the pipeline library's dynamic states cover every recorded state");
+    for (const unsigned face : {unsigned{KeptStencilOpFront}, unsigned{KeptStencilOpBack}}) Require(face + 2u == (face == KeptStencilOpFront ? KeptCompareMaskFront : KeptCompareMaskBack) && face + 4u == (face == KeptStencilOpFront ? KeptWriteMaskFront : KeptWriteMaskBack) && face + 6u == (face == KeptStencilOpFront ? KeptReferenceFront : KeptReferenceBack), "a face's stencil slots follow its stencil op two apart");
+    ClearPipelineLibraries(context.device);
+    Require(mock.live == 0, "the recorded draw state tests leaked Vulkan objects");
+}
+
 void sampleLocationGridFallbackTests() {
     using namespace AgcDriver::Graphics;
     auto queue = makeState();
@@ -12658,6 +12769,11 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--buffer-budget-placement") {
             bufferBudgetPlacementTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--recorded-draw-state") {
+            recordedDrawStateTests();
+            std::cout << "Recorded draw state checks passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--sample-location-grid-fallback") {
