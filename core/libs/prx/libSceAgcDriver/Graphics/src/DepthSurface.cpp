@@ -17,6 +17,8 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
+#include <compare>
 #include <cmath>
 #include <limits>
 #include <shared_mutex>
@@ -1802,6 +1804,128 @@ bool storeHtileOnGpu(const Context& context, Recorder& recorder, std::uint64_t a
 
 std::atomic<std::uint64_t> htileStoreBackReads{0};
 
+struct HtileSpeculationKey {
+    std::uint64_t address;
+    std::size_t bytes;
+    std::uint64_t program;
+    std::uint64_t dataHash;
+    auto operator<=>(const HtileSpeculationKey&) const = default;
+};
+
+struct HtileSpeculationState {
+    bool notCleared = false;
+    bool banned = false;
+    std::uint64_t observed = 0;
+};
+
+std::mutex& htileSpeculationMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::map<HtileSpeculationKey, HtileSpeculationState>& htileSpeculations() {
+    static auto* speculations = new std::map<HtileSpeculationKey, HtileSpeculationState>();
+    return *speculations;
+}
+
+std::atomic<std::uint64_t> htileSpeculated{0}, htileVerified{0}, htileDiverged{0}, htileBanned{0}, htileRewritten{0};
+
+bool htileSpeculationEnabled() {
+    static const bool enabled = std::getenv("APS5_HTILE_SPECULATE") != nullptr;
+    return enabled;
+}
+
+std::optional<HtileSpeculationKey> soleHtileWriter(const Recorder& recorder, std::uint64_t address, std::size_t bytes) {
+    auto writes = recorder.PendingWritesOver(address, bytes);
+    if (writes.empty() || writes.front().program == 0) return std::nullopt;
+    const HtileSpeculationKey key{address, bytes, writes.front().program, writes.front().dataHash};
+    for (const auto& write : writes) {
+        if (write.word >= 0 || write.program != key.program || write.dataHash != key.dataHash) return std::nullopt;
+    }
+    std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.begin < b.begin; });
+    std::uint64_t covered = address;
+    for (const auto& write : writes) {
+        if (write.begin > covered) return std::nullopt;
+        covered = std::max(covered, write.end);
+    }
+    if (covered < address + bytes) return std::nullopt;
+    return key;
+}
+
+void reportHtileSpeculation() {
+    static std::atomic<std::int64_t> last{0};
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto seen = last.load(std::memory_order_relaxed);
+    if (now - seen < std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count() || !last.compare_exchange_strong(seen, now)) return;
+    std::fprintf(stderr, "[htile-speculation] speculated %llu verified %llu diverged %llu banned %llu rewritten %llu\n", static_cast<unsigned long long>(htileSpeculated.load()), static_cast<unsigned long long>(htileVerified.load()), static_cast<unsigned long long>(htileDiverged.load()), static_cast<unsigned long long>(htileBanned.load()), static_cast<unsigned long long>(htileRewritten.load()));
+}
+
+void verifyHtileSpeculation(const Recorder& recorder, const HtileSpeculationKey& key, std::uint64_t speculatedAt, std::uint64_t note) {
+    htileVerified.fetch_add(1, std::memory_order_relaxed);
+    const auto generation = GuestMemory::CollectWritesUncached(key.address, key.bytes);
+    const bool cpuWrote = GuestMemory::CpuWrittenSince(key.address, key.bytes, speculatedAt);
+    const bool newer = recorder.WrittenAfterNote(key.address, key.bytes, note);
+    const auto count = key.bytes / 4u;
+    VkImageAspectFlags cleared = VK_IMAGE_ASPECT_DEPTH_BIT;
+    std::size_t first = count;
+    const bool readable = GuestMemory::Accessible(reinterpret_cast<const void*>(key.address), key.bytes, true);
+    const auto* words = reinterpret_cast<const volatile std::uint32_t*>(key.address);
+    if (readable) {
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto clears = HtileFillClears(words[index], false);
+            cleared &= clears;
+            if (clears != 0 && first == count) first = index;
+        }
+    }
+    std::unique_lock lock(htileSpeculationMutex());
+    auto& state = htileSpeculations()[key];
+    if (readable && cleared == 0) {
+        if (!cpuWrote && !newer) state.observed = generation;
+        lock.unlock();
+        if (!cpuWrote && !newer) {
+            std::lock_guard reads(htileReadsMutex());
+            htileReads()[key.address] = generation;
+        }
+        reportHtileSpeculation();
+        return;
+    }
+    htileDiverged.fetch_add(1, std::memory_order_relaxed);
+    if (!state.banned) htileBanned.fetch_add(1, std::memory_order_relaxed);
+    state.banned = true;
+    state.notCleared = false;
+    lock.unlock();
+    const bool rewrite = readable && !cpuWrote && !newer;
+    std::fprintf(stderr, "[htile-speculation] divergence: htile 0x%llx %zu B at present %llu, first cleared word %zu = 0x%08x; speculation banned for this writer, %s\n", static_cast<unsigned long long>(key.address), key.bytes, static_cast<unsigned long long>(Recorder::Presents()), first, readable && first < count ? static_cast<unsigned>(words[first]) : 0u, rewrite ? "rewritten expanded" : "not rewritten (a newer write or an unreadable range)");
+    if (rewrite) {
+        std::vector<std::uint32_t> expanded(count);
+        for (std::size_t index = 0; index < count; ++index) expanded[index] = expandedHtileWord(words[index], false, cleared);
+        GuestMemory::StoreOwnBytes(key.address, std::as_bytes(std::span(expanded)));
+        htileRewritten.fetch_add(1, std::memory_order_relaxed);
+        const auto stored = GuestMemory::CollectWritesUncached(key.address, key.bytes);
+        std::lock_guard reads(htileReadsMutex());
+        htileReads()[key.address] = stored;
+    }
+    reportHtileSpeculation();
+}
+
+bool speculateHtileNotCleared(Recorder& recorder, const HtileSpeculationKey& key) {
+    std::lock_guard lock(htileSpeculationMutex());
+    const auto found = htileSpeculations().find(key);
+    if (found == htileSpeculations().end() || found->second.banned || !found->second.notCleared) return false;
+    const auto speculatedAt = GuestMemory::CollectWritesUncached(key.address, key.bytes);
+    if (GuestMemory::CpuWrittenSince(key.address, key.bytes, found->second.observed)) return false;
+    htileSpeculated.fetch_add(1, std::memory_order_relaxed);
+    recorder.OnComplete([recorder = &recorder, key, speculatedAt, note = recorder.WriteNoteCount()] { verifyHtileSpeculation(*recorder, key, speculatedAt, note); });
+    return true;
+}
+
+void learnHtile(const HtileSpeculationKey& key, VkImageAspectFlags cleared, std::uint64_t generation) {
+    std::lock_guard lock(htileSpeculationMutex());
+    auto& state = htileSpeculations()[key];
+    state.notCleared = cleared == 0;
+    state.observed = generation;
+}
+
 VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target) {
     if (target.htileAddress == 0) return 0;
     const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
@@ -1832,6 +1956,12 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
             }
         }
     }
+    std::optional<HtileSpeculationKey> writer;
+    if (pending && !target.htileStencil && htileSpeculationEnabled()) {
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        writer = soleHtileWriter(*recorder, target.htileAddress, bytes);
+        if (writer.has_value() && speculateHtileNotCleared(*recorder, *writer)) return 0;
+    }
     GuestMemory::FlushGpuWrites(target.htileAddress, bytes);
     const auto readGeneration = GuestMemory::CollectWrites(target.htileAddress, bytes);
     htileStoreBackReads.fetch_add(1, std::memory_order_relaxed);
@@ -1839,6 +1969,7 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
     GuestMemory::Read(target.htileAddress, std::as_writable_bytes(std::span(words)), 4);
     VkImageAspectFlags cleared = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
     for (const auto word : words) cleared &= HtileFillClears(word, target.htileStencil);
+    if (writer.has_value()) learnHtile(*writer, cleared, readGeneration);
     auto generation = readGeneration;
     if (cleared != 0) {
         for (auto& word : words) word = expandedHtileWord(word, target.htileStencil, cleared);
@@ -2304,6 +2435,10 @@ std::uint64_t DepthViewMemoHits() {
 
 std::uint64_t HtileStoreBackReads() {
     return htileStoreBackReads.load(std::memory_order_relaxed);
+}
+
+HtileSpeculationCounts HtileSpeculationCounters() {
+    return {htileSpeculated.load(std::memory_order_relaxed), htileVerified.load(std::memory_order_relaxed), htileDiverged.load(std::memory_order_relaxed), htileBanned.load(std::memory_order_relaxed), htileRewritten.load(std::memory_order_relaxed)};
 }
 
 SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTarget& target) {

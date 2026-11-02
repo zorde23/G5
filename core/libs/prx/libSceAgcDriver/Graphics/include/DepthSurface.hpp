@@ -21,6 +21,10 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
 // DepthSurfaceView calls APS5_DEPTH_VIEW_MEMO answered from the memo of the previous call.
 std::uint64_t DepthViewMemoHits();
 std::uint64_t HtileStoreBackReads();
+struct HtileSpeculationCounts {
+    std::uint64_t speculated, verified, diverged, banned, rewritten;
+};
+HtileSpeculationCounts HtileSpeculationCounters();
 SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTarget& target);
 DepthSampleLocations DepthSurfaceSampleLocations(const Context& context, const DepthTarget& target);
 enum class DepthPlaneScope { Overlapped, Whole };

@@ -5316,6 +5316,11 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recorder.MarkCovered(dispatchedAccess);
     recordStep(PhaseRecordBind);
     if (record.htileClear.has_value()) Graphics::ArmHtileDepthClear(record.htileClear->first, record.htileClear->second);
+    struct WriteDataHashScope {
+        Graphics::Recorder& recorder;
+        ~WriteDataHashScope() { recorder.SetWriteDataHash(0); }
+    } writeDataHashScope{recorder};
+    recorder.SetWriteDataHash(resources.DataWordsHash() ^ (std::uint64_t{record.x} << 42u) ^ (std::uint64_t{record.y} << 21u) ^ record.z);
     resources.MarkGpuWrites(recorder);
     if (record.htileClear.has_value()) {
         Graphics::QueueHtileDepthClear(record.htileClear->first, record.htileClear->second);

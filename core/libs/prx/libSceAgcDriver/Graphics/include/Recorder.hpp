@@ -142,8 +142,13 @@ public:
         std::uint64_t note;
         int value;
         std::int64_t word = -1;
+        std::uint64_t program = 0;
+        std::uint64_t dataHash = 0;
     };
     std::vector<PendingWrite> PendingWritesOver(std::uint64_t address, std::size_t bytes) const;
+    void SetWriteDataHash(std::uint64_t hash) { writeDataHash = hash; }
+    std::uint64_t WriteNoteCount() const { return writeNoteCount; }
+    bool WrittenAfterNote(std::uint64_t address, std::size_t bytes, std::uint64_t note) const;
     void PendingWriteRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const;
     // Batch read tracking: the guest ranges the recorded work reads IN PLACE through a host import
     // and the GPU has not executed yet (a V# element bound in place, a region the GPU copies out of
@@ -574,6 +579,7 @@ private:
         std::vector<std::int16_t> writeValues;
         std::vector<std::int64_t> writeWords;
         std::vector<std::uint64_t> writePrograms;
+        std::vector<std::uint64_t> writeDataHashes;
         // In-place reads (see NotePendingRead), dying with the batch: a finished batch's reads are done.
         struct Read {
             std::uint64_t begin;
@@ -864,6 +870,7 @@ private:
     std::uint64_t addressStoreSerial = 0;
     std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
+    std::uint64_t writeDataHash = 0;
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per
