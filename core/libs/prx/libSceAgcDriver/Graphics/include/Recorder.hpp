@@ -194,6 +194,7 @@ public:
     // batch may write any memory, so no flush skips its wait for the batch (APS5_FLUSH_SKIP_SYNC).
     void NoteAddressStore() { addressStoreSerial = OpenSerial(); }
     bool OpenAddressStore() const { return addressStoreSerial != 0 && addressStoreSerial == OpenSerial(); }
+    bool AddressStorePending() const { return addressStoreSerial != 0 && (addressStoreSerial == OpenSerial() || (!inFlight.empty() && addressStoreSerial >= inFlight.front()->serial)); }
     std::uint64_t PendingWriterSerial(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t PendingWriterSerial(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> exceptNotes) const;
     // What SyncThrough(address, bytes) would wait for, for the [hooksync] attribution: the newest

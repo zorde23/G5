@@ -177,13 +177,16 @@ VkFormat SrgbTwinFormat(const Context& context, VkFormat format);
 // Who reads the range a FlushPending stores: a GPU reader is recorded after the stores, in the
 // same batch order, so with APS5_FLUSH_SKIP_SYNC the stores need not wait for the open batch that
 // wrote the images; a CPU reader always does.
-enum class FlushReader : std::uint8_t { Cpu, Gpu };
+enum class FlushReader : std::uint8_t { Cpu, Gpu, Label };
 
 // The rule for skipping that wait, over facts gathered
 // per image and for the batch: (a) an import covers the stored span, (b) the span is in the write
 // watch, (d) no page of it is compared when shared, (c) no block the CPU wrote lies on a write range
-// of the open batch, (e) no use of the open batch stores through addresses. The first condition
-// that fails names the blocker; None lets the wait be skipped.
+// of the open batch, (e) no use of the open batch stores through addresses. For a label's readback
+// (APS5_FLUSH_SKIP_SYNC_LABEL), whichever batch the writer is, (c) and (e) cover every unfinished
+// batch, and (f) no unfinished batch holds a write-back completion and no label stored by a
+// completion lies on the span. The first condition that fails names the blocker; None lets the wait
+// be skipped.
 struct WriterWaitFacts {
     bool stored = false;
     bool imported = false;
@@ -191,8 +194,9 @@ struct WriterWaitFacts {
     bool compared = false;
     bool cpuBlockOnOpenWrite = false;
     bool addressStore = false;
+    bool completionOverlap = false;
 };
-enum class WriterWaitBlocker : std::uint8_t { None, NothingStored, Import, Watch, Compared, CpuBlock, AddressStore, Count };
+enum class WriterWaitBlocker : std::uint8_t { None, NothingStored, Import, Watch, Compared, CpuBlock, AddressStore, Completion, Count };
 WriterWaitBlocker BlockerOf(const WriterWaitFacts& facts);
 
 class StorageTexture : public std::enable_shared_from_this<StorageTexture> {
@@ -237,7 +241,9 @@ public:
     // any unit was: a reader of the import must sync for a publish as for a store. Only images
     // with a pending unit inside the range are stored (APS5_NO_FLUSH_PRETEST=1 lists every
     // overlapping pending image, as before). A GPU `reader` lets the stores skip the wait for the
-    // open batch (APS5_FLUSH_SKIP_SYNC) when BlockerOf finds no blocker for every image;
+    // open batch (APS5_FLUSH_SKIP_SYNC) when BlockerOf finds no blocker for every image; a label's
+    // readback (`reader` Label) may skip the wait for the open batch or an older one in flight
+    // (APS5_FLUSH_SKIP_SYNC_LABEL), since the label is only made visible behind the stores;
     // APS5_FLUSH_SKIP_SYNC_VERIFY waits anyway and counts the flushes whose keep decision changed
     // across the wait.
     static bool FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr, const char* reason = "memory access", PublishScope scope = PublishScope::Whole, bool* published = nullptr, bool waited = false, FlushReader reader = FlushReader::Cpu);
@@ -248,7 +254,7 @@ public:
     static void SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes);
     static constexpr std::uint64_t SmallStoreBytes = 64 * 1024;
     static std::size_t StoreSmallPending(const char* reason);
-    static void StoreReadbackBeforeLabel(const char* reason);
+    static std::uint64_t StoreReadbackBeforeLabel(const char* reason);
     static std::size_t StoreDrawnLinear(const char* reason);
     static std::size_t StoreDrawnLinearTouching(const char* reason, const std::function<bool(std::uint64_t, std::uint64_t)>& touches, bool all);
     static bool AnyPending();
@@ -558,7 +564,7 @@ private:
     WriteBackBlocks writeBackBlocks(const std::vector<bool>& layers) const;
     KeepPlan planKeep(const WriteBackBlocks& blocks, const std::vector<bool>& compared) const;
     // The facts of BlockerOf for this image's store of the range (the batch's address stores too).
-    WriterWaitFacts writerWaitFacts(std::uint64_t address, std::size_t bytes, const Recorder& recorder) const;
+    WriterWaitFacts writerWaitFacts(std::uint64_t address, std::size_t bytes, const Recorder& recorder, std::uint64_t writer = 0) const;
     // The keep plan the write-back would follow now, hashed (the verify of the skip).
     std::uint64_t keepDecision(std::uint64_t address, std::size_t bytes) const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> drawnSpans(const DrawnArea& area, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep) const;

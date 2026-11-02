@@ -24,6 +24,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_PUBLISH_WAIT_UNLOCKED",
     "APS5_FLUSH_SKIP_SYNC",
     "APS5_DEPTH_VIEW_MEMO",
+    "APS5_FLUSH_SKIP_SYNC_LABEL",
 };
 
 struct SwitchValues {
@@ -37,6 +38,7 @@ struct SwitchValues {
             std::getenv("APS5_PUBLISH_WAIT_UNLOCKED") != nullptr,
             std::getenv("APS5_FLUSH_SKIP_SYNC") != nullptr,
             std::getenv("APS5_DEPTH_VIEW_MEMO") != nullptr,
+            std::getenv("APS5_FLUSH_SKIP_SYNC_LABEL") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

@@ -93,6 +93,7 @@ void keepStorageTexture(Recorder& recorder, std::shared_ptr<StorageTexture> text
 // FlushPending that forced the write-back (the other callers name themselves: "refresh", "cache
 // eviction", "explicit"). `flushReason` is set by the caller around its writeBack calls.
 thread_local const char* flushReason = nullptr;
+thread_local std::uint64_t labelSkippedWriter = 0;
 // Likewise what made an upload necessary: "first" (a new image), "keys" (the DCC keys changed),
 // "cpu" (a CPU store stamped a changed unit), "flushed" (another image's results were stored over
 // the surface by this refresh), "store" (a driver store: a fill, a copy, a label, an earlier
@@ -4248,9 +4249,9 @@ enum class WriterWait : std::uint8_t { Wait, Skip, Verify };
 // under the rule; APS5_FLUSH_SKIP_SYNC_VERIFY waits anyway and compares the keep decisions.
 WriterWait writerWaitMode(FlushReader reader) {
     static const bool verify = std::getenv("APS5_FLUSH_SKIP_SYNC_VERIFY") != nullptr;
-    if (reader != FlushReader::Gpu) return WriterWait::Wait;
+    if (reader == FlushReader::Cpu) return WriterWait::Wait;
     if (verify) return WriterWait::Verify;
-    return RuntimeSwitches::Set(RuntimeSwitch::FlushSkipSync) ? WriterWait::Skip : WriterWait::Wait;
+    return RuntimeSwitches::Set(reader == FlushReader::Label ? RuntimeSwitch::FlushSkipSyncLabel : RuntimeSwitch::FlushSkipSync) ? WriterWait::Skip : WriterWait::Wait;
 }
 
 std::atomic<std::uint64_t> writerWaitsSkipped{0};
@@ -4265,7 +4266,7 @@ void reportWriterWaitSkips(bool changed, const char* reason) {
     auto last = reported.load(std::memory_order_relaxed);
     if (nowMs - last <= 10000 || !reported.compare_exchange_strong(last, nowMs)) return;
     const auto blocked = [](WriterWaitBlocker blocker) { return static_cast<unsigned long long>(writerWaitBlockers[static_cast<std::size_t>(blocker)].load(std::memory_order_relaxed)); };
-    std::fprintf(stderr, "[flush-skip] (cumulative) %llu waits for the open batch skipped, %llu verified, %llu with a changed keep decision; eligible %llu, blocked by nothing stored %llu, no import %llu, outside the watch %llu, compared pages %llu, CPU block on an open write %llu, address store %llu\n", static_cast<unsigned long long>(writerWaitsSkipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(writerWaitsVerified.load(std::memory_order_relaxed)), static_cast<unsigned long long>(writerWaitsChanged.load(std::memory_order_relaxed)), blocked(WriterWaitBlocker::None), blocked(WriterWaitBlocker::NothingStored), blocked(WriterWaitBlocker::Import), blocked(WriterWaitBlocker::Watch), blocked(WriterWaitBlocker::Compared), blocked(WriterWaitBlocker::CpuBlock), blocked(WriterWaitBlocker::AddressStore));
+    std::fprintf(stderr, "[flush-skip] (cumulative) %llu waits for the open batch skipped, %llu verified, %llu with a changed keep decision; eligible %llu, blocked by nothing stored %llu, no import %llu, outside the watch %llu, compared pages %llu, CPU block on a pending write %llu, address store %llu, write-back completion %llu\n", static_cast<unsigned long long>(writerWaitsSkipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(writerWaitsVerified.load(std::memory_order_relaxed)), static_cast<unsigned long long>(writerWaitsChanged.load(std::memory_order_relaxed)), blocked(WriterWaitBlocker::None), blocked(WriterWaitBlocker::NothingStored), blocked(WriterWaitBlocker::Import), blocked(WriterWaitBlocker::Watch), blocked(WriterWaitBlocker::Compared), blocked(WriterWaitBlocker::CpuBlock), blocked(WriterWaitBlocker::AddressStore), blocked(WriterWaitBlocker::Completion));
 }
 
 }
@@ -4370,11 +4371,11 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         try {
             recorder->Reap();
             const auto writer = recorder->PendingWriterSerial(address, bytes, ownNotes);
-            auto mode = writer == recorder->OpenSerial() ? writerWaitMode(reader) : WriterWait::Wait;
+            auto mode = writer == recorder->OpenSerial() || (reader == FlushReader::Label && writer != 0) ? writerWaitMode(reader) : WriterWait::Wait;
             if (mode != WriterWait::Wait) {
                 // The first image with a blocker names it (each flush counts once).
                 auto blocker = WriterWaitBlocker::None;
-                for (std::size_t index = 0; index < flush.size() && blocker == WriterWaitBlocker::None; ++index) blocker = BlockerOf(flush[index]->writerWaitFacts(address, bytes, *recorder));
+                for (std::size_t index = 0; index < flush.size() && blocker == WriterWaitBlocker::None; ++index) blocker = BlockerOf(flush[index]->writerWaitFacts(address, bytes, *recorder, reader == FlushReader::Label ? writer : 0));
                 writerWaitBlockers[static_cast<std::size_t>(blocker)].fetch_add(1, std::memory_order_relaxed);
                 if (blocker != WriterWaitBlocker::None) mode = WriterWait::Wait;
             }
@@ -4383,6 +4384,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                 for (const auto& texture : flush) decisions.push_back(texture->keepDecision(address, bytes));
             }
             if (mode == WriterWait::Skip) {
+                if (reader == FlushReader::Label) labelSkippedWriter = std::max({labelSkippedWriter, writer, recorder->OpenSerial()});
                 writerWaitsSkipped.fetch_add(1, std::memory_order_relaxed);
                 reportWriterWaitSkips(false, reason);
             } else if (writer == recorder->OpenSerial()) {
@@ -4673,9 +4675,10 @@ std::size_t StorageTexture::StoreSmallPending(const char* reason) {
     return stored;
 }
 
-void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {
+std::uint64_t StorageTexture::StoreReadbackBeforeLabel(const char* reason) {
     static const bool disabled = std::getenv("APS5_NO_LABEL_READBACK_STORE") != nullptr;
-    if (disabled) return;
+    labelSkippedWriter = 0;
+    if (disabled) return 0;
     std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
     {
         auto& pending = Pending();
@@ -4684,7 +4687,8 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {
             if (texture->descriptor.tileMode == TextureTileMode::kLinear || texture->guestBytes <= SmallStoreBytes) ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
         }
     }
-    for (const auto& [address, bytes] : ranges) static_cast<void>(FlushPending(address, bytes, nullptr, reason));
+    for (const auto& [address, bytes] : ranges) static_cast<void>(FlushPending(address, bytes, nullptr, reason, PublishScope::Whole, nullptr, false, FlushReader::Label));
+    return labelSkippedWriter;
 }
 
 std::size_t StorageTexture::StoreDrawnLinear(const char* reason) {
@@ -6072,12 +6076,14 @@ WriterWaitBlocker BlockerOf(const WriterWaitFacts& facts) {
     if (facts.compared) return WriterWaitBlocker::Compared;
     if (facts.cpuBlockOnOpenWrite) return WriterWaitBlocker::CpuBlock;
     if (facts.addressStore) return WriterWaitBlocker::AddressStore;
+    if (facts.completionOverlap) return WriterWaitBlocker::Completion;
     return WriterWaitBlocker::None;
 }
 
-WriterWaitFacts StorageTexture::writerWaitFacts(std::uint64_t address, std::size_t bytes, const Recorder& recorder) const {
+WriterWaitFacts StorageTexture::writerWaitFacts(std::uint64_t address, std::size_t bytes, const Recorder& recorder, std::uint64_t writer) const {
     WriterWaitFacts facts;
-    facts.addressStore = recorder.OpenAddressStore();
+    const bool label = writer != 0;
+    facts.addressStore = label ? recorder.AddressStorePending() : recorder.OpenAddressStore();
     const auto blocks = writeBackBlocks(storedLayers(address, bytes));
     facts.stored = blocks.lastStored > blocks.firstStored;
     if (!facts.stored) return facts;
@@ -6090,8 +6096,9 @@ WriterWaitFacts StorageTexture::writerWaitFacts(std::uint64_t address, std::size
         if (blocks.changedBlocks[index] != GuestMemory::BlockWritten) continue;
         const auto from = std::max(blocks.firstStored, blocks.spanBegin + index * block);
         const auto to = std::min(blocks.lastStored, blocks.spanBegin + (index + 1) * block);
-        facts.cpuBlockOnOpenWrite = from < to && recorder.OpenWriteOverlaps(from, static_cast<std::size_t>(to - from));
+        facts.cpuBlockOnOpenWrite = from < to && (label ? recorder.PendingWriteOverlaps(from, static_cast<std::size_t>(to - from)) : recorder.OpenWriteOverlaps(from, static_cast<std::size_t>(to - from)));
     }
+    facts.completionOverlap = label && (Recorder::PendingWriteBackCompletions() != 0 || recorder.CompletionLabelIn(blocks.firstStored, span));
     return facts;
 }
 
