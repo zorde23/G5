@@ -2443,6 +2443,83 @@ bool settleRetireTests(const Device& device) {
     return true;
 }
 
+bool singleKeysUploadTests(const Device& device) {
+    using namespace AgcDriver::GuestMemory;
+    const auto& base = device.GetContext();
+    constexpr std::size_t unit = 65536;
+    if (base.hostImportAlignment == 0 || base.hostImportAlignment > unit || !WriteWatched()) {
+        std::cout << "host imports within 64 KiB or write watching unavailable: the comp-to-single upload not tested\n";
+        return false;
+    }
+    std::unique_lock gpu(GpuMutex());
+    PrepareImportWatch(base);
+    void* block = AllocateWatched(2 * unit, unit);
+    Require(block != nullptr, "no watched block although write watching is on");
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, 2 * unit); }
+    } release{block};
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto* texels = static_cast<std::uint8_t*>(block);
+    for (std::size_t offset = 0; offset < unit; ++offset) texels[offset] = 0xa5;
+    for (std::size_t first = 0; first < unit; first += 256) {
+        const std::uint32_t value = 0x10203000u + static_cast<std::uint32_t>(first / 256) * 0x01010101u;
+        std::memcpy(texels + first, &value, sizeof(value));
+    }
+    std::memset(texels + unit, 0x10, unit / 256);
+    std::vector<std::uint8_t> expected(unit);
+    for (std::size_t offset = 0; offset < unit; ++offset) expected[offset] = texels[offset / 256 * 256 + offset % 4];
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, 2 * unit, true, true, true);
+    }
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.dccAddress = address + unit;
+    resource.width = 128;
+    resource.height = 128;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kR64KBX;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    Require(DescribeSurface(resource).guestBytes == unit, "unexpected surface size");
+    Recorder recorder(context);
+    recorder.Activate();
+    const auto before = StorageTexture::SingleKeyGpuUploads();
+    const auto verifiedBefore = StorageTexture::SingleKeyGpuVerified();
+    {
+        auto image = StorageTexture::Create(context, detiler, resource, 0);
+        recorder.Keep(image);
+        image->MarkDirty();
+        image->WriteBack();
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    }
+    const bool onGpu = std::getenv("APS5_GPU_SINGLE_KEYS") != nullptr;
+    const auto uploads = StorageTexture::SingleKeyGpuUploads() - before;
+    std::vector<std::uint8_t> read(unit);
+    AgcDriver::GuestMemory::Read(address, std::as_writable_bytes(std::span(read)));
+    std::size_t differing = 0;
+    for (std::size_t offset = 0; offset < unit; ++offset) differing += read[offset] != expected[offset] ? 1u : 0u;
+    std::cout << "comp-to-single upload " << (onGpu ? "on the GPU" : "on the CPU") << ": " << uploads << " GPU single-key uploads, " << differing << " bytes differ from every block's first element\n";
+    Require(differing == 0, "the uploaded comp-to-single surface does not give every 256-byte block its first element");
+    const bool verify = std::getenv("APS5_GPU_SINGLE_KEYS_VERIFY") != nullptr;
+    Require(!verify || StorageTexture::SingleKeyGpuVerified() == verifiedBefore + 1, "APS5_GPU_SINGLE_KEYS_VERIFY=1 did not confirm the GPU expansion of the upload");
+    Require(onGpu ? uploads == 1 : uploads == 0, onGpu ? "APS5_GPU_SINGLE_KEYS did not upload the comp-to-single surface on the GPU" : "a comp-to-single surface was uploaded on the GPU without APS5_GPU_SINGLE_KEYS");
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+    std::cout << "comp-to-single upload tests passed\n";
+    return true;
+}
+
 bool settleStorageImageTests(const Device& device) {
     using namespace AgcDriver::GuestMemory;
     const auto& base = device.GetContext();
@@ -11834,6 +11911,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--settle-earlier-import-only") return settleEarlierImportTests(device) ? 0 : 77;
         if (argc == 2 && std::string_view(argv[1]) == "--settle-retire-only") return settleRetireTests(device) ? 0 : 77;
         if (argc == 2 && std::string_view(argv[1]) == "--settle-storage-image-only") return settleStorageImageTests(device) ? 0 : 77;
+        if (argc == 2 && std::string_view(argv[1]) == "--single-keys-upload-only") return singleKeysUploadTests(device) ? 0 : 77;
         if (argc == 2 && std::string_view(argv[1]) == "--reimport-bench") return reimportBench(device);
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-cut-only") return hostImportCutTests(device);
 #endif

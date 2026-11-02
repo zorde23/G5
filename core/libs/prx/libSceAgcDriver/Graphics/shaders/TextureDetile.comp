@@ -29,6 +29,7 @@ layout(constant_id = 19) const uint EQ15 = 0u;
 // Nonzero: block extent in elements (thick 3D blocks are not the thin 2D shape derived below).
 layout(constant_id = 20) const uint BLOCK_WIDTH = 0u;
 layout(constant_id = 21) const uint BLOCK_HEIGHT = 0u;
+layout(constant_id = 22) const uint SINGLE_KEY_BLOCKS = 0u;
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -245,6 +246,7 @@ void main() {
     if (tiledOffset < params.rangeBegin || tiledOffset >= params.rangeEnd) {
         return;
     }
+    uint sourceTiled = (SINGLE_KEY_BLOCKS != 0u ? (tiledOffset & ~255u) : tiledOffset) - params.tiledBase;
     tiledOffset -= params.tiledBase;
     linearOffset -= params.linearBase;
 
@@ -252,13 +254,13 @@ void main() {
     if (RETILE != 0u) {
         loadElement(p, params.dstBase + tiledOffset);
     } else {
-        storeElement(params.srcBase + tiledOffset, p);
+        storeElement(params.srcBase + sourceTiled, p);
     }
 #else
     if (RETILE != 0u) {
         copyElement(params.srcBase + linearOffset, params.dstBase + tiledOffset);
     } else {
-        copyElement(params.srcBase + tiledOffset, params.dstBase + linearOffset);
+        copyElement(params.srcBase + sourceTiled, params.dstBase + linearOffset);
     }
 #endif
 }

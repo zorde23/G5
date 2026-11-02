@@ -105,7 +105,9 @@ thread_local const char* uploadReason = "first";
 // selections widened to every pending unit (the hysteresis in writeBack), units dropped as dead
 // (DiscardPendingInside) and units an alias's own results superseded (markLayersPending); relaxed,
 // reported only.
-std::atomic<std::uint64_t> singlePassMoves{0}, slabRetiles{0};
+std::atomic<std::uint64_t> singlePassMoves{0}, slabRetiles{0}, singleKeyGpuUploads{0}, singleKeyGpuVerified{0};
+std::atomic<bool> singleKeyGpuRefuted{false};
+constexpr std::uint64_t SingleKeyBlockBytes = 256;
 std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWriteBacks{0}, partialWriteBackBytes{0}, emptyWriteBacks{0}, coalescedWriteBacks{0}, unitsDropped{0}, unitsSuperseded{0}, clearHandOvers{0}, handedOverSuperseded{0};
 // FlushPending listings skipped because no pending unit of the image lay inside the range, images
 // whose selected pending units were dropped because their memory is no longer registered (see
@@ -2477,6 +2479,48 @@ std::uint64_t StorageTexture::SlabRetiles() {
     return slabRetiles.load(std::memory_order_relaxed);
 }
 
+void StorageTexture::verifySingleKeysUpload(std::uint64_t upload) {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_GPU_SINGLE_KEYS_VERIFY");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    if (every == 0 || upload % every != 0) return;
+    if (auto* recorder = Recorder::Active()) recorder->Sync();
+    const auto bytes = static_cast<std::size_t>(guestBytes);
+    std::vector<std::byte> expected(bytes);
+    ReadTextureSurface(descriptor, DccKeys::ClearSingle, expected);
+    Buffer readback(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::memcpy(readback.Bytes().data(), expected.data(), bytes);
+    detiler.BeginBatch();
+    CommandBatch batch(context);
+    RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    const auto elementBytes = BytesPerElement(descriptor.format);
+    for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
+        for (std::uint32_t level = 0; level < mips.size(); ++level) {
+            if (!geometry.HasLayer(level, layer)) continue;
+            detiler.DispatchImage(batch.Handle(), descriptor.tileMode, elementBytes, readback.Handle(), geometry.GuestLayerOffset(layer) + mips[level].tiledOffset, elementLayerView(level, layer), mips[level], true, layer, {.pipeBankXor = descriptor.pipeBankXor});
+        }
+    }
+    RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    batch.SubmitAndWait();
+    const auto got = readback.Bytes();
+    const auto differs = std::mismatch(expected.begin(), expected.end(), got.begin());
+    if (differs.first == expected.end()) {
+        singleKeyGpuVerified.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    singleKeyGpuRefuted.store(true, std::memory_order_relaxed);
+    std::fprintf(stderr, "[gpu-single-keys] upload %llu of image 0x%llx (format %u) differs from the CPU expansion at byte %zu; APS5_GPU_SINGLE_KEYS is off from here on\n", static_cast<unsigned long long>(upload), static_cast<unsigned long long>(descriptor.baseAddress), descriptor.format, static_cast<std::size_t>(differs.first - expected.begin()));
+}
+
+std::uint64_t StorageTexture::SingleKeyGpuUploads() {
+    return singleKeyGpuUploads.load(std::memory_order_relaxed);
+}
+
+std::uint64_t StorageTexture::SingleKeyGpuVerified() {
+    return singleKeyGpuVerified.load(std::memory_order_relaxed);
+}
+
 bool StorageTexture::otherPendingOverlaps() const {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
@@ -2657,6 +2701,19 @@ std::vector<bool> StorageTexture::cpuUploadLayers(const std::vector<bool>& units
     return selected;
 }
 
+const HostImport* StorageTexture::singleKeysUploadImport(const std::vector<bool>* layers) {
+    static const bool enabled = std::getenv("APS5_GPU_SINGLE_KEYS") != nullptr;
+    if (!enabled || singleKeyGpuRefuted.load(std::memory_order_relaxed) || uploadedKeys != DccKeys::ClearSingle || layers != nullptr || descriptor.tileMode == TextureTileMode::kLinear || !SingleKeysReadable(descriptor) || !singlePass()) return nullptr;
+    const auto bytes = static_cast<std::size_t>(guestBytes);
+    if (!GuestMemory::Watched(descriptor.baseAddress, bytes) || (blockUnits && AnyShadowedOverlaps(descriptor.baseAddress, bytes)) || descriptor.baseAddress % SingleKeyBlockBytes != 0) return nullptr;
+    for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
+        for (std::uint32_t level = 0; level < mips.size(); ++level) {
+            if (geometry.HasLayer(level, layer) && (geometry.GuestLayerOffset(layer) + mips[level].tiledOffset) % SingleKeyBlockBytes != 0) return nullptr;
+        }
+    }
+    return HostImportFor(context, descriptor.baseAddress, bytes);
+}
+
 void StorageTexture::upload(const std::vector<bool>* layers) {
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -2667,9 +2724,10 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     const auto linearBytes = sliceLinearBytes * arrayLayers;
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
     auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    bool singleKeysOnGpu = false;
     const auto stampLayers = [&](bool selectedOnly) {
         const bool whole = !selectedOnly || layers == nullptr;
-        if (guestBytes > GenerationBaselineBytes || !guestBytesSettled()) generationBaseline.clear();
+        if (singleKeysOnGpu || guestBytes > GenerationBaselineBytes || !guestBytesSettled()) generationBaseline.clear();
         else if (whole) {
             generationBaseline.resize(static_cast<std::size_t>(guestBytes));
             GuestMemory::ReadCommitted(descriptor.baseAddress, generationBaseline);
@@ -2687,7 +2745,9 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     filledKeys = DccKeys::Uncompressed;
     VkClearColorValue clearValue{};
     const bool fastClear = IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle;
-    if (fastClear && (ClearColorFor(storageFormat, uploadedKeys, clearValue) || SingleKeyColorFor(descriptor, guestBytes, now, singleProof, storageFormat, uploadedKeys, clearValue))) {
+    const HostImport* singleKeysImport = singleKeysUploadImport(layers);
+    singleKeysOnGpu = singleKeysImport != nullptr;
+    if (fastClear && (ClearColorFor(storageFormat, uploadedKeys, clearValue) || (!singleKeysOnGpu && SingleKeyColorFor(descriptor, guestBytes, now, singleProof, storageFormat, uploadedKeys, clearValue)))) {
         // A fast-cleared surface is cleared on the GPU; its texel memory is neither read nor filled.
         // The clear is recorded into the open batch like a direct upload (the image kept by it): a
         // batch of its own submitted the recorder's work first and waited for all of it, 25-40 ms
@@ -2745,7 +2805,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadClear, start);
         return;
     }
-    if (const auto* import = uploadedKeys == DccKeys::Uncompressed ? HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : nullptr) {
+    if (const auto* import = uploadedKeys == DccKeys::Uncompressed ? HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : singleKeysImport) {
         now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
         if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
             layerOriginal.assign(trackedLayers, false);
@@ -2823,7 +2883,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 for (std::uint32_t level = 0; level < mips.size(); ++level) {
                     if (!geometry.HasLayer(level, layer)) continue;
                     const auto& mip = mips[level];
-                    detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestLayerOffset(layer) + mip.tiledOffset, elementLayerView(level, layer), mip, false, layer, {.pipeBankXor = descriptor.pipeBankXor});
+                    detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestLayerOffset(layer) + mip.tiledOffset, elementLayerView(level, layer), mip, false, layer, {.pipeBankXor = descriptor.pipeBankXor}, singleKeysOnGpu);
                 }
             }
             recordDirectUploadDone(commands);
@@ -2832,6 +2892,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             else recorder->EndGpuTiming(timing, uploadedBytes);
             countStorageUpload(1, uploadedBytes);
             ++Profile().storageDirectUploads;
+            if (singleKeysOnGpu) verifySingleKeysUpload(singleKeyGpuUploads.fetch_add(1, std::memory_order_relaxed) + 1);
             ++version;
             if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
             return;

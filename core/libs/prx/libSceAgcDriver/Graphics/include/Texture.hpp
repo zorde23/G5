@@ -417,6 +417,8 @@ public:
     std::uint64_t GuestBytes() const;
     std::uint64_t BudgetBytes() const;
     std::size_t OriginalSnapshotBytes() const { return original.capacity(); }
+    static std::uint64_t SingleKeyGpuUploads();
+    static std::uint64_t SingleKeyGpuVerified();
     VkDeviceSize AllocationBytes() const { return memoryBytes; }
 
 private:
@@ -427,6 +429,8 @@ private:
     // The regions of every array layer, or of the tracked layers `layers` selects.
     std::vector<VkBufferImageCopy> CopyRegions(const std::vector<bool>* layers = nullptr) const;
     void upload(const std::vector<bool>* layers = nullptr);
+    const HostImport* singleKeysUploadImport(const std::vector<bool>* layers);
+    void verifySingleKeysUpload(std::uint64_t upload);
     std::vector<bool> cpuUploadLayers(const std::vector<bool>& units) const;
     void captureGuestBytes(const std::vector<bool>* layers);
     bool originalHolds(std::uint64_t address, std::size_t bytes) const;
