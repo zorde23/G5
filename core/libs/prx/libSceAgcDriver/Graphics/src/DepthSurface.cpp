@@ -1800,6 +1800,8 @@ bool storeHtileOnGpu(const Context& context, Recorder& recorder, std::uint64_t a
     return true;
 }
 
+std::atomic<std::uint64_t> htileStoreBackReads{0};
+
 VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target) {
     if (target.htileAddress == 0) return 0;
     const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
@@ -1830,11 +1832,14 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
             }
         }
     }
+    GuestMemory::FlushGpuWrites(target.htileAddress, bytes);
+    const auto readGeneration = GuestMemory::CollectWrites(target.htileAddress, bytes);
+    htileStoreBackReads.fetch_add(1, std::memory_order_relaxed);
     std::vector<std::uint32_t> words(bytes / 4u);
     GuestMemory::Read(target.htileAddress, std::as_writable_bytes(std::span(words)), 4);
     VkImageAspectFlags cleared = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
     for (const auto word : words) cleared &= HtileFillClears(word, target.htileStencil);
-    auto generation = collected;
+    auto generation = readGeneration;
     if (cleared != 0) {
         for (auto& word : words) word = expandedHtileWord(word, target.htileStencil, cleared);
         GuestMemory::Write(target.htileAddress, std::as_bytes(std::span(words)), 4);
@@ -2295,6 +2300,10 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
 
 std::uint64_t DepthViewMemoHits() {
     return depthViewMemoHits.load(std::memory_order_relaxed);
+}
+
+std::uint64_t HtileStoreBackReads() {
+    return htileStoreBackReads.load(std::memory_order_relaxed);
 }
 
 SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTarget& target) {
