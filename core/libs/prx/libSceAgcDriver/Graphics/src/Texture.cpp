@@ -4452,11 +4452,15 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         if (conflict != 0 && (writer == 0 || conflict > writer)) counts.conflictAfterWriter.fetch_add(1, std::memory_order_relaxed);
         ReportLabelShadow();
     }
-    const bool narrow = narrowLabelRule(reader) && !flush.empty() && !Recorder::InCompletion();
+    bool narrow = narrowLabelRule(reader) && !flush.empty() && !Recorder::InCompletion();
+    if (narrow && !Recorder::OnCommitter()) {
+        narrow = false;
+        Recorder::RejectCommitter();
+    }
     std::pair<std::uint64_t, std::uint64_t> sealed{0, 0};
     if (auto* recorder = Recorder::Active(); recorder != nullptr && narrow) {
         Require(GuestMemory::GpuMutex().HeldByThisThread(), "a label readback decided its completion wait without the GPU lock");
-        Require(!AgcDriver::DriverDetail::DrawPipeline::Active() || AgcDriver::DriverDetail::DrawPipeline::Queue0().Outstanding() == 0, "a label readback decided its completion wait outside the committer while the committer had work queued");
+        Require(Recorder::OnCommitter(), "a label readback decided its completion wait off the committer");
         sealed = Span64(flush);
         const auto conflict = CompletionConflict(*recorder, sealed.first, sealed.second);
         if (conflict != 0) {

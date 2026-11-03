@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "Recompiler.hpp"
 #include <algorithm>
@@ -429,6 +430,10 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 
 
 void DrawPipeline::run() {
+    Graphics::Recorder::BindCommitter();
+    struct Unbind {
+        ~Unbind() { Graphics::Recorder::UnbindCommitter(); }
+    } unbind;
     PerformanceTrace::BindThread("draw committer");
     StartCommitterSampler();
     for (;;) {

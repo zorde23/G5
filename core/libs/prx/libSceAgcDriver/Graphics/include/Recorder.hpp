@@ -147,6 +147,13 @@ public:
     };
     static SealCost SealCheckCost();
     static void NoteSealFrame();
+    static void BindCommitter();
+    static void UnbindCommitter();
+    static bool OnCommitter();
+    static std::uint64_t RejectCommitter();
+    static std::uint64_t CommitterRejections();
+    static bool CompletionFailedInBatch();
+    static std::uint64_t CompletionLabelsBlocked();
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
     void NotePendingWordFill(std::uint64_t address, std::size_t bytes, std::uint32_t word);
@@ -898,6 +905,8 @@ private:
         std::uint64_t serial;
     };
     std::vector<SealedSpan> seals;
+    std::uint64_t sealsRetiredThrough = 0;
+    void retireSeals();
     friend void CheckSealedStore(std::uint64_t address, std::size_t bytes);
     mutable std::shared_ptr<const WriteRanges> published;
     std::uint64_t submissions = 0;

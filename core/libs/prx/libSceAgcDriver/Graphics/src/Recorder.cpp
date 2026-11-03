@@ -3026,7 +3026,14 @@ void AuditCompletionStore(std::uint64_t address, std::size_t bytes) {
         return;
     }
     const auto end = address + bytes;
-    const bool inside = std::any_of(auditedWrites->ranges.begin(), auditedWrites->ranges.end(), [&](const auto& range) { return range.first <= address && end <= range.second; });
+    auto ranges = auditedWrites->ranges;
+    std::sort(ranges.begin(), ranges.end());
+    auto covered = address;
+    for (const auto& [begin, rangeEnd] : ranges) {
+        if (begin > covered) break;
+        covered = std::max(covered, rangeEnd);
+    }
+    const bool inside = covered >= end;
     if (inside) return;
     audit.outsideStores.fetch_add(1, std::memory_order_relaxed);
     audit.outsideBytes.fetch_add(bytes, std::memory_order_relaxed);
@@ -3066,6 +3073,53 @@ void Recorder::NoteSealFrame() {
     base = cost;
     frames = 0;
     windowStart = now;
+}
+
+namespace {
+
+std::atomic<std::thread::id> committerThread{};
+std::atomic<std::uint64_t> committerRejections{0};
+thread_local bool completionFailed = false;
+std::atomic<std::uint64_t> completionLabelsBlocked{0};
+
+}
+
+std::uint64_t Recorder::CompletionLabelsBlocked() {
+    return completionLabelsBlocked.load(std::memory_order_relaxed);
+}
+
+void Recorder::BindCommitter() {
+    committerThread.store(std::this_thread::get_id(), std::memory_order_release);
+}
+
+void Recorder::UnbindCommitter() {
+    auto self = std::this_thread::get_id();
+    committerThread.compare_exchange_strong(self, std::thread::id{}, std::memory_order_acq_rel);
+}
+
+bool Recorder::OnCommitter() {
+    const auto bound = committerThread.load(std::memory_order_acquire);
+    return bound == std::thread::id{} || bound == std::this_thread::get_id();
+}
+
+std::uint64_t Recorder::RejectCommitter() {
+    return committerRejections.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+std::uint64_t Recorder::CommitterRejections() {
+    return committerRejections.load(std::memory_order_relaxed);
+}
+
+bool Recorder::CompletionFailedInBatch() {
+    return completionFailed;
+}
+
+void Recorder::retireSeals() {
+    if (seals.empty()) return;
+    std::erase_if(seals, [&](const SealedSpan& seal) {
+        if (seal.serial > sealsRetiredThrough) return false;
+        return std::none_of(finishing.begin(), finishing.end(), [&](const Batch* batch) { return batch->serial < seal.serial; });
+    });
 }
 
 void Recorder::Seal(std::uint64_t begin, std::uint64_t end, std::uint64_t serial) {
@@ -3737,6 +3791,11 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
             completionStoresSkipped.fetch_add(1, std::memory_order_relaxed);
             return;
         }
+        if (completionFailed && RuntimeSwitches::Set(RuntimeSwitch::FlushSkipSyncLabel) && RuntimeSwitches::Set(RuntimeSwitch::FlushSkipSyncLabelNarrow)) {
+            completionLabelsBlocked.fetch_add(1, std::memory_order_relaxed);
+            std::fprintf(stderr, "[flush-skip-seal] a completion label at 0x%llx was not stored: an earlier completion of its batch failed\n", static_cast<unsigned long long>(address));
+            return;
+        }
         completionStoresRun.fetch_add(1, std::memory_order_relaxed);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(address), copy.size(), 4, true);
         GuestMemory::StoreOwnBytes(address, copy);
@@ -4326,7 +4385,6 @@ bool Recorder::Reap() {
 
 void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
     inFlightKeptBytes -= batch->keptBytes;
-    std::erase_if(seals, [&](const SealedSpan& seal) { return seal.serial <= batch->serial; });
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {
         Recorder& recorder;
@@ -4334,6 +4392,8 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         ~Finishing() {
             auto& list = recorder.finishing;
             list.erase(std::remove(list.begin(), list.end(), batch), list.end());
+            recorder.sealsRetiredThrough = std::max(recorder.sealsRetiredThrough, batch->serial);
+            recorder.retireSeals();
             // The batch's completion labels have landed, or never will (fence failure below).
             if (batch->completionLabelCount != 0) completionLabels.fetch_sub(batch->completionLabelCount, std::memory_order_acq_rel);
             if (batch->completionStoreCount != 0) completionStores.fetch_sub(batch->completionStoreCount, std::memory_order_acq_rel);
@@ -4433,6 +4493,10 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         }();
         static_cast<void>(auditInstalled);
         std::size_t auditIndex = 0;
+        struct FailedScope {
+            bool previous;
+            ~FailedScope() { completionFailed = previous; }
+        } failedScope{std::exchange(completionFailed, false)};
         for (auto& action : batch->completions) {
             struct AuditScope {
                 const CompletionWrites* writes;
@@ -4452,6 +4516,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             try {
                 action();
             } catch (const BdaUnalignedAccess& error) {
+                completionFailed = true;
                 static std::mutex failuresMutex;
                 static std::unordered_map<std::uint32_t, std::uint64_t> failures;
                 constexpr std::uint64_t kDeferredFailureFirst = 8, kDeferredFailureEvery = 1024;
@@ -4462,6 +4527,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                 if (count <= kDeferredFailureFirst) std::fprintf(stderr, "[gpu] deferred write-back failed: %s\n", error.what());
                 else if (count % kDeferredFailureEvery == 0) std::fprintf(stderr, "[gpu] deferred write-back failed with an unaligned BDA access at pc 0x%x %llu times so far; latest: %s\n", error.instruction, static_cast<unsigned long long>(count), error.what());
             } catch (const std::exception& error) {
+                completionFailed = true;
                 AgcDriver::LogCoalescedStderr_nid_no_patch("[gpu] deferred write-back failed: %s\n", error.what());
             }
         }
@@ -4500,7 +4566,8 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
 }
 
 void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
-    std::erase_if(seals, [&](const SealedSpan& seal) { return seal.serial <= batch->serial; });
+    sealsRetiredThrough = std::max(sealsRetiredThrough, batch->serial);
+    retireSeals();
     removeLabels(*batch);
     if (batch->completionLabelCount != 0) completionLabels.fetch_sub(batch->completionLabelCount, std::memory_order_acq_rel);
     if (batch->completionStoreCount != 0) completionStores.fetch_sub(batch->completionStoreCount, std::memory_order_acq_rel);
