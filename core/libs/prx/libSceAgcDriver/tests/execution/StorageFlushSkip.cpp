@@ -1144,6 +1144,40 @@ void NarrowAuditUnionOfRanges(const GuestBlock& guest) {
     Require(audit.outsideStores == 1, what + "a store covered by the union of overlapping ranges was counted, or one across a gap was not");
 }
 
+void NarrowCommitterBindsDuringDecisions(AgcDriver::VulkanDevice& device) {
+    const std::string what = "storage flush skip narrow, committer binding during decisions: ";
+    GuestBlock guest;
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> toggles{0};
+    std::thread toggler([&] {
+        while (!stop.load()) {
+            Recorder::BindCommitter();
+            std::this_thread::yield();
+            Recorder::UnbindCommitter();
+            toggles.fetch_add(1);
+        }
+    });
+    SetNarrow(true);
+    std::exception_ptr failure;
+    try {
+        for (std::size_t round = 0; round < 32; ++round) {
+            const auto image = guest.Address() + (round % 4u) * 2u * SlotBytes;
+            StoreImage(device, image);
+            Flush(image, FlushReader::Label, what);
+        }
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    stop = true;
+    toggler.join();
+    SetNarrow(false);
+    SyncAll();
+    if (failure) std::rethrow_exception(failure);
+    Require(toggles.load() != 0, what + "the committer was never bound during the decisions");
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Require(Recorder::OnCommitter(), what + "a committer stayed bound after the toggling thread ended");
+}
+
 void NarrowRejectsOffCommitter(AgcDriver::VulkanDevice& device) {
     const std::string what = "storage flush skip narrow, decision off the committer: ";
     std::thread([] { Recorder::BindCommitter(); }).join();
@@ -1203,6 +1237,7 @@ void NarrowTests(AgcDriver::VulkanDevice& device) {
         NarrowSealSurvivesNestedRetirement(seal, labels);
     }
     NarrowRejectsOffCommitter(device);
+    NarrowCommitterBindsDuringDecisions(device);
 }
 
 }
