@@ -23,11 +23,14 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -495,6 +498,610 @@ void CpuBlockOnOpenWriteWaits(AgcDriver::VulkanDevice& device, const GuestBlock&
     device.WaitIdle();
 }
 
+
+using AgcDriver::Graphics::FlushReader;
+using AgcDriver::Graphics::Recorder;
+using AgcDriver::Graphics::RuntimeSwitch;
+namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+
+constexpr std::uint32_t Stale = 0x55555555u;
+constexpr std::size_t CaseBytes = 2 * SlotBytes;
+constexpr std::size_t UnitBytes = 65536;
+constexpr auto SkipGrace = std::chrono::milliseconds(3000);
+
+Recorder& ActiveRecorder() {
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "storage flush skip narrow: no active recorder");
+    return *recorder;
+}
+
+void SetNarrow(bool on) {
+    RuntimeSwitches::Assign(RuntimeSwitch::FlushSkipSyncLabelNarrow, on);
+}
+
+std::function<void()> StoreWord(std::uint64_t address, std::uint32_t value, std::atomic<bool>* ran = nullptr) {
+    return [address, value, ran] {
+        if (ran != nullptr) ran->store(true);
+        AgcDriver::GuestMemory::StoreOwnBytes(address, std::as_bytes(std::span(&value, 1)));
+    };
+}
+
+Recorder::CompletionWrites Declared(std::uint64_t begin, std::uint64_t end, bool hookable = false) {
+    return {true, {{begin, end}}, hookable};
+}
+
+void SyncAll() {
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    ActiveRecorder().Sync();
+}
+
+std::vector<std::uint32_t> CaseWords(const GuestBlock& guest, std::size_t caseOffset) {
+    const auto* words = guest.Words() + caseOffset / 4u;
+    return {words, words + CaseBytes / 4u};
+}
+
+enum class Expect : std::uint8_t { Wait, Skip };
+
+struct Hooks {
+    std::function<void(std::uint64_t base, std::uint64_t image)> prepare;
+    std::function<void(Recorder&, std::uint64_t base, std::uint64_t image)> beforeSubmit;
+    std::function<void(Recorder&, std::uint64_t base, std::uint64_t image, SubmissionGate&)> afterSubmit;
+};
+
+struct Outcome {
+    bool skipped = false;
+    bool ranAtFlush = false;
+    std::vector<std::uint32_t> words;
+};
+
+Outcome RunCase(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t caseOffset, std::size_t imageOffset, bool oracle, Expect expect, const std::string& what, std::atomic<bool>& ran, const Hooks& hooks) {
+    SubmissionGate gate(device);
+    const auto base = guest.Address() + caseOffset;
+    const auto image = base + imageOffset;
+    ran = false;
+    HeldWriter(device, gate, image, what, [&] {
+        if (hooks.prepare) hooks.prepare(base, image);
+        if (!hooks.beforeSubmit) return;
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        hooks.beforeSubmit(ActiveRecorder(), base, image);
+    });
+    if (hooks.afterSubmit) {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        hooks.afterSubmit(ActiveRecorder(), base, image, gate);
+    }
+    if (oracle) {
+        gate.Release();
+        SyncAll();
+    } else {
+        gate.ReleaseAfter(expect == Expect::Wait ? HeldFor : SkipGrace);
+    }
+    Outcome outcome;
+    outcome.skipped = Flush(image, FlushReader::Label, what);
+    outcome.ranAtFlush = ran.load();
+    const bool held = !gate.Released();
+    if (!oracle && expect == Expect::Wait) {
+        Require(!outcome.skipped, what + "the flush skipped the wait");
+        Require(outcome.ranAtFlush, what + "the results were stored before the conflicting completion ran");
+    }
+    if (!oracle && expect == Expect::Skip) {
+        Require(outcome.skipped && held, what + "the flush waited for the held writer");
+        Require(!outcome.ranAtFlush, what + "the completion ran before the skipped flush returned");
+    }
+    gate.Finish();
+    SyncAll();
+    outcome.words = CaseWords(guest, caseOffset);
+    return outcome;
+}
+
+void RequireSameBytes(const Outcome& narrow, const Outcome& oracle, const std::string& what) {
+    for (std::size_t index = 0; index < narrow.words.size(); ++index) {
+        if (narrow.words[index] == oracle.words[index]) continue;
+        char text[160];
+        std::snprintf(text, sizeof(text), "the byte at case offset 0x%zx is %08x, the settled order gives %08x", index * 4u, narrow.words[index], oracle.words[index]);
+        Require(false, what + text);
+    }
+}
+
+void CheckCase(AgcDriver::VulkanDevice& device, const std::string& what, std::size_t imageOffset, Expect expect, std::atomic<bool>& ran, const Hooks& hooks) {
+    GuestBlock guest;
+    SetNarrow(true);
+    const auto narrow = RunCase(device, guest, 0, imageOffset, false, expect, what, ran, hooks);
+    const auto oracle = RunCase(device, guest, BlockBytes / 2u, imageOffset, true, expect, what + "(settled) ", ran, hooks);
+    SetNarrow(false);
+    RequireSameBytes(narrow, oracle, what);
+}
+
+void FlushImage(std::uint64_t image) {
+    static_cast<void>(StorageTexture::FlushPending(image, ImageBytes, nullptr, "test", AgcDriver::Graphics::PublishScope::Whole, nullptr, false, FlushReader::Gpu));
+    SyncAll();
+}
+
+void NarrowAuditCountsOutsideStores(const GuestBlock& guest) {
+    const std::string what = "storage flush skip narrow, completion auditor: ";
+    RuntimeSwitches::Assign(RuntimeSwitch::FlushSkipSyncLabelShadow, true);
+    static_cast<void>(Recorder::TakeCompletionAudit());
+    const auto base = guest.Address();
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto& recorder = ActiveRecorder();
+        recorder.Commands();
+        recorder.OnComplete(StoreWord(base + 0x100u, Stale), Declared(base + 0x100u, base + 0x104u));
+        recorder.Sync();
+    }
+    auto audit = Recorder::TakeCompletionAudit();
+    Require(audit.completions >= 1 && audit.outsideStores == 0 && audit.unknownStores == 0, what + "a store inside the declared range was counted");
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto& recorder = ActiveRecorder();
+        recorder.Commands();
+        recorder.OnComplete(StoreWord(base + 0x200u, Stale), Declared(base + 0x100u, base + 0x104u));
+        recorder.OnComplete(StoreWord(base + 0x300u, Stale));
+        recorder.Sync();
+    }
+    audit = Recorder::TakeCompletionAudit();
+    RuntimeSwitches::Assign(RuntimeSwitch::FlushSkipSyncLabelShadow, false);
+    Require(audit.outsideStores == 1 && audit.outsideBytes == 4, what + "the store outside the declared range was not counted once");
+    Require(audit.unknownStores == 1, what + "the undeclared completion's store was not counted");
+    Require(guest.Words()[0x200u / 4u] == Stale, what + "the counted store did not land");
+}
+
+void NarrowAuditVerifyFails() {
+    GuestBlock guest;
+    const auto base = guest.Address();
+    static_cast<void>(Recorder::TakeCompletionAudit());
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto& recorder = ActiveRecorder();
+        recorder.Commands();
+        recorder.OnComplete(StoreWord(base + 0x100u, Stale), Declared(base + 0x100u, base + 0x104u));
+        recorder.OnComplete(StoreWord(base + 0x200u, Stale), Declared(base + 0x100u, base + 0x104u));
+        recorder.Sync();
+    }
+    const auto audit = Recorder::TakeCompletionAudit();
+    Require(guest.Words()[0x100u / 4u] == Stale, "storage flush skip narrow verify: the store inside the declared range did not land");
+    Require(guest.Words()[0x200u / 4u] == Initial, "storage flush skip narrow verify: the store outside the declared range landed");
+    Require(audit.outsideStores == 1, "storage flush skip narrow verify: the store outside the declared range was not counted");
+}
+
+void NarrowHtileSplitWaits(AgcDriver::VulkanDevice& device) {
+    const std::string what = "storage flush skip narrow, HTILE split over two batches: ";
+    std::atomic<bool> ran{false};
+    Hooks hooks;
+    hooks.afterSubmit = [&](Recorder& recorder, std::uint64_t, std::uint64_t image, SubmissionGate& gate) {
+        recorder.Commands();
+        recorder.NotePendingWrite(image, ImageBytes);
+        recorder.Submit();
+        const auto first = recorder.OpenSerial() - 1;
+        recorder.Commands();
+        recorder.NotePendingWrite(image + ImageBytes, ImageBytes);
+        Require(recorder.AfterPendingWrite(image, 2 * ImageBytes, StoreWord(image + 0x40u, Stale, &ran)), what + "the speculation found no batch");
+        gate.Release();
+        recorder.FinishUpTo(first);
+        Require(recorder.PendingWriterSerial(image, ImageBytes) == 0, what + "a batch still writes the image after the first half's batch finished");
+    };
+    CheckCase(device, what, 0, Expect::Wait, ran, hooks);
+}
+
+void NarrowSharedUnitWaits(AgcDriver::VulkanDevice& device) {
+    const std::string what = "storage flush skip narrow, completion in the image's partial unit: ";
+    std::atomic<bool> ran{false};
+    Hooks hooks;
+    hooks.beforeSubmit = [&](Recorder& recorder, std::uint64_t base, std::uint64_t) { recorder.OnComplete(StoreWord(base + 0x100u, Stale, &ran), Declared(base + 0x100u, base + 0x104u)); };
+    CheckCase(device, what, UnitBytes / 2u, Expect::Wait, ran, hooks);
+}
+
+void NarrowLaterCompletionsWait(AgcDriver::VulkanDevice& device) {
+    for (int variant = 0; variant < 3; ++variant) {
+        const std::string what = std::string("storage flush skip narrow, completion over the span ") + (variant == 0 ? "in the open batch: " : variant == 1 ? "in a batch after the writer: " : "with the writer retired: ");
+        std::atomic<bool> ran{false};
+        Hooks hooks;
+        hooks.afterSubmit = [&, variant](Recorder& recorder, std::uint64_t, std::uint64_t image, SubmissionGate& gate) {
+            if (variant == 2) {
+                const auto writer = recorder.PendingWriterSerial(image, ImageBytes);
+                gate.Release();
+                recorder.FinishUpTo(writer);
+            }
+            recorder.Commands();
+            recorder.OnComplete(StoreWord(image + 0x40u, Stale, &ran), Declared(image + 0x40u, image + 0x44u));
+            if (variant == 1) recorder.Submit();
+            if (variant == 2) Require(recorder.PendingWriterSerial(image, ImageBytes) == 0, what + "the writer did not retire");
+        };
+        CheckCase(device, what, 0, Expect::Wait, ran, hooks);
+    }
+}
+
+void NarrowOutsideCompletionSkips(AgcDriver::VulkanDevice& device) {
+    const std::string what = "storage flush skip narrow, completion outside the span's units: ";
+    std::atomic<bool> ran{false};
+    Hooks hooks;
+    hooks.beforeSubmit = [&](Recorder& recorder, std::uint64_t base, std::uint64_t) { recorder.OnComplete(StoreWord(base + 3u * UnitBytes, Stale, &ran), Declared(base + 3u * UnitBytes, base + 3u * UnitBytes + 4u)); };
+    CheckCase(device, what, 0, Expect::Skip, ran, hooks);
+    GuestBlock global;
+    RunCase(device, global, 0, 0, false, Expect::Wait, "storage flush skip, global rule with a completion outside the span: ", ran, hooks);
+}
+
+void NarrowCopiedWriterWaits(AgcDriver::VulkanDevice& device) {
+    const std::string what = "storage flush skip narrow, copied writer over the span: ";
+    std::atomic<bool> ran{false};
+    Hooks hooks;
+    hooks.beforeSubmit = [&](Recorder& recorder, std::uint64_t, std::uint64_t image) { recorder.OnComplete(StoreWord(image + 0x40u, Stale, &ran), Declared(image, image + ImageBytes, true)); };
+    CheckCase(device, what, 0, Expect::Wait, ran, hooks);
+}
+
+alignas(256) constexpr std::array<std::uint32_t, 8> LoadGlobalCode{0x7e000208u, 0x7e020209u, 0xdc308100u, 0x037d0000u, 0xbf8c3f70u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
+
+void NarrowAddressReadSkips(AgcDriver::VulkanDevice& device) {
+    const std::string what = "storage flush skip narrow, address-based read in the open batch: ";
+    GuestBlock guest;
+    SetNarrow(true);
+    SubmissionGate gate(device);
+    const auto image = guest.Address();
+    HeldWriter(device, gate, image, what, [] {});
+    const auto loadGlobal = Compile(LoadGlobalCode, GlobalUserData(image), device.Target());
+    device.Dispatch(loadGlobal, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(LoadGlobalCode.data()));
+    gate.ReleaseAfter(SkipGrace);
+    const bool skipped = Flush(image, FlushReader::Label, what);
+    const bool held = !gate.Released();
+    gate.Finish();
+    SyncAll();
+    SetNarrow(false);
+    Require(skipped && held, what + "the flush waited");
+    Require(guest.Words()[0] == Second && guest.Words()[FarDword] == Second, what + "the image's second store was not stored");
+    GuestBlock stores;
+    SetNarrow(true);
+    LabelReaderOpenNoteOverInFlightAddressStore(device, stores);
+    SetNarrow(false);
+}
+
+void NarrowUnitEdges(AgcDriver::VulkanDevice& device) {
+    const auto imageOffset = UnitBytes / 2u;
+    const auto spanEnd = (imageOffset + ImageBytes + UnitBytes - 1u) & ~(UnitBytes - 1u);
+    {
+        const std::string what = "storage flush skip narrow, completion just before the image in its first unit: ";
+        std::atomic<bool> ran{false};
+        Hooks hooks;
+        hooks.beforeSubmit = [&](Recorder& recorder, std::uint64_t, std::uint64_t image) { recorder.OnComplete(StoreWord(image - 4u, Stale, &ran), Declared(image - 4u, image)); };
+        CheckCase(device, what, imageOffset, Expect::Wait, ran, hooks);
+    }
+    {
+        const std::string what = "storage flush skip narrow, completion just after the image's last unit: ";
+        std::atomic<bool> ran{false};
+        Hooks hooks;
+        hooks.beforeSubmit = [&, spanEnd](Recorder& recorder, std::uint64_t base, std::uint64_t) { recorder.OnComplete(StoreWord(base + spanEnd, Stale, &ran), Declared(base + spanEnd, base + spanEnd + 4u)); };
+        CheckCase(device, what, imageOffset, Expect::Skip, ran, hooks);
+    }
+    {
+        const std::string what = "storage flush skip narrow, completion just inside the image's last unit: ";
+        std::atomic<bool> ran{false};
+        Hooks hooks;
+        hooks.beforeSubmit = [&, spanEnd](Recorder& recorder, std::uint64_t base, std::uint64_t) { recorder.OnComplete(StoreWord(base + spanEnd - 4u, Stale, &ran), Declared(base + spanEnd - 4u, base + spanEnd)); };
+        CheckCase(device, what, imageOffset, Expect::Wait, ran, hooks);
+    }
+}
+
+void NarrowUndeclaredWaits(AgcDriver::VulkanDevice& device) {
+    const std::string what = "storage flush skip narrow, undeclared completion: ";
+    std::atomic<bool> ran{false};
+    Hooks hooks;
+    hooks.beforeSubmit = [&](Recorder& recorder, std::uint64_t base, std::uint64_t) { recorder.OnComplete(StoreWord(base + 3u * UnitBytes, Stale, &ran)); };
+    CheckCase(device, what, 0, Expect::Wait, ran, hooks);
+}
+
+void NarrowInsideCompletion(AgcDriver::VulkanDevice& device) {
+    const std::string what = "storage flush skip narrow, label readback inside a completion: ";
+    GuestBlock guest;
+    SetNarrow(true);
+    SubmissionGate gate(device);
+    const auto image = guest.Address();
+    HeldWriter(device, gate, image, what, [] {});
+    const auto conflictWaits = StorageTexture::NarrowConflictWaits();
+    std::atomic<bool> inside{false};
+    std::atomic<bool> flushed{false};
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto& recorder = ActiveRecorder();
+        recorder.OnComplete(StoreWord(image + 0x40u, Stale), Declared(image + 0x40u, image + 0x44u));
+        recorder.OnComplete([&, image] {
+            inside = Recorder::InCompletion();
+            flushed = StorageTexture::FlushPending(image, ImageBytes, nullptr, "test", AgcDriver::Graphics::PublishScope::Whole, nullptr, false, FlushReader::Label);
+        }, {true, {}, false});
+    }
+    gate.Release();
+    SyncAll();
+    gate.Finish();
+    SyncAll();
+    SetNarrow(false);
+    Require(inside.load() && flushed.load(), what + "the readback did not run inside the completion");
+    Require(StorageTexture::NarrowConflictWaits() == conflictWaits, what + "the readback inside the completion waited for a conflict");
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Require(ActiveRecorder().Seals() == 0, what + "a seal outlived the batches");
+    }
+}
+
+void NarrowLabelVisibleAfterImage(AgcDriver::VulkanDevice& device) {
+    const std::string what = "storage flush skip narrow, label after a readback that skipped: ";
+    GuestBlock guest;
+    GuestBlock labels;
+    SetNarrow(true);
+    SubmissionGate gate(device);
+    const auto image = guest.Address();
+    const auto* words = static_cast<volatile const std::uint32_t*>(guest.Words());
+    auto* label = static_cast<volatile std::uint32_t*>(labels.Words());
+    const std::uint32_t value = 0x1abe2u;
+    HeldWriter(device, gate, image, what, [&] {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        ActiveRecorder().OnComplete(StoreWord(image + 3u * UnitBytes, Stale), Declared(image + 3u * UnitBytes, image + 3u * UnitBytes + 4u));
+    });
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        const auto before = StorageTexture::WriterWaitsSkipped();
+        const auto reason = device.WriteLabelOnGpu(labels.Address(), std::as_bytes(std::span(&value, 1)), 1, 0);
+        Require(StorageTexture::WriterWaitsSkipped() != before, what + "the label's readback did not skip the wait");
+        Require(reason == 0 || reason == 5, what + "the label was not ordered behind the write-back (reason " + std::to_string(reason) + ")");
+        Require(ActiveRecorder().Seals() != 0, what + "the skip left no seal");
+        device.SubmitRecorded(true);
+    }
+    Require(*label != value, what + "the label landed while its writer was held");
+    gate.Release();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (*label != value) {
+        Require(std::chrono::steady_clock::now() < deadline, what + "the label never landed");
+        std::this_thread::yield();
+    }
+    Require(words[0] == Second && words[FarDword] == Second, what + "the label was visible before the image's second store");
+    gate.Finish();
+    SyncAll();
+    SetNarrow(false);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Require(ActiveRecorder().Seals() == 0, what + "the seal outlived its batch");
+}
+
+void NarrowLaterCompletionClosesGap(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
+    const std::string what = "storage flush skip narrow, completion in a batch after the writer: ";
+    SetNarrow(true);
+    SubmissionGate gate(device);
+    const auto image = guest.Address() + 2 * SlotBytes;
+    HeldWriter(device, gate, image, what, [] {});
+    std::atomic<bool> ran{false};
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto& recorder = ActiveRecorder();
+        recorder.OnComplete([&ran] { ran = true; });
+        Require(recorder.PendingWriterSerial(image, ImageBytes) != recorder.OpenSerial(), what + "the batch holding the completion became the writer of the range");
+    }
+    gate.ReleaseAfter(HeldFor);
+    Require(!Flush(image, FlushReader::Label, what), what + "the flush skipped the wait");
+    const bool ranAtStore = ran.load();
+    gate.Finish();
+    SetNarrow(false);
+    Require(ranAtStore, what + "the results were stored before the later batch's completion ran");
+}
+
+void NarrowHookableWriteBack(AgcDriver::VulkanDevice& device) {
+    for (const bool dirty : {true, false}) {
+        const std::string what = std::string("storage flush skip narrow, write-back with ") + (dirty ? "pending results" : "no pending results") + " in its declared range: ";
+        std::atomic<bool> ran{false};
+        Hooks hooks;
+        hooks.beforeSubmit = [&](Recorder& recorder, std::uint64_t base, std::uint64_t) {
+            const auto other = base + SlotBytes;
+            recorder.OnComplete(StoreWord(other + 0x40u, Stale, &ran), Declared(other, other + ImageBytes, true));
+        };
+        GuestBlock guest;
+        SetNarrow(true);
+        for (const std::size_t caseOffset : {std::size_t{0}, BlockBytes / 2u}) {
+            const auto other = guest.Address() + caseOffset + SlotBytes;
+            StoreImage(device, other);
+            if (!dirty) FlushImage(other);
+        }
+        const auto narrow = RunCase(device, guest, 0, 0, false, dirty ? Expect::Wait : Expect::Skip, what, ran, hooks);
+        const auto oracle = RunCase(device, guest, BlockBytes / 2u, 0, true, Expect::Wait, what + "(settled) ", ran, hooks);
+        SetNarrow(false);
+        for (const std::size_t caseOffset : {std::size_t{0}, BlockBytes / 2u}) FlushImage(guest.Address() + caseOffset + SlotBytes);
+        RequireSameBytes(narrow, oracle, what);
+    }
+    const std::string what = "storage flush skip narrow, auditor across a nested finish: ";
+    GuestBlock guest;
+    const auto base = guest.Address();
+    RuntimeSwitches::Assign(RuntimeSwitch::FlushSkipSyncLabelShadow, true);
+    static_cast<void>(Recorder::TakeCompletionAudit());
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto& recorder = ActiveRecorder();
+        recorder.Commands();
+        const auto later = recorder.OpenSerial() + 1;
+        recorder.OnComplete([&recorder, later, base] {
+            recorder.FinishUpTo(later);
+            const std::uint32_t value = Stale;
+            AgcDriver::GuestMemory::StoreOwnBytes(base + 0x100u, std::as_bytes(std::span(&value, 1)));
+        }, Declared(base + 0x100u, base + 0x104u));
+        recorder.Submit();
+        recorder.Commands();
+        recorder.OnComplete([base] {
+            const std::uint32_t value = Stale;
+            AgcDriver::GuestMemory::StoreOwnBytes(base + 0x200u, std::as_bytes(std::span(&value, 1)));
+            throw std::runtime_error("deliberate failure of a nested completion");
+        }, Declared(base + 0x200u, base + 0x204u));
+        recorder.Submit();
+        recorder.Sync();
+    }
+    const auto audit = Recorder::TakeCompletionAudit();
+    RuntimeSwitches::Assign(RuntimeSwitch::FlushSkipSyncLabelShadow, false);
+    Require(guest.Words()[0x100u / 4u] == Stale && guest.Words()[0x200u / 4u] == Stale, what + "a completion's store did not land");
+    Require(audit.outsideStores == 0 && audit.unknownStores == 0, what + "the outer completion's store was audited against the nested one's ranges");
+}
+
+void NarrowSealFiresOnOlderCompletion(const GuestBlock& guest) {
+    const std::string what = "storage flush skip narrow, seal: ";
+    const auto base = guest.Address();
+    const auto violations = Recorder::SealViolations();
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto& recorder = ActiveRecorder();
+        recorder.Commands();
+        recorder.OnComplete(StoreWord(base + 0x100u, Stale), Declared(base + 0x100u, base + 0x104u));
+        recorder.Submit();
+        recorder.Commands();
+        recorder.Seal(base, base + UnitBytes, recorder.OpenSerial());
+        recorder.OnComplete(StoreWord(base + 0x200u, Stale), Declared(base + 0x200u, base + 0x204u));
+        recorder.Sync();
+        Require(recorder.Seals() == 0, what + "the seal outlived its batch");
+    }
+    Require(Recorder::SealViolations() == violations + 1, what + "an older batch's completion stored into the sealed span unnoticed");
+    Require(guest.Words()[0x100u / 4u] == Initial, what + "the older batch's store into the sealed span landed");
+    Require(guest.Words()[0x200u / 4u] == Stale, what + "the sealing batch's own completion could not store");
+}
+
+void NarrowLabelBehindCompletions(AgcDriver::VulkanDevice& device) {
+    const std::string what = "storage flush skip narrow, label behind the completions after a skip: ";
+    GuestBlock guest;
+    GuestBlock labels;
+    SetNarrow(true);
+    SubmissionGate gate(device);
+    const auto image = guest.Address();
+    const auto* words = static_cast<volatile const std::uint32_t*>(guest.Words());
+    auto* label = static_cast<volatile std::uint32_t*>(labels.Words());
+    const std::uint32_t value = 0x1abe3u;
+    HeldWriter(device, gate, image, what, [] {});
+    std::atomic<std::uint32_t> seenLabel{0}, seenFirst{0}, seenFar{0};
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto& recorder = ActiveRecorder();
+        const std::uint32_t other = 0x0dd5u;
+        recorder.AfterCompletions(labels.Address() + 0x100u, std::as_bytes(std::span(&other, 1)), 1, 0, false);
+        Require(Recorder::PendingCompletionStores() != 0, what + "no completion store is pending");
+        const auto before = StorageTexture::WriterWaitsSkipped();
+        const auto reason = device.WriteLabelOnGpu(labels.Address(), std::as_bytes(std::span(&value, 1)), 2, 0);
+        Require(StorageTexture::WriterWaitsSkipped() != before, what + "the label's readback did not skip the wait");
+        Require(reason == 5, what + "the label was not stored behind the completions (reason " + std::to_string(reason) + ")");
+        recorder.OnComplete([&] {
+            seenLabel = *label;
+            seenFirst = words[0];
+            seenFar = words[FarDword];
+        }, {true, {}, false});
+        device.SubmitRecorded(true);
+    }
+    Require(*label != value, what + "the label landed while its writer was held");
+    gate.Finish();
+    SyncAll();
+    SetNarrow(false);
+    Require(*label == value, what + "the label never landed");
+    Require(seenLabel.load() == value, what + "the label had not landed when its batch's later completion ran");
+    Require(seenFirst.load() == Second && seenFar.load() == Second, what + "the label landed before the image's second store");
+}
+
+void NarrowTwoLabelsSameSpan(AgcDriver::VulkanDevice& device) {
+    const std::string what = "storage flush skip narrow, two labels over one span: ";
+    GuestBlock guest;
+    GuestBlock labels;
+    SetNarrow(true);
+    SubmissionGate gate(device);
+    const auto image = guest.Address();
+    const auto* words = static_cast<volatile const std::uint32_t*>(guest.Words());
+    auto* second = static_cast<volatile std::uint32_t*>(labels.Words() + 1);
+    const std::uint32_t firstValue = 0x1abe4u;
+    const std::uint32_t secondValue = 0x1abe5u;
+    HeldWriter(device, gate, image, what, [] {});
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        const auto before = StorageTexture::WriterWaitsSkipped();
+        const auto reason = device.WriteLabelOnGpu(labels.Address(), std::as_bytes(std::span(&firstValue, 1)), 3, 0);
+        Require(StorageTexture::WriterWaitsSkipped() != before, what + "the first label's readback did not skip the wait");
+        Require(reason == 0 || reason == 5, what + "the first label was not ordered behind the write-back (reason " + std::to_string(reason) + ")");
+    }
+    StoreImage(device, image);
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        const auto before = StorageTexture::WriterWaitsSkipped();
+        const auto reason = device.WriteLabelOnGpu(labels.Address() + 4u, std::as_bytes(std::span(&secondValue, 1)), 4, 0);
+        Require(StorageTexture::WriterWaitsSkipped() != before, what + "the second label's readback did not skip the wait");
+        Require(reason == 0 || reason == 5, what + "the second label was not ordered behind the write-back (reason " + std::to_string(reason) + ")");
+        device.SubmitRecorded(true);
+    }
+    Require(!gate.Released(), what + "a readback waited for the held writer");
+    Require(*second != secondValue, what + "the second label landed while the writer was held");
+    gate.Release();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (*second != secondValue) {
+        Require(std::chrono::steady_clock::now() < deadline, what + "the second label never landed");
+        std::this_thread::yield();
+    }
+    Require(words[0] == Stored && words[FarDword] == Stored, what + "the second label was visible before the third store");
+    gate.Finish();
+    SyncAll();
+    SetNarrow(false);
+}
+
+void NarrowThrowingCompletions(AgcDriver::VulkanDevice& device) {
+    {
+        const std::string what = "storage flush skip narrow, conflicting completion that throws: ";
+        GuestBlock guest;
+        std::atomic<bool> ran{false};
+        Hooks hooks;
+        hooks.beforeSubmit = [&](Recorder& recorder, std::uint64_t, std::uint64_t image) {
+            recorder.OnComplete([&ran] {
+                ran = true;
+                throw std::runtime_error("deliberate failure of a conflicting completion");
+            }, Declared(image, image + 4u));
+        };
+        SetNarrow(true);
+        RunCase(device, guest, 0, 0, false, Expect::Wait, what, ran, hooks);
+        SetNarrow(false);
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Require(ActiveRecorder().Seals() == 0, what + "a seal outlived the batches");
+    }
+    {
+        const std::string what = "storage flush skip narrow, sealing batch whose completion throws: ";
+        GuestBlock guest;
+        SetNarrow(true);
+        SubmissionGate gate(device);
+        const auto image = guest.Address();
+        HeldWriter(device, gate, image, what, [] {});
+        gate.ReleaseAfter(SkipGrace);
+        Require(Flush(image, FlushReader::Label, what) && !gate.Released(), what + "the flush did not skip");
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            auto& recorder = ActiveRecorder();
+            Require(recorder.Seals() == 1, what + "the skip left no seal");
+            recorder.OnComplete([] { throw std::runtime_error("deliberate failure of the sealing batch's completion"); }, {true, {}, false});
+        }
+        gate.Finish();
+        SyncAll();
+        SetNarrow(false);
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Require(ActiveRecorder().Seals() == 0, what + "the seal outlived its batch");
+    }
+}
+
+void NarrowTests(AgcDriver::VulkanDevice& device) {
+    {
+        GuestBlock audit;
+        NarrowAuditCountsOutsideStores(audit);
+    }
+    NarrowHtileSplitWaits(device);
+    NarrowSharedUnitWaits(device);
+    NarrowOutsideCompletionSkips(device);
+    NarrowAddressReadSkips(device);
+    NarrowLaterCompletionsWait(device);
+    NarrowCopiedWriterWaits(device);
+    NarrowUnitEdges(device);
+    NarrowUndeclaredWaits(device);
+    NarrowInsideCompletion(device);
+    NarrowLabelVisibleAfterImage(device);
+    {
+        GuestBlock gap;
+        NarrowLaterCompletionClosesGap(device, gap);
+    }
+    NarrowHookableWriteBack(device);
+    {
+        GuestBlock seal;
+        NarrowSealFiresOnOlderCompletion(seal);
+    }
+    NarrowLabelBehindCompletions(device);
+    NarrowTwoLabelsSameSpan(device);
+    NarrowThrowingCompletions(device);
+}
+
 }
 
 int main() {
@@ -507,6 +1114,11 @@ int main() {
         if (!AgcDriver::GuestMemory::WriteWatched()) {
             std::puts("guest memory has no write watch: storage flush skip tests skipped");
             return VulkanTestSkipped;
+        }
+        if (std::getenv("APS5_FLUSH_SKIP_SYNC_VERIFY") != nullptr) {
+            NarrowAuditVerifyFails();
+            std::puts("storage flush skip verify tests passed");
+            return 0;
         }
         GuestBlock guest;
         GpuReaderSkips(*device, guest, 0);
@@ -528,6 +1140,7 @@ int main() {
             GuestBlock gap;
             LabelReaderLaterCompletionGap(*device, gap);
         }
+        NarrowTests(*device);
         std::puts("storage flush skip tests passed");
         return 0;
     } catch (const std::exception& error) {
