@@ -70,6 +70,8 @@ using FreshCollectHook = bool (*)(std::uintptr_t address, std::size_t bytes, voi
 void SetFreshCollectHook(FreshCollectHook hook);
 #endif
 bool Watched(std::uint64_t address, std::size_t bytes);
+using CompletionStoreAudit = void (*)(std::uint64_t address, std::size_t bytes);
+void SetCompletionStoreAudit(CompletionStoreAudit audit);
 // Whether a page of the range is compared when shared instead of armed (GuestArena
 // CompareWhenShared, without APS5_ARM_SHARED_IMPORTS): a CPU store there is not caught by a fault.
 // Pinned pages (guest stacks, fiber contexts) are not reported: no GPU resource lives there.

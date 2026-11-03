@@ -5772,7 +5772,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                     CaptureTrace::Log("copy-input-byte batch=%llu address=%llx offset=%zu cpu=%02x gpu=%02x", batch, static_cast<unsigned long long>(address), index, std::to_integer<unsigned>(expected[index]), std::to_integer<unsigned>(actual[index]));
                 }
                 CaptureTrace::Log("copy-input-result batch=%llu address=%llx bytes=%zu changed=%zu", batch, static_cast<unsigned long long>(address), expected.size(), changed);
-            });
+            }, {true, {}, false});
         }
         if (inputSnapshot == nullptr) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
         // Kept by the batch at record time, as every other recorded target is: the caller keeps

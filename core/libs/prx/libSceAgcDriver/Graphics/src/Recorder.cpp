@@ -2965,14 +2965,161 @@ void Recorder::KeepHighestIndex(std::uint64_t address, std::size_t bytes, Snapsh
     }
 }
 
+namespace {
+
+struct CompletionAuditState {
+    std::atomic<std::uint64_t> completions{0}, outsideStores{0}, outsideBytes{0}, unknownStores{0}, gpuNotes{0};
+    std::atomic<int> logged{0};
+};
+
+CompletionAuditState& CompletionAuditCounters() {
+    static CompletionAuditState state;
+    return state;
+}
+
+thread_local const Recorder::CompletionWrites* auditedWrites = nullptr;
+thread_local const void* auditedSite = nullptr;
+thread_local std::uint64_t auditedSerial = 0;
+
+}
+
+std::atomic<std::uint64_t> sealViolations{0};
+
+std::uint64_t Recorder::SealViolations() {
+    return sealViolations.load(std::memory_order_relaxed);
+}
+
+std::atomic<std::uint64_t> sealCheckNs{0};
+std::atomic<std::uint64_t> sealChecks{0};
+
+void CheckSealedStore(std::uint64_t address, std::size_t bytes) {
+    const auto* recorder = activeRecorder;
+    if (recorder == nullptr || recorder->seals.empty()) return;
+    const auto start = std::chrono::steady_clock::now();
+    struct Cost {
+        std::chrono::steady_clock::time_point start;
+        ~Cost() {
+            sealCheckNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+            sealChecks.fetch_add(1, std::memory_order_relaxed);
+        }
+    } cost{start};
+    const auto end = address + bytes;
+    for (const auto& seal : recorder->seals) {
+        if (seal.serial <= auditedSerial || end <= seal.begin || seal.end <= address) continue;
+        sealViolations.fetch_add(1, std::memory_order_relaxed);
+        char message[256];
+        std::snprintf(message, sizeof(message), "a completion of batch %llu stored 0x%llx+0x%zx into a span sealed by the label readback that skipped its wait up to batch %llu", static_cast<unsigned long long>(auditedSerial), static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(seal.serial));
+        Require(false, message);
+    }
+}
+
+namespace {
+
+void AuditCompletionStore(std::uint64_t address, std::size_t bytes) {
+    if (completionDepth == 0 || bytes == 0) return;
+    CheckSealedStore(address, bytes);
+    static const bool verify = std::getenv("APS5_FLUSH_SKIP_SYNC_VERIFY") != nullptr;
+    if (!verify && !RuntimeSwitches::Set(RuntimeSwitch::FlushSkipSyncLabelShadow)) return;
+    auto& audit = CompletionAuditCounters();
+    if (auditedWrites == nullptr || !auditedWrites->known) {
+        audit.unknownStores.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const auto end = address + bytes;
+    const bool inside = std::any_of(auditedWrites->ranges.begin(), auditedWrites->ranges.end(), [&](const auto& range) { return range.first <= address && end <= range.second; });
+    if (inside) return;
+    audit.outsideStores.fetch_add(1, std::memory_order_relaxed);
+    audit.outsideBytes.fetch_add(bytes, std::memory_order_relaxed);
+    Require(!verify, "a completion stored outside the ranges its registration declared");
+    if (audit.logged.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[flush-skip-shadow] completion store 0x%llx+0x%zx outside the ranges its registration declared (site %p)\n", static_cast<unsigned long long>(address), bytes, auditedSite);
+}
+
+}
+
+Recorder::CompletionAudit Recorder::TakeCompletionAudit() {
+    auto& audit = CompletionAuditCounters();
+    CompletionAudit taken;
+    taken.completions = audit.completions.exchange(0);
+    taken.outsideStores = audit.outsideStores.exchange(0);
+    taken.outsideBytes = audit.outsideBytes.exchange(0);
+    taken.unknownStores = audit.unknownStores.exchange(0);
+    taken.gpuNotes = audit.gpuNotes.exchange(0);
+    return taken;
+}
+
+Recorder::SealCost Recorder::SealCheckCost() {
+    return {sealChecks.load(std::memory_order_relaxed), sealCheckNs.load(std::memory_order_relaxed)};
+}
+
+void Recorder::NoteSealFrame() {
+    static std::mutex mutex;
+    static SealCost base{};
+    static std::uint64_t frames = 0;
+    static auto windowStart = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    ++frames;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - windowStart < std::chrono::seconds(10)) return;
+    const auto cost = SealCheckCost();
+    const auto msPerFrame = static_cast<double>(cost.ns - base.ns) / 1e6 / static_cast<double>(frames);
+    if (msPerFrame > 0.1) std::fprintf(stderr, "[flush-skip-seal] the seal checks cost %.3f ms per frame over the last %llu frames (%llu checks), above the 0.1 ms budget\n", msPerFrame, static_cast<unsigned long long>(frames), static_cast<unsigned long long>(cost.checks - base.checks));
+    base = cost;
+    frames = 0;
+    windowStart = now;
+}
+
+void Recorder::Seal(std::uint64_t begin, std::uint64_t end, std::uint64_t serial) {
+    Require(GuestMemory::GpuMutex().HeldByThisThread(), "a label readback sealed its span without the GPU lock");
+    seals.push_back({begin, end, serial});
+}
+
+void Recorder::OnComplete(std::function<void()> action, CompletionWrites writes) {
+    ensureOpen();
+    open->completions.push_back(std::move(action));
+    open->completionWrites.push_back(std::move(writes));
+    open->completionSites.push_back(__builtin_return_address(0));
+    ++open->writeBackCompletionCount;
+    writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
+}
+
+std::uint64_t Recorder::NewestCompletionMayWrite(std::uint64_t begin, std::uint64_t end, const std::function<bool(const CompletionWrites&)>& dirty) const {
+    std::uint64_t newest = 0;
+    const auto scan = [&](const Batch& batch, std::uint64_t serial) {
+        if (serial <= newest) return;
+        for (std::size_t index = 0; index < batch.completions.size(); ++index) {
+            if (index >= batch.completionWrites.size()) {
+                newest = serial;
+                return;
+            }
+            const auto& writes = batch.completionWrites[index];
+            const bool overlaps = std::any_of(writes.ranges.begin(), writes.ranges.end(), [&](const auto& range) { return range.first < end && begin < range.second; });
+            if (!writes.known || overlaps || (writes.hookable && dirty && dirty(writes))) {
+                newest = serial;
+                return;
+            }
+        }
+    };
+    for (const auto* batch : finishing) scan(*batch, batch->serial);
+    for (const auto& batch : inFlight) scan(*batch, batch->serial);
+    if (open != nullptr) scan(*open, OpenSerial());
+    return newest;
+}
+
 void Recorder::OnComplete(std::function<void()> action) {
     ensureOpen();
     open->completions.push_back(std::move(action));
+    open->completionWrites.emplace_back();
+    open->completionSites.push_back(__builtin_return_address(0));
     ++open->writeBackCompletionCount;
     writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
 }
 
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value, std::int64_t word) {
+    if (completionDepth != 0 && bytes != 0 && RuntimeSwitches::Set(RuntimeSwitch::FlushSkipSyncLabelShadow)) {
+        auto& audit = CompletionAuditCounters();
+        audit.gpuNotes.fetch_add(1, std::memory_order_relaxed);
+        if (audit.logged.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[flush-skip-shadow] GPU write 0x%llx+0x%zx recorded inside a completion (site %p)\n", static_cast<unsigned long long>(address), bytes, auditedSite);
+    }
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
     ensureOpen();
@@ -3231,6 +3378,8 @@ bool Recorder::AfterPendingWrite(std::uint64_t address, std::size_t bytes, std::
     }
     if (target == nullptr) return false;
     target->completions.push_back(std::move(action));
+    target->completionWrites.push_back({true, {{address, end}}, false});
+    target->completionSites.push_back(__builtin_return_address(0));
     ++target->writeBackCompletionCount;
     writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
     return true;
@@ -3581,6 +3730,8 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
         std::lock_guard ringLock(writtenBackMutex);
         return writtenBackSequence;
     }();
+    batch.completionWrites.push_back({true, {{address, address + copy.size()}}, false});
+    batch.completionSites.push_back(__builtin_return_address(0));
     batch.completions.push_back([this, address, copy = std::move(copy), sequence, storedOnGpu] {
         if (storedOnGpu && !always && !writtenBackSince(sequence, address, address + copy.size())) {
             completionStoresSkipped.fetch_add(1, std::memory_order_relaxed);
@@ -3618,6 +3769,8 @@ bool Recorder::AfterRecordedWork(std::function<void()> action) {
     if (Idle()) return false;
     Batch& batch = open != nullptr ? *open : *inFlight.back();
     batch.completions.push_back(std::move(action));
+    batch.completionWrites.push_back({true, {}, false});
+    batch.completionSites.push_back(__builtin_return_address(0));
     ++batch.completionLabelCount;
     completionLabels.fetch_add(1, std::memory_order_acq_rel);
         GuestMemory::BreakProofs();
@@ -4173,6 +4326,7 @@ bool Recorder::Reap() {
 
 void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
     inFlightKeptBytes -= batch->keptBytes;
+    std::erase_if(seals, [&](const SealedSpan& seal) { return seal.serial <= batch->serial; });
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {
         Recorder& recorder;
@@ -4273,7 +4427,28 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             InCompletion() { ++completionDepth; }
             ~InCompletion() { --completionDepth; }
         } inCompletion;
+        static const bool auditInstalled = [] {
+            GuestMemory::SetCompletionStoreAudit(&AuditCompletionStore);
+            return true;
+        }();
+        static_cast<void>(auditInstalled);
+        std::size_t auditIndex = 0;
         for (auto& action : batch->completions) {
+            struct AuditScope {
+                const CompletionWrites* writes;
+                const void* site;
+                std::uint64_t serial;
+                ~AuditScope() {
+                    auditedWrites = writes;
+                    auditedSite = site;
+                    auditedSerial = serial;
+                }
+            } auditScope{auditedWrites, auditedSite, auditedSerial};
+            auditedSerial = batch->serial;
+            auditedWrites = auditIndex < batch->completionWrites.size() ? &batch->completionWrites[auditIndex] : nullptr;
+            auditedSite = auditIndex < batch->completionSites.size() ? batch->completionSites[auditIndex] : nullptr;
+            ++auditIndex;
+            if (RuntimeSwitches::Set(RuntimeSwitch::FlushSkipSyncLabelShadow)) CompletionAuditCounters().completions.fetch_add(1, std::memory_order_relaxed);
             try {
                 action();
             } catch (const BdaUnalignedAccess& error) {
@@ -4325,6 +4500,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
 }
 
 void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
+    std::erase_if(seals, [&](const SealedSpan& seal) { return seal.serial <= batch->serial; });
     removeLabels(*batch);
     if (batch->completionLabelCount != 0) completionLabels.fetch_sub(batch->completionLabelCount, std::memory_order_acq_rel);
     if (batch->completionStoreCount != 0) completionStores.fetch_sub(batch->completionStoreCount, std::memory_order_acq_rel);

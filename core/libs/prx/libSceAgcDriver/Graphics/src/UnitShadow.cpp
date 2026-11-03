@@ -263,6 +263,8 @@ bool recordCopiesOnCpu(const UnitShadow& shadow, const std::vector<SlabCopies>& 
     Recorder::CountBarriers(Recorder::CommandClass::ShadowPublish);
     recorder->EndGpuTiming(timing, bytes);
     recorder->NotePendingWrites(ranges);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> units;
+    for (const auto& [begin, end] : ranges) units.emplace_back(begin & ~(UnitBytes - 1), (end + UnitBytes - 1) & ~(UnitBytes - 1));
     recorder->OnComplete([host, pieces = std::move(pieces), checked] {
         host->Invalidate();
         for (const auto& piece : pieces) {
@@ -274,7 +276,7 @@ bool recordCopiesOnCpu(const UnitShadow& shadow, const std::vector<SlabCopies>& 
                 at = next;
             }
         }
-    });
+    }, {true, std::move(units), false});
     return true;
 }
 

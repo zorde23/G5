@@ -5340,7 +5340,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recorder.OnComplete([kept, htileClear = record.htileClear] {
             kept->CheckFaults();
             if (htileClear.has_value()) Graphics::CompleteHtileDepthClear(htileClear->first, htileClear->second);
-        });
+        }, {true, {}, false});
     } else if (completionNeeded) {
         // Listed for DispatchIndirect until the write-back ran (a non-reusable object, so once).
         auto writers = state->copiedWriters;
@@ -5350,7 +5350,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             writers->erase(std::remove(writers->begin(), writers->end(), kept), writers->end());
             kept->WriteBackBuffers();
             if (htileClear.has_value()) Graphics::CompleteHtileDepthClear(htileClear->first, htileClear->second);
-        });
+        }, {true, resources.GpuWrites(), true});
         // Listed after the registration: a throw there leaves nothing that would pin the CPU path forever.
         if (resources.HasCopiedWrites()) writers->push_back(kept);
     }

@@ -19,6 +19,8 @@ enum class RuntimeSwitch : std::size_t {
     FlushSkipSync,
     DepthViewMemo,
     FlushSkipSyncLabel,
+    FlushSkipSyncLabelShadow,
+    FlushSkipSyncLabelNarrow,
     Count,
 };
 

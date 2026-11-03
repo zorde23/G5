@@ -123,6 +123,30 @@ public:
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
     void KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest);
     void OnComplete(std::function<void()> action);
+    struct CompletionWrites {
+        bool known = false;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        bool hookable = false;
+    };
+    void OnComplete(std::function<void()> action, CompletionWrites writes);
+    std::uint64_t NewestCompletionMayWrite(std::uint64_t begin, std::uint64_t end, const std::function<bool(const CompletionWrites&)>& dirty) const;
+    struct CompletionAudit {
+        std::uint64_t completions = 0;
+        std::uint64_t outsideStores = 0;
+        std::uint64_t outsideBytes = 0;
+        std::uint64_t unknownStores = 0;
+        std::uint64_t gpuNotes = 0;
+    };
+    static CompletionAudit TakeCompletionAudit();
+    void Seal(std::uint64_t begin, std::uint64_t end, std::uint64_t serial);
+    std::size_t Seals() const { return seals.size(); }
+    static std::uint64_t SealViolations();
+    struct SealCost {
+        std::uint64_t checks = 0;
+        std::uint64_t ns = 0;
+    };
+    static SealCost SealCheckCost();
+    static void NoteSealFrame();
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
     void NotePendingWordFill(std::uint64_t address, std::size_t bytes, std::uint32_t word);
@@ -576,6 +600,8 @@ private:
         std::size_t keptBytes = 0;
         std::unordered_set<const void*> keptOwners;
         std::vector<std::function<void()>> completions;
+        std::vector<CompletionWrites> completionWrites;
+        std::vector<const void*> completionSites;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;
@@ -866,6 +892,13 @@ private:
     // Batches popped from inFlight whose completions have not run yet: their writes stay in the
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;
+    struct SealedSpan {
+        std::uint64_t begin;
+        std::uint64_t end;
+        std::uint64_t serial;
+    };
+    std::vector<SealedSpan> seals;
+    friend void CheckSealedStore(std::uint64_t address, std::size_t bytes);
     mutable std::shared_ptr<const WriteRanges> published;
     std::uint64_t submissions = 0;
     // The serial of the open batch when a use stored through addresses into it (NoteAddressStore).

@@ -1974,12 +1974,12 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
         recorder.OnComplete([resources, writers] {
             writers->erase(std::remove(writers->begin(), writers->end(), resources), writers->end());
             resources->WriteBackBuffers();
-        });
+        }, {true, resources->GpuWrites(), true});
         writers->push_back(resources);
         GuestMemory::BreakProofs();
     } else if (completion) {
-        if (resources->Reusable()) recorder.OnComplete([resources] { resources->CheckFaults(); });
-        else recorder.OnComplete([resources] { resources->WriteBackBuffers(); });
+        if (resources->Reusable()) recorder.OnComplete([resources] { resources->CheckFaults(); }, {true, {}, false});
+        else recorder.OnComplete([resources] { resources->WriteBackBuffers(); }, {true, resources->GpuWrites(), true});
     }
     std::vector<bool> storeNow(residents.size(), false);
     for (std::size_t index = 0; index < residents.size(); ++index) {
@@ -2187,7 +2187,7 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
             }
         }
         CaptureTrace::Log("input-result draw=%llu batch=%llu ranges=%zu mismatched=%zu", draw, batch, samples.size(), differences);
-    });
+    }, {true, {}, false});
 }
 
 bool WriteOnlyPasses() {

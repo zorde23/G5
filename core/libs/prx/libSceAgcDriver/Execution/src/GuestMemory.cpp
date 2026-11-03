@@ -2009,8 +2009,15 @@ static GuestAllocations::Lease::Ranges pinStoreRanges(std::uint64_t address, std
     return pinned;
 }
 
+std::atomic<CompletionStoreAudit> completionStoreAudit{nullptr};
+
+void SetCompletionStoreAudit(CompletionStoreAudit audit) {
+    completionStoreAudit.store(audit, std::memory_order_release);
+}
+
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
     if (bytes == 0) return 0;
+    if (const auto audit = completionStoreAudit.load(std::memory_order_acquire)) audit(address, bytes);
     const auto pinned = pinStoreRanges(address, bytes);
     BreakProofs();
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {

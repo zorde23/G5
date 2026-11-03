@@ -4275,6 +4275,76 @@ std::uint64_t StorageTexture::WriterWaitsSkipped() {
     return writerWaitsSkipped.load(std::memory_order_relaxed);
 }
 
+namespace {
+
+bool narrowLabelRule(FlushReader reader) {
+    return reader == FlushReader::Label && RuntimeSwitches::Set(RuntimeSwitch::FlushSkipSyncLabel) && RuntimeSwitches::Set(RuntimeSwitch::FlushSkipSyncLabelNarrow);
+}
+
+thread_local bool narrowCompletionFact = false;
+std::atomic<std::uint64_t> narrowConflictWaits{0};
+
+std::pair<std::uint64_t, std::uint64_t> Span64(std::span<const std::shared_ptr<StorageTexture>> images) {
+    constexpr std::uint64_t unit = 65536;
+    std::uint64_t begin = ~std::uint64_t{0}, end = 0;
+    for (const auto& image : images) {
+        begin = std::min(begin, image->Descriptor().baseAddress & ~(unit - 1));
+        end = std::max(end, (image->Descriptor().baseAddress + image->GuestBytes() + unit - 1) & ~(unit - 1));
+    }
+    return {begin, end};
+}
+
+std::uint64_t CompletionConflict(const Recorder& recorder, std::uint64_t begin, std::uint64_t end) {
+    const auto dirty = [](const Recorder::CompletionWrites& writes) {
+        return std::any_of(writes.ranges.begin(), writes.ranges.end(), [](const auto& range) {
+            const std::pair<std::uint64_t, std::uint64_t> one[1] = {range};
+            return StorageTexture::AnyPendingOverlaps(one) || AnyShadowedOverlaps(range.first, static_cast<std::size_t>(range.second - range.first));
+        });
+    };
+    auto conflict = recorder.NewestCompletionMayWrite(begin, end, dirty);
+    if (recorder.CompletionLabelIn(begin, static_cast<std::size_t>(end - begin))) conflict = std::max(conflict, recorder.OpenSerial());
+    return conflict;
+}
+
+}
+
+std::uint64_t StorageTexture::NarrowConflictWaits() {
+    return narrowConflictWaits.load(std::memory_order_relaxed);
+}
+
+namespace {
+
+struct LabelShadowCounts {
+    std::atomic<std::uint64_t> flushes{0}, globalBlocks{0}, narrowBlocks{0}, narrowWouldSkip{0}, narrowStricter{0}, conflictAfterWriter{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+LabelShadowCounts& LabelShadow() {
+    static LabelShadowCounts counts;
+    return counts;
+}
+
+}
+
+std::uint64_t StorageTexture::ShadowNarrowWouldSkip() {
+    return LabelShadow().narrowWouldSkip.load(std::memory_order_relaxed);
+}
+
+namespace {
+
+void ReportLabelShadow() {
+    auto& counts = LabelShadow();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counts.lastReport.load();
+    if (nowMs - last <= 10000 || !counts.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto audit = Recorder::TakeCompletionAudit();
+    std::fprintf(stderr, "[flush-skip-shadow] (10 s) %llu label readbacks with pending results: the completion fact blocks %llu, the narrow rule blocks %llu, narrow would skip where the completion fact blocks %llu, narrow blocks where it does not %llu, conflicting completion after the writer or with the writer retired %llu; completions audited %llu, stores outside the declared ranges %llu (%llu bytes), stores of undeclared completions %llu, GPU writes recorded inside completions %llu\n",
+        static_cast<unsigned long long>(counts.flushes.exchange(0)), static_cast<unsigned long long>(counts.globalBlocks.exchange(0)), static_cast<unsigned long long>(counts.narrowBlocks.exchange(0)), static_cast<unsigned long long>(counts.narrowWouldSkip.exchange(0)), static_cast<unsigned long long>(counts.narrowStricter.exchange(0)), static_cast<unsigned long long>(counts.conflictAfterWriter.exchange(0)),
+        static_cast<unsigned long long>(audit.completions), static_cast<unsigned long long>(audit.outsideStores), static_cast<unsigned long long>(audit.outsideBytes), static_cast<unsigned long long>(audit.unknownStores), static_cast<unsigned long long>(audit.gpuNotes));
+}
+
+}
+
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published, bool waited, FlushReader reader) {
     static_cast<void>(FlushDepthPlanes(address, bytes));
     if (published != nullptr) *published = false;
@@ -4367,6 +4437,39 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     }
     std::unique_lock gpu(GuestMemory::GpuMutex());
     if (!ownNotes.empty() && (flush.size() != 1 || std::any_of(flush.begin(), flush.end(), [](const std::shared_ptr<StorageTexture>& texture) { return ExistingHostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) == nullptr; }))) ownNotes.clear();
+    if (auto* recorder = Recorder::Active(); recorder != nullptr && reader == FlushReader::Label && !flush.empty() && !Recorder::InCompletion() && RuntimeSwitches::Set(RuntimeSwitch::FlushSkipSyncLabelShadow)) {
+        const auto [begin, end] = Span64(flush);
+        const auto writer = recorder->PendingWriterSerial(address, bytes, ownNotes);
+        const auto conflict = CompletionConflict(*recorder, begin, end);
+        const bool narrow = conflict != 0;
+        const bool global = writer != 0 && (Recorder::PendingWriteBackCompletions() != 0 || recorder->CompletionLabelIn(address, bytes));
+        auto& counts = LabelShadow();
+        counts.flushes.fetch_add(1, std::memory_order_relaxed);
+        if (global) counts.globalBlocks.fetch_add(1, std::memory_order_relaxed);
+        if (narrow) counts.narrowBlocks.fetch_add(1, std::memory_order_relaxed);
+        if (global && !narrow) counts.narrowWouldSkip.fetch_add(1, std::memory_order_relaxed);
+        if (narrow && !global) counts.narrowStricter.fetch_add(1, std::memory_order_relaxed);
+        if (conflict != 0 && (writer == 0 || conflict > writer)) counts.conflictAfterWriter.fetch_add(1, std::memory_order_relaxed);
+        ReportLabelShadow();
+    }
+    const bool narrow = narrowLabelRule(reader) && !flush.empty() && !Recorder::InCompletion();
+    std::pair<std::uint64_t, std::uint64_t> sealed{0, 0};
+    if (auto* recorder = Recorder::Active(); recorder != nullptr && narrow) {
+        Require(GuestMemory::GpuMutex().HeldByThisThread(), "a label readback decided its completion wait without the GPU lock");
+        Require(!AgcDriver::DriverDetail::DrawPipeline::Active() || AgcDriver::DriverDetail::DrawPipeline::Queue0().Outstanding() == 0, "a label readback decided its completion wait outside the committer while the committer had work queued");
+        sealed = Span64(flush);
+        const auto conflict = CompletionConflict(*recorder, sealed.first, sealed.second);
+        if (conflict != 0) {
+            const auto target = std::max(conflict, recorder->PendingWriterSerial(address, bytes, ownNotes));
+            if (target >= recorder->OpenSerial()) recorder->Submit();
+            recorder->FinishUpTo(std::min(target, recorder->OpenSerial() - 1));
+            narrowConflictWaits.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    struct NarrowFact {
+        bool previous;
+        ~NarrowFact() { narrowCompletionFact = previous; }
+    } narrowFact{std::exchange(narrowCompletionFact, narrow)};
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes, ownNotes) != 0) {
         try {
             recorder->Reap();
@@ -4385,6 +4488,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             }
             if (mode == WriterWait::Skip) {
                 if (reader == FlushReader::Label) labelSkippedWriter = std::max({labelSkippedWriter, writer, recorder->OpenSerial()});
+                if (narrow) recorder->Seal(sealed.first, sealed.second, recorder->OpenSerial());
                 writerWaitsSkipped.fetch_add(1, std::memory_order_relaxed);
                 reportWriterWaitSkips(false, reason);
             } else if (writer == recorder->OpenSerial()) {
@@ -4550,7 +4654,7 @@ void StorageTexture::commitStoredSave(const std::vector<std::uint32_t>& units) {
     }
     recorder->OnComplete([texture = weak_from_this(), bytes = savedBytes, ticket, units] {
         if (auto alive = texture.lock()) alive->applyStoredSave(ticket, units);
-    });
+    }, {true, {}, false});
 }
 
 void StorageTexture::applyStoredSave(std::uint64_t ticket, const std::vector<std::uint32_t>& units) {
@@ -6098,7 +6202,7 @@ WriterWaitFacts StorageTexture::writerWaitFacts(std::uint64_t address, std::size
         const auto to = std::min(blocks.lastStored, blocks.spanBegin + (index + 1) * block);
         facts.cpuBlockOnOpenWrite = from < to && (label ? recorder.PendingWriteOverlaps(from, static_cast<std::size_t>(to - from)) : recorder.OpenWriteOverlaps(from, static_cast<std::size_t>(to - from)));
     }
-    facts.completionOverlap = label && (Recorder::PendingWriteBackCompletions() != 0 || recorder.CompletionLabelIn(blocks.firstStored, span));
+    facts.completionOverlap = label && !narrowCompletionFact && (Recorder::PendingWriteBackCompletions() != 0 || recorder.CompletionLabelIn(blocks.firstStored, span));
     return facts;
 }
 
