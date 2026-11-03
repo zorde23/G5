@@ -6,6 +6,7 @@
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <initializer_list>
 #include <map>
 #include <optional>
@@ -1086,9 +1087,45 @@ std::uint32_t EmitUndefU1(SpirvEmitterState& state, const IrValue& inst) {
     return result;
 }
 
+namespace {
+
+std::uint32_t QuadPermute(SpirvEmitterState& state, std::uint32_t type, std::uint32_t value, std::uint32_t control) {
+    const auto quadLane = EmitBinaryU32(state, spv::OpBitwiseAnd, EmitSubgroupLocalInvocationId(state), ConstantU32(state, 3u));
+    const auto source = EmitBinaryU32(state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, ConstantU32(state, control), EmitBinaryU32(state, spv::OpShiftLeftLogical, quadLane, ConstantU32(state, 1u))), ConstantU32(state, 3u));
+    std::uint32_t result = 0;
+    for (std::uint32_t k = 0; k < 4u; ++k) {
+        const auto broadcast = state.module.AllocateId();
+        state.module.AddFunction(spv::OpGroupNonUniformQuadBroadcast, type, broadcast, ConstantU32(state, spv::ScopeSubgroup), value, ConstantU32(state, k));
+        if (k == 0u) {
+            result = broadcast;
+            continue;
+        }
+        const auto pick = Binary(state, spv::OpIEqual, TypeBool(state), source, ConstantU32(state, k));
+        result = Select(state, type, pick, broadcast, result);
+    }
+    return result;
+}
+
+bool TmpQuadDpp(const SpirvEmitterState& state, const DppMoveFlags& flags) {
+    static const bool enabled = std::getenv("APS5_TMP_DPP_QUAD_OPS") != nullptr;
+    if (!enabled || state.program.Resources().stage != IrShaderStage::Pixel || state.spannedWave || state.laneCount != 1u) return false;
+    if ((flags.control & DppMoveFlags::Lanes8) != 0u || flags.control >= 0x100u) return false;
+    return std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityGroupNonUniformQuad)) != state.supportedCapabilities.end();
+}
+
+}
+
 std::uint32_t EmitDppMoveU32(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     const auto flags = inst.Flags<DppMoveFlags>();
+    if (TmpQuadDpp(state, flags)) {
+        state.module.EmitCapability(spv::CapabilityGroupNonUniform);
+        state.module.EmitCapability(spv::CapabilityGroupNonUniformQuad);
+        const auto moved = QuadPermute(state, TypeU32(state), ctx.Arg(inst, 0), flags.control);
+        if (flags.fetchInactive) return moved;
+        const auto sourceActive = QuadPermute(state, TypeBool(state), ctx.Arg(inst, 1), flags.control);
+        return EmitNative<spv::OpSelect, IrType::U32>(state, sourceActive, moved, ConstantU32(state, 0u));
+    }
     const auto target = EmitDppTargetLane(state, flags.control);
     const auto shuffled = ctx.ShuffleInHalf(inst, 0, target.lane);
     if (flags.fetchInactive) {
