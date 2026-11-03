@@ -4453,14 +4453,15 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         ReportLabelShadow();
     }
     bool narrow = narrowLabelRule(reader) && !flush.empty() && !Recorder::InCompletion();
-    if (narrow && !Recorder::OnCommitter()) {
+    const bool onCommitter = Recorder::OnCommitter();
+    if (narrow && !onCommitter) {
         narrow = false;
         Recorder::RejectCommitter();
     }
     std::pair<std::uint64_t, std::uint64_t> sealed{0, 0};
     if (auto* recorder = Recorder::Active(); recorder != nullptr && narrow) {
         Require(GuestMemory::GpuMutex().HeldByThisThread(), "a label readback decided its completion wait without the GPU lock");
-        Require(Recorder::OnCommitter(), "a label readback decided its completion wait off the committer");
+        Require(onCommitter, "a label readback decided its completion wait off the committer");
         sealed = Span64(flush);
         const auto conflict = CompletionConflict(*recorder, sealed.first, sealed.second);
         if (conflict != 0) {
