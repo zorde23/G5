@@ -1044,15 +1044,27 @@ void NarrowThrowingCompletions(AgcDriver::VulkanDevice& device) {
                 throw std::runtime_error("deliberate failure of a conflicting completion");
             }, Declared(image, image + 4u));
         };
+        GuestBlock labels;
+        const std::uint32_t value = 0x1abe6u;
+        hooks.beforeSubmit = [&](Recorder& recorder, std::uint64_t, std::uint64_t image) {
+            recorder.OnComplete([&ran] {
+                ran = true;
+                throw std::runtime_error("deliberate failure of a conflicting completion");
+            }, Declared(image, image + 4u));
+            recorder.AfterCompletions(labels.Address(), std::as_bytes(std::span(&value, 1)), 5, 0, false);
+        };
         SetNarrow(true);
         RunCase(device, guest, 0, 0, false, Expect::Wait, what, ran, hooks);
         SetNarrow(false);
+        Require(labels.Words()[0] != value, what + "the batch's label landed as a success after its completion failed");
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
         Require(ActiveRecorder().Seals() == 0, what + "a seal outlived the batches");
     }
     {
         const std::string what = "storage flush skip narrow, sealing batch whose completion throws: ";
         GuestBlock guest;
+        GuestBlock labels;
+        const std::uint32_t value = 0x1abe7u;
         SetNarrow(true);
         SubmissionGate gate(device);
         const auto image = guest.Address();
@@ -1064,19 +1076,104 @@ void NarrowThrowingCompletions(AgcDriver::VulkanDevice& device) {
             auto& recorder = ActiveRecorder();
             Require(recorder.Seals() == 1, what + "the skip left no seal");
             recorder.OnComplete([] { throw std::runtime_error("deliberate failure of the sealing batch's completion"); }, {true, {}, false});
+            recorder.AfterCompletions(labels.Address(), std::as_bytes(std::span(&value, 1)), 6, 0, false);
         }
         gate.Finish();
         SyncAll();
         SetNarrow(false);
+        Require(labels.Words()[0] != value, what + "the sealing batch's label landed as a success after its completion failed");
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
         Require(ActiveRecorder().Seals() == 0, what + "the seal outlived its batch");
     }
+}
+
+void NarrowSealSurvivesNestedRetirement(const GuestBlock& guest, const GuestBlock& labels) {
+    const std::string what = "storage flush skip narrow, seal across a nested retirement of its batch: ";
+    const auto base = guest.Address();
+    const auto violations = Recorder::SealViolations();
+    const std::uint32_t value = 0x1abe8u;
+    SetNarrow(true);
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto& recorder = ActiveRecorder();
+        recorder.Commands();
+        const auto sealing = recorder.OpenSerial() + 1;
+        recorder.OnComplete([&recorder, sealing, base] {
+            recorder.FinishUpTo(sealing);
+            Require(recorder.Seals() == 1, "the seal was dropped while an older batch's completion still runs");
+            const std::uint32_t stale = Stale;
+            AgcDriver::GuestMemory::StoreOwnBytes(base + 0x100u, std::as_bytes(std::span(&stale, 1)));
+        }, Declared(base + 0x100u, base + 0x104u));
+        recorder.AfterCompletions(labels.Address(), std::as_bytes(std::span(&value, 1)), 7, 0, false);
+        recorder.Submit();
+        recorder.Commands();
+        recorder.Seal(base, base + UnitBytes, recorder.OpenSerial());
+        recorder.OnComplete(StoreWord(base + 0x200u, Stale), Declared(base + 0x200u, base + 0x204u));
+        recorder.Submit();
+        recorder.Sync();
+        Require(recorder.Seals() == 0, what + "the seal outlived the older batch");
+    }
+    SetNarrow(false);
+    Require(Recorder::SealViolations() == violations + 1, what + "the older completion stored into the sealed span after the nested retirement unnoticed");
+    Require(guest.Words()[0x100u / 4u] == Initial, what + "the older completion's store into the sealed span landed");
+    Require(guest.Words()[0x200u / 4u] == Stale, what + "the sealing batch's own completion could not store");
+    Require(labels.Words()[0] != value, what + "the older batch's label landed as a success after its seal violation");
+}
+
+void NarrowAuditUnionOfRanges(const GuestBlock& guest) {
+    const std::string what = "storage flush skip narrow, auditor over overlapping declarations: ";
+    const auto base = guest.Address();
+    RuntimeSwitches::Assign(RuntimeSwitch::FlushSkipSyncLabelShadow, true);
+    static_cast<void>(Recorder::TakeCompletionAudit());
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto& recorder = ActiveRecorder();
+        recorder.Commands();
+        recorder.OnComplete([base] {
+            const std::array<std::uint32_t, 3> words{Stale, Stale, Stale};
+            AgcDriver::GuestMemory::StoreOwnBytes(base + 0x400u, std::as_bytes(std::span(words)));
+        }, {true, {{base + 0x404u, base + 0x40cu}, {base + 0x400u, base + 0x408u}}, true});
+        recorder.OnComplete([base] {
+            const std::array<std::uint32_t, 3> words{Stale, Stale, Stale};
+            AgcDriver::GuestMemory::StoreOwnBytes(base + 0x500u, std::as_bytes(std::span(words)));
+        }, {true, {{base + 0x500u, base + 0x504u}, {base + 0x508u, base + 0x50cu}}, true});
+        recorder.Sync();
+    }
+    const auto audit = Recorder::TakeCompletionAudit();
+    RuntimeSwitches::Assign(RuntimeSwitch::FlushSkipSyncLabelShadow, false);
+    Require(audit.outsideStores == 1, what + "a store covered by the union of overlapping ranges was counted, or one across a gap was not");
+}
+
+void NarrowRejectsOffCommitter(AgcDriver::VulkanDevice& device) {
+    const std::string what = "storage flush skip narrow, decision off the committer: ";
+    std::thread([] { Recorder::BindCommitter(); }).join();
+    const auto rejections = Recorder::CommitterRejections();
+    std::atomic<bool> ran{false};
+    Hooks hooks;
+    hooks.beforeSubmit = [&](Recorder& recorder, std::uint64_t base, std::uint64_t) { recorder.OnComplete(StoreWord(base + 3u * UnitBytes, Stale, &ran), Declared(base + 3u * UnitBytes, base + 3u * UnitBytes + 4u)); };
+    GuestBlock guest;
+    SetNarrow(true);
+    try {
+        RunCase(device, guest, 0, 0, false, Expect::Wait, what, ran, hooks);
+    } catch (...) {
+        Recorder::BindCommitter();
+        Recorder::UnbindCommitter();
+        SetNarrow(false);
+        throw;
+    }
+    Recorder::BindCommitter();
+    Recorder::UnbindCommitter();
+    SetNarrow(false);
+    Require(Recorder::CommitterRejections() > rejections, what + "the decision off the committer was not rejected");
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Require(ActiveRecorder().Seals() == 0, what + "a decision off the committer left a seal");
 }
 
 void NarrowTests(AgcDriver::VulkanDevice& device) {
     {
         GuestBlock audit;
         NarrowAuditCountsOutsideStores(audit);
+        NarrowAuditUnionOfRanges(audit);
     }
     NarrowHtileSplitWaits(device);
     NarrowSharedUnitWaits(device);
@@ -1100,6 +1197,12 @@ void NarrowTests(AgcDriver::VulkanDevice& device) {
     NarrowLabelBehindCompletions(device);
     NarrowTwoLabelsSameSpan(device);
     NarrowThrowingCompletions(device);
+    {
+        GuestBlock seal;
+        GuestBlock labels;
+        NarrowSealSurvivesNestedRetirement(seal, labels);
+    }
+    NarrowRejectsOffCommitter(device);
 }
 
 }
