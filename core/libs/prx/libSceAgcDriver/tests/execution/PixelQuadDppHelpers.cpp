@@ -114,11 +114,6 @@ int main() {
         std::printf("switch %s: %u QuadBroadcast, %u Shuffle, %u Ballot in the pixel shader\n", switched ? "on" : "off", counts[0], counts[1], counts[2]);
         if (switched) Require(counts[0] != 0u && counts[1] == 0u, "pixel quad DPP: the switched quad_perm did not become QuadBroadcast");
         else Require(counts[0] == 0u && counts[1] != 0u, "pixel quad DPP: the quad_perm used QuadBroadcast without the switch");
-        if (!switched) {
-            std::puts("texels: skipped with the switch off, helper lanes in a Shuffle are undefined there");
-            std::puts("pixel quad DPP helper tests passed");
-            return 0;
-        }
 
         AgcDriver::Graphics::State state{};
         state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, 64u, 64u, std::nullopt, std::nullopt};
@@ -148,13 +143,18 @@ int main() {
                 const auto qx = x & ~1u, qy = y & ~1u;
                 const bool full = Covered(qx, qy) && Covered(qx + 1u, qy) && Covered(qx, qy + 1u) && Covered(qx + 1u, qy + 1u);
                 const auto value = Pixels[(y * Width + x) * 4u];
-                const bool wrong = std::fabs(value - Step) > 1e-4f;
+                const bool wrong = !std::isfinite(value) || std::fabs(value - Step) > 1e-4f;
                 (full ? interior : edge) += 1u;
                 (full ? wrongInterior : wrongEdge) += wrong ? 1u : 0u;
                 if (wrong && first.empty()) first = "(" + std::to_string(x) + ", " + std::to_string(y) + ") " + (full ? "interior" : "edge") + " holds " + std::to_string(value);
             }
         }
         std::printf("switch %s: %u edge pixels (%u wrong), %u interior pixels (%u wrong), expected %f\n", switched ? "on" : "off", edge, wrongEdge, interior, wrongInterior, Step);
+        if (!switched) {
+            std::puts("texels: diagnostic only with the switch off, helper lanes in a Shuffle are undefined there");
+            std::puts("pixel quad DPP helper tests passed");
+            return 0;
+        }
         Require(edge > 200u && interior > 50u, "pixel quad DPP: the triangles covered too few edge or interior quads");
         Require(wrongEdge == 0u && wrongInterior == 0u, "pixel quad DPP: a quad_perm neighbour read in WQM is wrong at " + first);
         std::puts("pixel quad DPP helper tests passed");

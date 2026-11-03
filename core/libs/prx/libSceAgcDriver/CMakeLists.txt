@@ -2773,6 +2773,7 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_stage_local_uint_storage_switched PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    set_property(TEST agc_driver_pixel_quad_dpp_helpers APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_TMP_DPP_QUAD_OPS=unset:")
     add_test(NAME agc_driver_pixel_quad_dpp_helpers_switched COMMAND agc_driver_pixel_quad_dpp_helpers_tests)
     set_tests_properties(agc_driver_pixel_quad_dpp_helpers_switched PROPERTIES
         ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TMP_DPP_QUAD_OPS=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
