@@ -1677,7 +1677,7 @@ TargetMemoKey targetMemoKey(const Context& context, const ColorTarget& color) {
     auto* recorder = Recorder::Active();
     TargetMemoKey key;
     key.words = {color.address, (std::uint64_t{color.extent.width} << 32) | color.extent.height, static_cast<std::uint64_t>(color.format), static_cast<std::uint64_t>(color.tileMode) | (std::uint64_t{color.elementBytes} << 32), color.dccAddress, color.cmaskAddress | (color.cmaskFastClear ? 1ull << 63 : 0), color.surfaceAddress, (std::uint64_t{color.surfaceExtent.width} << 32) | color.surfaceExtent.height, (std::uint64_t{color.mipCount} << 32) | color.mip, color.arrayAddress, (std::uint64_t{color.arraySlice} << 32) | color.layers, (std::uint64_t{color.arrayLastSlice} << 32) | color.depthSlice, (std::uint64_t{color.samples} << 32) | color.pipeBankXor, (std::uint64_t{color.clearWords[0]} << 32) | color.clearWords[1], color.fmaskAddress, (std::uint64_t{color.partialWriteMask} << 8) | color.componentMapping,
-        GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), recorder != nullptr ? recorder->Submissions() : 0, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), reinterpret_cast<std::uint64_t>(context.device)};
+        GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), recorder != nullptr ? recorder->Submissions() : 0, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), reinterpret_cast<std::uint64_t>(context.device), color.chainDccAddress, (std::uint64_t{color.depth} << 32) | color.dccControl, (color.dccAlphaOnMsb ? 1u : 0u) | (color.dccPipeAligned ? 2u : 0u) | (color.uintExport ? 4u : 0u) | (std::uint64_t{color.exportIndex} << 32), (std::uint64_t{color.coverageSamples} << 32) | color.fmaskPipeBankXor, color.bytes};
     return key;
 }
 
@@ -2899,20 +2899,22 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
             if (TargetMemoEnabled()) {
+                if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
                 const auto memoKey = targetMemoKey(context, color);
                 TargetMemo<StorageTexture>::Entry* entry = nullptr;
-                const auto found = targetMemo().Find(color.address, memoKey, entry);
+                auto found = memoKey.words[16] != 0 ? targetMemo().Find(color.address, memoKey, entry) : TargetMemo<StorageTexture>::Lookup::Miss;
+                auto remembered = entry != nullptr ? entry->resident.lock() : nullptr;
+                if (remembered == nullptr || !remembered->Cached()) found = TargetMemo<StorageTexture>::Lookup::Miss;
                 if (found == TargetMemo<StorageTexture>::Lookup::Hit) {
-                    if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
                     timer.phase(PhaseReadTarget);
-                    binding.resident = entry->resident;
+                    binding.resident = std::move(remembered);
                     binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
                     targetViews.push_back(entry->view);
                     targetMemoCounts().hits.fetch_add(1, std::memory_order_relaxed);
                     continue;
                 }
                 if (found == TargetMemo<StorageTexture>::Lookup::Verify) {
-                    memoResident = entry->resident;
+                    memoResident = std::move(remembered);
                     memoView = entry->view;
                     memoVerify = true;
                 }

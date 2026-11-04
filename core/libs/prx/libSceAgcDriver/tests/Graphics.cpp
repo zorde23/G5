@@ -7824,17 +7824,23 @@ void targetMemoTests() {
     Require(memo.Find(0x1000, key(0x1000, 1), entry) == TargetMemo<int>::Lookup::Miss && entry == nullptr, "an empty target memo answered");
     auto first = std::make_shared<int>(1);
     memo.Store(key(0x1000, 1), first, view(0x10));
-    Require(memo.Find(0x1000, key(0x1000, 1), entry) == TargetMemo<int>::Lookup::Hit && entry != nullptr && entry->resident == first && entry->view == view(0x10), "a target memo with an equal key missed");
+    Require(memo.Find(0x1000, key(0x1000, 1), entry) == TargetMemo<int>::Lookup::Hit && entry != nullptr && entry->resident.lock() == first && entry->view == view(0x10), "a target memo with an equal key missed");
     Require(memo.Find(0x1000, key(0x1000, 2), entry) == TargetMemo<int>::Lookup::Miss, "a target memo answered after a counter moved");
     Require(memo.Find(0x2000, key(0x2000, 1), entry) == TargetMemo<int>::Lookup::Miss && entry == nullptr, "a target memo answered for another address");
     auto second = std::make_shared<int>(2);
     memo.Store(key(0x1000, 2), second, view(0x20));
-    Require(memo.Find(0x1000, key(0x1000, 2), entry) == TargetMemo<int>::Lookup::Hit && entry->resident == second && entry->view == view(0x20), "a stored lookup did not replace the target's entry");
+    Require(memo.Find(0x1000, key(0x1000, 2), entry) == TargetMemo<int>::Lookup::Hit && entry->resident.lock() == second && entry->view == view(0x20), "a stored lookup did not replace the target's entry");
     memo.Forget(0x1000);
     Require(memo.Find(0x1000, key(0x1000, 2), entry) == TargetMemo<int>::Lookup::Miss, "a forgotten target still answered");
-    for (std::uint64_t index = 0; index < 20; ++index) memo.Store(key(0x10000 + index * 0x1000, 1), std::make_shared<int>(static_cast<int>(index)), view(0x100 + index));
+    std::vector<std::shared_ptr<int>> held;
+    for (std::uint64_t index = 0; index < 20; ++index) {
+        held.push_back(std::make_shared<int>(static_cast<int>(index)));
+        memo.Store(key(0x10000 + index * 0x1000, 1), held.back(), view(0x100 + index));
+    }
     Require(memo.Find(0x10000, key(0x10000, 1), entry) == TargetMemo<int>::Lookup::Miss, "the oldest of more targets than the memo holds still answered");
-    Require(memo.Find(0x10000 + 19 * 0x1000, key(0x10000 + 19 * 0x1000, 1), entry) == TargetMemo<int>::Lookup::Hit && *entry->resident == 19, "the newest target missed");
+    Require(memo.Find(0x10000 + 19 * 0x1000, key(0x10000 + 19 * 0x1000, 1), entry) == TargetMemo<int>::Lookup::Hit && *entry->resident.lock() == 19, "the newest target missed");
+    held.back().reset();
+    Require(memo.Find(0x10000 + 19 * 0x1000, key(0x10000 + 19 * 0x1000, 1), entry) == TargetMemo<int>::Lookup::Miss, "a target memo answered for a released resident");
     TargetMemo<int> verified(4);
     verified.Store(key(0x3000, 1), first, view(0x30));
     int verifies = 0;
@@ -7845,7 +7851,7 @@ void targetMemoTests() {
     }
     Require(verifies == 3, "a target memo verifying every fourth hit verified " + std::to_string(verifies) + " of 12");
     memo.Clear();
-    Require(memo.Find(0x10000 + 19 * 0x1000, key(0x10000 + 19 * 0x1000, 1), entry) == TargetMemo<int>::Lookup::Miss, "a cleared target memo answered");
+    Require(memo.Find(0x10000 + 18 * 0x1000, key(0x10000 + 18 * 0x1000, 1), entry) == TargetMemo<int>::Lookup::Miss, "a cleared target memo answered");
 }
 
 void recordedDrawStateTests() {

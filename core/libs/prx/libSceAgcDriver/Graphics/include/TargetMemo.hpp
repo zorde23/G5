@@ -10,7 +10,7 @@
 namespace AgcDriver::Graphics {
 
 struct TargetMemoKey {
-    std::array<std::uint64_t, 22> words{};
+    std::array<std::uint64_t, 27> words{};
     bool operator==(const TargetMemoKey&) const = default;
 };
 
@@ -19,7 +19,7 @@ class TargetMemo {
 public:
     struct Entry {
         TargetMemoKey key;
-        std::shared_ptr<Resident> resident;
+        std::weak_ptr<Resident> resident;
         VkImageView view = VK_NULL_HANDLE;
     };
 
@@ -30,19 +30,19 @@ public:
     Lookup Find(std::uint64_t address, const TargetMemoKey& key, Entry*& found) {
         found = nullptr;
         for (auto& entry : entries) {
-            if (entry.resident != nullptr && entry.key.words[0] == address) found = &entry;
+            if (!entry.resident.expired() && entry.key.words[0] == address) found = &entry;
         }
         if (found == nullptr || !(found->key == key)) return Lookup::Miss;
         return verifyEvery != 0 && ++hits % verifyEvery == 0 ? Lookup::Verify : Lookup::Hit;
     }
 
-    void Store(const TargetMemoKey& key, std::shared_ptr<Resident> resident, VkImageView view) {
+    void Store(const TargetMemoKey& key, const std::shared_ptr<Resident>& resident, VkImageView view) {
         Entry* slot = nullptr;
         for (auto& entry : entries) {
-            if (entry.resident != nullptr && entry.key.words[0] == key.words[0]) slot = &entry;
+            if (!entry.resident.expired() && entry.key.words[0] == key.words[0]) slot = &entry;
         }
         if (slot == nullptr) slot = &entries[next++ % entries.size()];
-        *slot = {key, std::move(resident), view};
+        *slot = {key, resident, view};
     }
 
     void Forget(std::uint64_t address) {
