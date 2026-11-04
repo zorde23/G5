@@ -3,6 +3,7 @@
 #include "GraphicsTests.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TargetMemo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
@@ -7809,6 +7810,44 @@ PFN_vkVoidFunction VKAPI_CALL recordedStateProc(VkDevice device, const char* nam
     return it != table.end() ? it->second : sampleLocationProc(device, name);
 }
 
+void targetMemoTests() {
+    using namespace AgcDriver::Graphics;
+    const auto key = [](std::uint64_t address, std::uint64_t epoch) {
+        TargetMemoKey made;
+        made.words[0] = address;
+        made.words[16] = epoch;
+        return made;
+    };
+    const auto view = [](std::uintptr_t value) { return reinterpret_cast<VkImageView>(value); };
+    TargetMemo<int> memo;
+    TargetMemo<int>::Entry* entry = nullptr;
+    Require(memo.Find(0x1000, key(0x1000, 1), entry) == TargetMemo<int>::Lookup::Miss && entry == nullptr, "an empty target memo answered");
+    auto first = std::make_shared<int>(1);
+    memo.Store(key(0x1000, 1), first, view(0x10));
+    Require(memo.Find(0x1000, key(0x1000, 1), entry) == TargetMemo<int>::Lookup::Hit && entry != nullptr && entry->resident == first && entry->view == view(0x10), "a target memo with an equal key missed");
+    Require(memo.Find(0x1000, key(0x1000, 2), entry) == TargetMemo<int>::Lookup::Miss, "a target memo answered after a counter moved");
+    Require(memo.Find(0x2000, key(0x2000, 1), entry) == TargetMemo<int>::Lookup::Miss && entry == nullptr, "a target memo answered for another address");
+    auto second = std::make_shared<int>(2);
+    memo.Store(key(0x1000, 2), second, view(0x20));
+    Require(memo.Find(0x1000, key(0x1000, 2), entry) == TargetMemo<int>::Lookup::Hit && entry->resident == second && entry->view == view(0x20), "a stored lookup did not replace the target's entry");
+    memo.Forget(0x1000);
+    Require(memo.Find(0x1000, key(0x1000, 2), entry) == TargetMemo<int>::Lookup::Miss, "a forgotten target still answered");
+    for (std::uint64_t index = 0; index < 20; ++index) memo.Store(key(0x10000 + index * 0x1000, 1), std::make_shared<int>(static_cast<int>(index)), view(0x100 + index));
+    Require(memo.Find(0x10000, key(0x10000, 1), entry) == TargetMemo<int>::Lookup::Miss, "the oldest of more targets than the memo holds still answered");
+    Require(memo.Find(0x10000 + 19 * 0x1000, key(0x10000 + 19 * 0x1000, 1), entry) == TargetMemo<int>::Lookup::Hit && *entry->resident == 19, "the newest target missed");
+    TargetMemo<int> verified(4);
+    verified.Store(key(0x3000, 1), first, view(0x30));
+    int verifies = 0;
+    for (int round = 0; round < 12; ++round) {
+        const auto found = verified.Find(0x3000, key(0x3000, 1), entry);
+        Require(found != TargetMemo<int>::Lookup::Miss, "a verified target memo missed with an equal key");
+        if (found == TargetMemo<int>::Lookup::Verify) ++verifies;
+    }
+    Require(verifies == 3, "a target memo verifying every fourth hit verified " + std::to_string(verifies) + " of 12");
+    memo.Clear();
+    Require(memo.Find(0x10000 + 19 * 0x1000, key(0x10000 + 19 * 0x1000, 1), entry) == TargetMemo<int>::Lookup::Miss, "a cleared target memo answered");
+}
+
 void recordedDrawStateTests() {
     using namespace AgcDriver::Graphics;
     const bool filter = RecordStateFilter();
@@ -12803,6 +12842,11 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--buffer-budget-placement") {
             bufferBudgetPlacementTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--target-memo") {
+            targetMemoTests();
+            std::cout << "Target memo checks passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--recorded-draw-state") {

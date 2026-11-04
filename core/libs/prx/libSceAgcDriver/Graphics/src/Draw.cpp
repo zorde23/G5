@@ -20,6 +20,7 @@
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TargetMemo.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #include "ThreadOwned.hpp"
@@ -1656,6 +1657,54 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 // over the target's pages, the DCC key scan of TextureClearKeys, then UnchangedSince), with the
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
 // the stored object instead.
+bool TargetMemoEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_TARGET_MEMO");
+        return value != nullptr && value[0] != ' ' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+std::uint64_t TargetMemoVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* value = std::getenv("APS5_TARGET_MEMO_VERIFY");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+TargetMemoKey targetMemoKey(const Context& context, const ColorTarget& color) {
+    auto* recorder = Recorder::Active();
+    TargetMemoKey key;
+    key.words = {color.address, (std::uint64_t{color.extent.width} << 32) | color.extent.height, static_cast<std::uint64_t>(color.format), static_cast<std::uint64_t>(color.tileMode) | (std::uint64_t{color.elementBytes} << 32), color.dccAddress, color.cmaskAddress | (color.cmaskFastClear ? 1ull << 63 : 0), color.surfaceAddress, (std::uint64_t{color.surfaceExtent.width} << 32) | color.surfaceExtent.height, (std::uint64_t{color.mipCount} << 32) | color.mip, color.arrayAddress, (std::uint64_t{color.arraySlice} << 32) | color.layers, (std::uint64_t{color.arrayLastSlice} << 32) | color.depthSlice, (std::uint64_t{color.samples} << 32) | color.pipeBankXor, (std::uint64_t{color.clearWords[0]} << 32) | color.clearWords[1], color.fmaskAddress, (std::uint64_t{color.partialWriteMask} << 8) | color.componentMapping,
+        GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), recorder != nullptr ? recorder->Submissions() : 0, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), reinterpret_cast<std::uint64_t>(context.device)};
+    return key;
+}
+
+struct TargetMemoCounts {
+    std::atomic<std::uint64_t> hits{0}, verified{0}, diverged{0};
+};
+
+TargetMemoCounts& targetMemoCounts() {
+    static TargetMemoCounts counts;
+    return counts;
+}
+
+TargetMemo<StorageTexture>& targetMemo() {
+    thread_local TargetMemo<StorageTexture> memo(TargetMemoVerifyEvery());
+    return memo;
+}
+
+void noteTargetMemoVerify(std::uint64_t address, bool same) {
+    auto& counts = targetMemoCounts();
+    const auto verified = counts.verified.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!same) {
+        const auto diverged = counts.diverged.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (diverged <= 16) std::fprintf(stderr, "[target-memo] color target 0x%llx: the memo's resident or view differs from a full lookup\n", static_cast<unsigned long long>(address));
+    }
+    if (verified % 10000 == 0) std::fprintf(stderr, "[target-memo] %llu hits, %llu verified, %llu diverged\n", static_cast<unsigned long long>(counts.hits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(verified), static_cast<unsigned long long>(counts.diverged.load(std::memory_order_relaxed)));
+}
+
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
@@ -2839,6 +2888,9 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
         static const bool residentLinear = std::getenv("APS5_NO_RESIDENT_LINEAR") == nullptr;
         const bool linearResident = residentLinear && residentTargets && context.detiler != nullptr && color.tileMode == ColorTileMode::Linear && (ExistingHostImportFor(context, color.address, colorLayout.Bytes()) != nullptr || (GuestMemory::Watched(color.address, colorLayout.Bytes()) && HostImportFor(context, color.address, colorLayout.Bytes(), ImportRequester::ColorTarget) != nullptr));
+        std::shared_ptr<StorageTexture> memoResident;
+        VkImageView memoView = VK_NULL_HANDLE;
+        bool memoVerify = false;
         if ((binding.gpuTiling || ((color.tileMode != ColorTileMode::Linear || linearResident) && context.detiler != nullptr)) && residentTargets) {
             // The lookup refreshes the image on every draw (StorageTexture::Refresh: FlushPending,
             // CollectWrites over the target's pages, the DCC key scan of TextureClearKeys, then
@@ -2846,6 +2898,25 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             // (GuestMemory::BumpCollectEpoch: ordering points of the queue, or every packet under
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
+            if (TargetMemoEnabled()) {
+                const auto memoKey = targetMemoKey(context, color);
+                TargetMemo<StorageTexture>::Entry* entry = nullptr;
+                const auto found = targetMemo().Find(color.address, memoKey, entry);
+                if (found == TargetMemo<StorageTexture>::Lookup::Hit) {
+                    if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
+                    timer.phase(PhaseReadTarget);
+                    binding.resident = entry->resident;
+                    binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
+                    targetViews.push_back(entry->view);
+                    targetMemoCounts().hits.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                if (found == TargetMemo<StorageTexture>::Lookup::Verify) {
+                    memoResident = entry->resident;
+                    memoView = entry->view;
+                    memoVerify = true;
+                }
+            }
             binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
                 if (color.arrayLastSlice != 0) {
                     Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
@@ -2875,8 +2946,13 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             timer.phase(PhaseReadTarget);
             binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
             targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice));
+            if (TargetMemoEnabled()) {
+                if (memoVerify) noteTargetMemoVerify(color.address, memoResident == binding.resident && memoView == targetViews.back());
+                targetMemo().Store(targetMemoKey(context, color), binding.resident, targetViews.back());
+            }
             continue;
         }
+        if (TargetMemoEnabled()) targetMemo().Forget(color.address);
         materializeCmaskClear(context, color, nullptr);
         Require(!color.mipTail || binding.gpuTiling, "rendering into a packed mip tail requires the GPU tiled fallback");
         Require(color.depth == 1, "rendering into a 3D color target needs the resident image of its surface");
