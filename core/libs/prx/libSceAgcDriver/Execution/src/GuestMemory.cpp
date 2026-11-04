@@ -2668,6 +2668,7 @@ unsigned long long CodeOffset(const void* address) {
 namespace {
 std::atomic<void (*)(std::uint64_t, std::size_t)> flushHook{nullptr};
 std::atomic<void (*)(std::uint64_t, std::size_t)> readGuard{nullptr};
+std::atomic<void (*)(std::uint64_t, std::size_t, std::vector<std::pair<std::uint64_t, std::uint64_t>>&)> hostOnlyQuery{nullptr};
 
 void PrepareHostRead(std::uintptr_t address, std::size_t bytes) {
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, bytes);
@@ -2687,6 +2688,31 @@ void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes)) {
 
 void GuardRead(std::uint64_t address, std::size_t bytes) {
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, bytes);
+}
+
+void SetHostOnlyQuery(void (*query)(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans)) {
+    hostOnlyQuery.store(query, std::memory_order_release);
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> HostOnlySpans(std::uint64_t address, std::size_t bytes) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> found;
+    const auto query = hostOnlyQuery.load(std::memory_order_acquire);
+    if (query == nullptr || bytes == 0) return found;
+    query(address, bytes, found);
+    const auto end = address + bytes;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    for (auto [begin, last] : found) {
+        begin = std::max(begin, address);
+        last = std::min(last, end);
+        if (begin < last) spans.emplace_back(begin, last);
+    }
+    std::sort(spans.begin(), spans.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    for (const auto& span : spans) {
+        if (!merged.empty() && span.first <= merged.back().second) merged.back().second = std::max(merged.back().second, span.second);
+        else merged.push_back(span);
+    }
+    return merged;
 }
 
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {

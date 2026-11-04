@@ -9097,6 +9097,113 @@ void dataRefreshTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
+bool storageUnderHostOnlyTargetTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    const auto& base = device.GetContext();
+    constexpr std::size_t unit = 65536;
+    if ((base.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) == 0 || !device.NullDescriptors() || !WriteWatched()) {
+        std::cout << "4x color targets, nullDescriptor or write watching unavailable: idle store under a host-only target not tested\n";
+        return false;
+    }
+    void* block = AllocateWatched(unit, unit);
+    Require(block != nullptr, "no watched block although write watching is on");
+    std::memset(block, 0x5a, unit);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, unit, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            ClearMultisampleTargets(context.device);
+            ClearCachedTextures(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            ReleaseWatched(block, unit);
+        }
+    } unregister{base, block};
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    context.nullDescriptors = true;
+    TextureCache cache(context);
+    context.textureCache = &cache;
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.width = 128;
+    resource.height = 128;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kR64KBX;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    Require(DescribeSurface(resource).guestBytes == unit, "unexpected storage surface size");
+    const auto settle = [&] {
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    };
+    context.hostImportAlignment = 0;
+    auto image = StorageTexture::Create(context, detiler, resource, 0);
+    Require(Watched(address, unit), "the storage image's memory left the write watch without a host import");
+    {
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        const VkClearColorValue red{{1.0f, 0.0f, 0.0f, 1.0f}};
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &red, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        image->MarkDirty();
+        image->MarkWholeWritten();
+    }
+    settle();
+    Require(StorageTexture::FindPending(address, unit) == image, "the storage image's results are not pending");
+    ColorTarget target{};
+    target.address = address;
+    target.surfaceAddress = address;
+    target.extent = {64, 64};
+    target.surfaceExtent = target.extent;
+    target.format = VK_FORMAT_R8G8B8A8_UNORM;
+    target.bytes = unit / 4u;
+    target.samples = 4;
+    {
+        std::lock_guard gpu(GpuMutex());
+        Require(MultisampleTargetView(context, target) != VK_NULL_HANDLE, "the multisampled target has no view");
+        settle();
+    }
+    if (StorageTexture::FindPending(address, unit) != image) {
+        std::cout << "the multisampled target stored the pending image first: idle store under a host-only target not tested\n";
+        return false;
+    }
+    std::array<std::byte, 64> texels{};
+    std::string refusal;
+    try {
+        Read(address + 256u, texels);
+    } catch (const std::exception& error) {
+        refusal = error.what();
+    }
+    Require(refusal.find("whose samples are only on the host") != std::string::npos, "the multisampled target over the pending image is not host-only: " + refusal);
+    std::string failure;
+    try {
+        StorageTexture::FlushAllPending("idle");
+    } catch (const std::exception& error) {
+        failure = error.what();
+    }
+    settle();
+    Require(failure.empty(), "the idle store of a storage image under a host-only multisampled target failed: " + failure);
+    Require(StorageTexture::FindPending(address, unit) == nullptr, "the storage image under a host-only multisampled target is still pending after the idle store");
+    std::cout << "idle store of a storage image under a host-only multisampled target verified\n";
+    return true;
+}
+
 void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if ((base.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) == 0 || !device.NullDescriptors()) {
@@ -12224,6 +12331,7 @@ int main(int argc, char** argv) {
             std::cout << "Copied draw input tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--storage-host-only-idle-only") return storageUnderHostOnlyTargetTests(device, recorder) ? 0 : 77;
         if (argc == 2 && std::string_view(argv[1]) == "--multisample-only") {
             multisampleGuestAccessTests(device, recorder);
             oneFragmentFmaskGuardTests(device);

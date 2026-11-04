@@ -805,6 +805,15 @@ void guardReads(std::uint64_t address, std::size_t bytes) {
     RequireNoMultisampleTarget(address, bytes, "a CPU read");
 }
 
+void hostOnlySpans(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans) {
+    ResidentDepthHostOnlySpans_nid_no_patch(address, bytes, spans);
+    if (!anyGuarded().load(std::memory_order_acquire)) return;
+    std::shared_lock lock(guardedMutex());
+    for (const auto& range : guarded()) {
+        if (address < range.address + range.bytes && range.address < address + bytes && range.hostOnly->load(std::memory_order_acquire)) spans.emplace_back(range.address, range.address + range.bytes);
+    }
+}
+
 struct RecordedSingleClear {
     std::uint64_t surface = 0;
     std::uint32_t pipeBankXor = 0;
@@ -1019,7 +1028,10 @@ MultisampleTarget& createFilled(const Context& context, const GuestTextureResour
 
 void InstallResidentImageReadGuard_nid_no_patch() {
     static std::once_flag installed;
-    std::call_once(installed, [] { GuestMemory::SetReadGuard(&guardReads); });
+    std::call_once(installed, [] {
+        GuestMemory::SetHostOnlyQuery(&hostOnlySpans);
+        GuestMemory::SetReadGuard(&guardReads);
+    });
     UpdateResidentImageUnmapObserver_nid_no_patch();
 }
 

@@ -6546,6 +6546,19 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         }
         return;
     }
+    static const bool hostOnlyDrop = [] {
+        const char* capture = std::getenv("APS5_FRAME_CAPTURE");
+        return (capture != nullptr && *capture != '\0') || std::getenv("APS5_TMP_STORAGE_HOST_ONLY_DROP") != nullptr;
+    }();
+    if (hostOnlyDrop && !GuestMemory::HostOnlySpans(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)).empty()) {
+        static std::atomic<int> reports{0};
+        if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[gpu] storage image 0x%llx+0x%llx overlaps a host-only multisampled target (%s store); %zu pending ranges dropped\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), flushReason != nullptr ? flushReason : "unnamed", stores.size());
+        forgetStored();
+        for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+            if (layers[layer]) layerPending[layer] = false;
+        }
+        return;
+    }
     original.resize(static_cast<std::size_t>(guestBytes));
     // The store below compares against the guest bytes, read now when `original` does not hold
     // them (a GPU clear, a dropped or kept unit). Reading them says nothing about the image: a

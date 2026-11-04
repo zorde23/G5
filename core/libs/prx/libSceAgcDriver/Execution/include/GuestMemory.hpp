@@ -217,6 +217,8 @@ unsigned long long CodeOffset(const void* address);
 void SetFlushHook(void (*hook)(std::uint64_t address, std::size_t bytes));
 void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes));
 void GuardRead(std::uint64_t address, std::size_t bytes);
+void SetHostOnlyQuery(void (*query)(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans));
+std::vector<std::pair<std::uint64_t, std::uint64_t>> HostOnlySpans(std::uint64_t address, std::size_t bytes);
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes);
 // Moves with every ForgetPages call (the libc invalidator: memory unmapped or re-registered): odd
 // while the call stores its page states, moved past it after, so a reader that loads an even
