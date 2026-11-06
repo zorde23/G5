@@ -424,6 +424,38 @@ void DitheredCoverage(AgcDriver::VulkanDevice& device, std::uint32_t samples, st
     AgcDriver::Graphics::ClearMultisampleTargets(device.Device());
 }
 
+void UnditheredFourSampleCoverage(AgcDriver::VulkanDevice& device) {
+    const ColorTargetLayout layout(Width, Height, ColorTileMode::RenderTarget, 8);
+    constexpr std::uint32_t samples = 4;
+    for (const float alpha : {0.0f, 0.5f, 1.0f}) {
+        Block source(layout.Bytes() * samples);
+        std::memset(source.data, 0, source.bytes);
+        const auto multisampled = DecodeTarget(source, samples);
+        Draw(device, multisampled, true, Float32Export, Program(Color{1, 0, 0, alpha}, Float32Export), false, false, static_cast<std::uint8_t>(samples));
+        Block resolved(layout.Bytes());
+        std::memset(resolved.data, 0, resolved.bytes);
+        AgcDriver::Graphics::ColorMetadataPass pass{};
+        pass.mode = AgcDriver::Graphics::ColorMetadataPass::Mode::Resolve;
+        pass.source = multisampled;
+        pass.targets = {DecodeTarget(resolved)};
+        device.ColorMetadataPass(pass);
+        const auto stored = ReadBack(device, resolved);
+        for (std::uint32_t y = 0; y < Height; ++y) {
+            for (std::uint32_t x = 0; x < Width; ++x) {
+                const auto actual = FromHalf(stored[layout.Offset(x, y) / 2u]);
+                const bool covered = actual == 0.25f || actual == 0.5f || actual == 0.75f || actual == 1.0f;
+                const bool match = x >= ScissorWidth ? actual == 0.0f : alpha == 0.0f ? actual == 0.0f : alpha == 1.0f ? actual == 1.0f : covered;
+                if (match) continue;
+                char detail[160];
+                std::snprintf(detail, sizeof(detail), "undithered four-sample coverage alpha %.2g pixel (%u,%u): resolved %.9g", alpha, x, y, actual);
+                throw std::runtime_error(detail);
+            }
+        }
+        programCount = 0;
+    }
+    AgcDriver::Graphics::ClearMultisampleTargets(device.Device());
+}
+
 constexpr std::array<DitherCase, 36> EightSampleDitherCases{{
     {0x00000000u, 9u, {0x00u, 0x00u, 0x00u, 0x00u}},
     {0x80000000u, 9u, {0x00u, 0x00u, 0x00u, 0x00u}},
@@ -1194,6 +1226,17 @@ int main(int argc, char** argv) {
                 return VulkanTestSkipped;
             }
             std::puts("dithered eight-sample alpha-to-coverage tests passed");
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--undithered4") {
+            try {
+                UnditheredFourSampleCoverage(*device);
+            } catch (const std::runtime_error& error) {
+                if (std::string_view(error.what()) != "AGC graphics: the device cannot render color with the target's sample count") throw;
+                std::printf("skipped, the device lacks four-sample color attachments: %s\n", error.what());
+                return VulkanTestSkipped;
+            }
+            std::puts("undithered four-sample alpha-to-coverage tests passed");
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--dithered2") {

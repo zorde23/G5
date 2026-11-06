@@ -16,6 +16,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <mutex>
+#include <set>
 #include <span>
 #include <array>
 #include <sstream>
@@ -304,6 +306,37 @@ std::uint32_t shaderControlMask(std::uint32_t zFormat) {
 bool IgnoreDepthTest() {
     static const bool ignore = std::getenv("APS5_IGNORE_DEPTH_TEST") != nullptr;
     return ignore;
+}
+
+bool DitheredAlphaFallback() {
+    static const bool fallback = std::getenv("APS5_DITHERED_ALPHA_FALLBACK") != nullptr;
+    return fallback;
+}
+
+void reportUnmeasuredDitheredAlpha(const Registers& cx) {
+    std::array<std::uint32_t, 23> words{};
+    const std::array<std::uint32_t, 7> registers{0x2dc, 0x2f8, 0x201, 0x292, 0x293, 0x203, 0x1c5};
+    for (std::size_t index = 0; index < registers.size(); ++index)
+        if (const auto hit = find(cx, registers[index]); hit != cx.end()) words[index] = hit->second;
+    for (std::uint32_t slot = 0; slot < 16; ++slot)
+        if (const auto hit = find(cx, 0x2fe + slot); hit != cx.end()) words[registers.size() + slot] = hit->second;
+    static std::mutex lock;
+    static std::set<std::array<std::uint32_t, 23>> seen;
+    {
+        const std::lock_guard guard(lock);
+        if (!seen.insert(words).second) return;
+    }
+    std::ostringstream text;
+    text << "[gpu] dithered alpha-to-coverage outside the measured eight- and two-sample setups, " << (DitheredAlphaFallback() ? "drawn undithered (APS5_DITHERED_ALPHA_FALLBACK)" : "refused") << std::hex
+         << ": DB_ALPHA_TO_MASK=0x" << words[0] << " PA_SC_AA_CONFIG=0x" << words[1] << " DB_EQAA=0x" << words[2] << " PA_SC_MODE_CNTL_0=0x" << words[3] << " PA_SC_MODE_CNTL_1=0x" << words[4] << " DB_SHADER_CONTROL=0x" << words[5] << " SPI_SHADER_COL_FORMAT=0x" << words[6] << " PA_SC_AA_SAMPLE_LOCS=";
+    for (std::size_t slot = 0; slot < 16; ++slot) text << (slot == 0 ? "" : ",") << "0x" << words[registers.size() + slot];
+    text << '\n';
+    std::fputs(text.str().c_str(), stderr);
+}
+
+bool fallsBackFromDitheredAlpha(const Registers& cx) {
+    reportUnmeasuredDitheredAlpha(cx);
+    return DitheredAlphaFallback();
 }
 
 bool depthSurfaceBound(const Registers& cx) {
@@ -1529,6 +1562,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     result.alphaToCoverage = alpha == AlphaToCoverageUndithered || (!alphaDisabled && ditheredAlphaToCoverageWord(alpha));
     result.ditheredAlphaToCoverage = result.alphaToCoverage && ditheredAlphaToCoverageWord(alpha);
     if (!result.alphaToCoverage) zero(cx, 0x2dc, alphaDisabled ? AlphaToCoverageMask & ~1u : AlphaToCoverageMask, "dithered or rounded alpha-to-coverage");
+    if (result.ditheredAlphaToCoverage && alpha == AlphaToCoverageDithered && !ditheredAlphaSamplesSupported(cx) && fallsBackFromDitheredAlpha(cx)) result.ditheredAlphaToCoverage = false;
     if (result.ditheredAlphaToCoverage && alpha == AlphaToCoverageDithered) {
         Require(ditheredAlphaSamplesSupported(cx), "dithered alpha-to-coverage requires eight matched raster/DB_EQAA samples and one pixel iteration");
         Require(!result.customSampleLocations, "dithered alpha-to-coverage with custom sample locations is unsupported");
@@ -2390,9 +2424,14 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
         if ((word != AlphaToCoverageUndithered && !ditheredAlphaToCoverageWord(word)) || alphaDisabled) {
             if (auto reason = nonzero(cx, 0x2dc, alphaDisabled ? AlphaToCoverageMask & ~1u : AlphaToCoverageMask, "dithered or rounded alpha-to-coverage"); !reason.empty()) return reason;
         }
-        if (!alphaDisabled && word == AlphaToCoverageDithered && !ditheredAlphaSamplesSupported(cx)) return "AGC graphics: dithered alpha-to-coverage requires eight matched raster/DB_EQAA samples and one pixel iteration";
+        const bool fallback = !alphaDisabled && word == AlphaToCoverageDithered && !ditheredAlphaSamplesSupported(cx) && fallsBackFromDitheredAlpha(cx);
+        if (fallback) {
+            std::uint32_t format = 0;
+            if (value(cx, 0x1c5, format) && (format & 0xfu) != 3u && (format & 0xfu) != 4u && (format & 0xfu) != 5u && (format & 0xfu) != 6u && (format & 0xfu) != 9u) return "AGC graphics: alpha-to-coverage needs an MRT0 export format with a floating-point alpha";
+        }
+        if (!alphaDisabled && !fallback && word == AlphaToCoverageDithered && !ditheredAlphaSamplesSupported(cx)) return "AGC graphics: dithered alpha-to-coverage requires eight matched raster/DB_EQAA samples and one pixel iteration";
         if (!alphaDisabled && word == AlphaToCoverageTwoSampleDithered && !twoSampleDitheredAlphaSamplesSupported(cx)) return "AGC graphics: DB_ALPHA_TO_MASK 0xe701 requires two matched raster/DB_EQAA samples and one pixel iteration";
-        if (!alphaDisabled && ditheredAlphaToCoverageWord(word)) {
+        if (!alphaDisabled && !fallback && ditheredAlphaToCoverageWord(word)) {
             if (word == AlphaToCoverageDithered && !ditheredAlphaLocationsSupported(cx)) return "AGC graphics: dithered alpha-to-coverage with custom sample locations is unsupported";
             if (word == AlphaToCoverageTwoSampleDithered && !twoSampleDitheredAlphaLocationsSupported(cx)) return "AGC graphics: DB_ALPHA_TO_MASK 0xe701 is supported only with the two-sample locations (4,4),(-4,-4) or (-4,4),(4,-4) in every pixel";
             std::uint32_t format = 0;

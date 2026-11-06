@@ -4937,6 +4937,36 @@ void UnditheredAlphaToCoverageTests() {
     }
 }
 
+void DitheredAlphaFallbackTests() {
+    auto dithered = makeState();
+    dithered.context[0x203] = 0x8010;
+    dithered.context[0x2dc] = 0x18701;
+    dithered.context[0x292] = 3;
+    dithered.context[0x1c5] = 4;
+    dithered.context[0x1b3] = 2;
+    dithered.context[0x1b4] = 2;
+    dithered.context[0x201] = 0x00122202;
+    dithered.context[0x2f8] = 0x0020e002;
+    dithered.context[0x31d] = 0x12000;
+    for (std::uint32_t slot = 0; slot < 16; ++slot) dithered.context[0x2fe + slot] = 0;
+    const auto rejection = AgcDriver::Graphics::DrawRejection(dithered, false);
+    Require(rejection.empty(), "the fallback refused four-sample dithered alpha-to-coverage: " + rejection);
+    const auto fallback = AgcDriver::Graphics::DecodeState(dithered);
+    Require(fallback.alphaToCoverage && !fallback.ditheredAlphaToCoverage && fallback.samples == 4, "four-sample dithered alpha-to-coverage did not fall back to undithered coverage");
+    dithered.context[0x1c5] = 1;
+    Require(AgcDriver::Graphics::DrawRejection(dithered, false).find("floating-point alpha") != std::string::npos, "the fallback accepted an export without a floating-point alpha");
+    dithered.context[0x1c5] = 4;
+    dithered.context[0x201] = 0x00133303;
+    dithered.context[0x2f8] = 0x0030e003;
+    dithered.context[0x31d] = 0x1b000;
+    for (std::uint32_t pixel = 0; pixel < 4; ++pixel) {
+        dithered.context[0x2fe + pixel * 4u] = 0xbd153fd1u;
+        dithered.context[0x2ff + pixel * 4u] = 0x9773f95bu;
+    }
+    const auto measured = AgcDriver::Graphics::DecodeState(dithered);
+    Require(measured.ditheredAlphaToCoverage && measured.ditheredAlphaSamples == 8 && measured.samples == 8, "the fallback changed the measured eight-sample dither");
+}
+
 void TwoSampleDitheredAlphaToCoverageTests() {
     auto dithered = makeState();
     dithered.context[0x203] = 0x8010;
@@ -12795,6 +12825,11 @@ int main(int argc, char** argv) {
             Require(!snapshotAcquired, "pipeline cache snapshot overlapped pipeline creation");
             pipelineUse.unlock();
             Require(synchronization.TryLockForSnapshot().owns_lock(), "pipeline cache snapshot stayed blocked after pipeline creation finished");
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--dithered-alpha-fallback-state") {
+            DitheredAlphaFallbackTests();
+            std::cout << "Dithered alpha-to-coverage fallback states passed\n";
+            return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--undithered-alpha-to-coverage-state") {
             UnditheredAlphaToCoverageTests();
