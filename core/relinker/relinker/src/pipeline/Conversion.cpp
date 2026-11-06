@@ -123,13 +123,14 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
         for (const auto& region : Relinker::UnusedNidFilter::ReadExceptionFunctions(sourceBytes, headers, {}, {})) functions.push_back({region.Begin, region.End});
         if (functions.empty()) throw Domain::RelinkerException("Red-zone framing needs function bounds from the executable's .eh_frame, and it has none");
         Codegen::RedZoneFrameReport report;
-        auto framed = Codegen::FrameRedZoneFunctions(sourceBytes, codeSegments, functions, trampolines, report, displacements);
+        auto framed = Codegen::FrameRedZoneFunctions(sourceBytes, codeSegments, functions, trampolines, report, displacements, options.FrameShrinkWrapped);
         for (const auto& moved : displacements) {
             if (moved.Offset > sourceBytes.size() || moved.Bytes.size() > sourceBytes.size() - moved.Offset)
                 throw Domain::RelinkerException("Red-zone displacement exceeds source image", moved.Offset);
             std::copy(moved.Bytes.begin(), moved.Bytes.end(), sourceBytes.begin() + static_cast<std::ptrdiff_t>(moved.Offset));
         }
         { std::ostringstream message; message << "Red-zone framing: " << report.Functions << " functions, " << report.RedZoneFunctions << " leaf functions keep values below RSP, " << report.Framed << " framed (" << report.FramedWithoutFramePointer << " without a frame pointer, " << report.MovedOperands << " rsp operands moved, " << report.StubbedOperands << " in " << report.OperandStubs << " operand stubs; " << report.Exits << " exits)\n"; inputProgress.Message(message.str()); }
+        if (report.ShrinkWrapped != 0) { std::ostringstream message; message << "Red-zone framing: " << report.ShrinkWrapped << " of them push their registers after an early exit and are framed after the pushes\n"; inputProgress.Message(message.str()); }
         if (report.WidenedPrologues != 0 || report.WidenedExits != 0) { std::ostringstream message; message << "Red-zone framing: " << report.WidenedPrologues << " prologues widened over the instructions after them and " << report.WidenedExits << " exits over the instructions before them, as they were shorter than a jump (" << report.WidenedOperands << " rsp operands moved into their stubs)\n"; inputProgress.Message(message.str()); }
         for (const auto& [reason, count] : report.Skipped) { std::ostringstream message; message << "Red-zone framing: skipped " << count << ": " << reason << '\n'; inputProgress.Message(message.str()); }
         redZoneTable = RedZoneGuardTable(sourceBytes, headers, trampolines, &report);

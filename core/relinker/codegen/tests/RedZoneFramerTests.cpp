@@ -91,7 +91,7 @@ void framesRedZoneLeaf() {
     std::vector<std::uint8_t> exitBody{0x48, 0x8d, 0xa4, 0x24, 0x80, 0, 0, 0};
     append(exitBody, Exit);
     append(exitBody, {0xe9, 0, 0, 0, 0});
-    require(exit.Body == exitBody && exit.ReturnBranchOffset == 8 + Exit.size(), "the exit stub does not raise rsp before the pops");
+    require(exit.Body == exitBody && exit.ReturnBranchOffset == 8 + Exit.size(), "the exit stub does not raise rsp before the pops and leave the ret the early je reaches");
 }
 
 const std::vector<std::uint8_t> FramelessPrologue{0x53, 0x41, 0x56, 0x41, 0x57};
@@ -356,6 +356,25 @@ void skipsFragmentsThatPopWithoutPushing() {
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
     require(sites.empty() && displacements.empty() && report.Skipped.at("push or pop in a leaf without pushes") == 1, "a fragment without pushes that pops a register its caller pushed was framed");
+}
+
+void framesShrinkWrappedLeavesOnlyWhenAsked() {
+    const std::vector<std::uint8_t> shrinkWrapped{0x48, 0x85, 0xff, 0x74, 0x14, 0x53, 0x41, 0x56, 0x41, 0x57, 0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x8b, 0x44, 0x24, 0xf8, 0x41, 0x5f, 0x41, 0x5e, 0x5b, 0xc3};
+    const std::vector<std::uint8_t> earlyBranchPastPushes{0x48, 0x85, 0xff, 0x74, 0x0a, 0x53, 0x41, 0x56, 0x41, 0x57, 0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x8b, 0x44, 0x24, 0xf8, 0x41, 0x5f, 0x41, 0x5e, 0x5b, 0xc3};
+    const auto input = image({shrinkWrapped, earlyBranchPastPushes});
+    Codegen::RedZoneFrameReport plain;
+    std::vector<Codegen::RedZoneDisplacement> plainDisplacements;
+    require(Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, plain, plainDisplacements).empty() && plain.Skipped.at("push or pop in a leaf without pushes") == 2, "a leaf pushing after an early exit was framed without being asked");
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements, true);
+    require(report.Framed == 1 && report.ShrinkWrapped == 1 && report.Skipped.at("shrink-wrapped: early branch past the push run") == 1, "the shrink-wrapped leaf was not framed or the leaf branching past its pushes was");
+    require(sites.size() == 2 && sites[0].Address == input.functions[0].Begin + 5 && sites[1].Address == input.functions[0].Begin + 20, "the shrink-wrapped leaf was not framed at its pushes and its pops");
+    std::vector<std::uint8_t> entry{0x53, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0x64, 0x24, 0xf0, 0xe9, 0, 0, 0, 0};
+    require(sites[0].Body == entry, "the entry stub does not push and then lower rsp");
+    std::vector<std::uint8_t> exit{0x48, 0x8d, 0xa4, 0x24, 0x10, 0x00, 0x00, 0x00, 0x41, 0x5f, 0x41, 0x5e, 0x5b, 0xe9, 0, 0, 0, 0};
+    require(sites[1].Body == exit, "the exit stub does not raise rsp before the pops and leave the ret the early je reaches");
+    require(displacements.size() == 2 && displacements[0].Bytes == std::vector<std::uint8_t>{0x08} && displacements[1].Bytes == std::vector<std::uint8_t>{0x08}, "the spill and load below rsp were not moved by the shift");
 }
 
 void skipsWideningOverBranchTargets() {
@@ -854,6 +873,7 @@ int main() {
         widensAShortFramePointerPrologue();
         framesLeavesWithoutPushes();
         skipsFragmentsThatPopWithoutPushing();
+        framesShrinkWrappedLeavesOnlyWhenAsked();
         skipsWideningOverBranchTargets();
         skipsBranchesIntoTheInstructionsAfterAShortPrologue();
         widensAShortPrologueThatAllocates();

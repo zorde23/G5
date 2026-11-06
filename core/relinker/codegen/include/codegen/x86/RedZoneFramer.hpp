@@ -27,6 +27,7 @@ struct RedZoneFrameReport {
     std::size_t RedZoneFunctions = 0;
     std::size_t Framed = 0;
     std::size_t FramedWithoutFramePointer = 0;
+    std::size_t ShrinkWrapped = 0;
     std::size_t Exits = 0;
     std::size_t WidenedPrologues = 0;
     std::size_t WidenedExits = 0;
@@ -49,7 +50,8 @@ std::vector<TrampolineSite> FrameRedZoneFunctions(
     const std::vector<RedZoneFunction>& functions,
     const std::vector<TrampolineSite>& existing,
     RedZoneFrameReport& report,
-    std::vector<RedZoneDisplacement>& displacements
+    std::vector<RedZoneDisplacement>& displacements,
+    bool shrinkWrapped = false
 );
 
 }

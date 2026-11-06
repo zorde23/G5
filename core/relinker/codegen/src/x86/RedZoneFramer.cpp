@@ -18,7 +18,7 @@ constexpr std::uint8_t kRegRbp = 5;
 constexpr std::size_t kJumpBytes = 5;
 constexpr std::int64_t kRedZoneBytes = 0x80;
 constexpr std::int64_t kStackAlignment = 16;
-constexpr std::uint8_t kJumpBack[] = {0xe9, 0x00, 0x00, 0x00, 0x00};
+constexpr std::uint8_t kJumpBack[] = {0xe9, 0x00, 0x00, 0x00, 0x00};
 
 std::vector<std::uint8_t> lowerRsp(const std::int64_t shift) {
     return {0x48, 0x8d, 0x64, 0x24, static_cast<std::uint8_t>(-shift)};
@@ -240,7 +240,8 @@ void frameSegment(
     const std::vector<TrampolineSite>& existing,
     std::vector<TrampolineSite>& sites,
     std::vector<RedZoneDisplacement>& displacements,
-    RedZoneFrameReport& report
+    RedZoneFrameReport& report,
+    const bool shrinkWrapped
 ) {
     const auto segOffset = static_cast<std::size_t>(ph.Offset);
     const auto segSize = static_cast<std::size_t>(ph.FileSize);
@@ -268,6 +269,159 @@ void frameSegment(
     const auto targetInside = [&](const std::size_t begin, const std::size_t end) {
         const auto hit = targets.upper_bound(begin);
         return hit != targets.end() && *hit < end;
+    };
+    const auto frameShrinkWrapped = [&](const RedZoneFunction& function, const std::vector<Insn>& body, const std::size_t start, const std::size_t limit) -> const char* {
+        const auto at = [&](const std::size_t k) { return seg.data() + body[k].Offset; };
+        const auto isRet = [&](const std::size_t k) { return body[k].Length == 1 && at(k)[0] == 0xc3; };
+        std::size_t first = 0;
+        while (first < body.size() && !pushedRegister(at(first), body[first])) ++first;
+        if (first == 0 || first == body.size()) return "shrink-wrapped: no push run after the entry";
+        std::size_t last = first;
+        std::vector<std::uint8_t> pushed;
+        while (last < body.size())
+            if (const auto reg = pushedRegister(at(last), body[last])) { pushed.push_back(*reg); ++last; } else break;
+        const auto pushBegin = body[first].Offset;
+        const auto pushEnd = body[last - 1].Offset + body[last - 1].Length;
+        std::map<std::size_t, std::size_t> index;
+        for (std::size_t k = 0; k < body.size(); ++k) index.emplace(body[k].Offset, k);
+        const auto branchTarget = [&](const std::size_t k) -> std::optional<std::size_t> {
+            const auto& info = body[k].Info;
+            if (!info.HasBranchTarget || info.HasRipRelativeDisp) return std::nullopt;
+            const auto target = static_cast<std::int64_t>(body[k].Offset + body[k].Length) + info.BranchDisp;
+            if (target < static_cast<std::int64_t>(start) || target >= static_cast<std::int64_t>(limit)) return std::nullopt;
+            const auto hit = index.find(static_cast<std::size_t>(target));
+            if (hit == index.end()) return std::nullopt;
+            return hit->second;
+        };
+        for (std::size_t k = 0; k < first; ++k) {
+            const auto flow = body[k].Info.FlowKind;
+            if (pushesOrPops(at(k), body[k]) || memoryUse(at(k), body[k]).UsesRsp || rspAdjustment(at(k), body[k])) return "shrink-wrapped: rsp used before the push run";
+            if (flow == ControlFlowKind::IndirectJump) return "shrink-wrapped: indirect jump";
+            if (flow == ControlFlowKind::Return && !isRet(k)) return "shrink-wrapped: ret with an immediate";
+            if (flow == ControlFlowKind::UnconditionalJump || flow == ControlFlowKind::ConditionalBranch) {
+                const auto target = branchTarget(k);
+                if (!target) return "shrink-wrapped: branch leaves the function";
+                if (*target > first && !isRet(*target)) return "shrink-wrapped: early branch past the push run";
+            }
+        }
+        struct Exit {
+            std::size_t First;
+            std::size_t Ret;
+        };
+        std::vector<Exit> exits;
+        std::set<std::size_t> popped;
+        std::int64_t depth = 0;
+        bool wholeRedZone = false;
+        for (std::size_t k = last; k < body.size(); ++k) {
+            const auto& insn = body[k];
+            const auto flow = insn.Info.FlowKind;
+            const auto use = memoryUse(at(k), insn);
+            if (use.RegisterRsp || rspAdjustment(at(k), insn)) return "shrink-wrapped: other use of rsp";
+            if (use.RspBased && at(k)[insn.Info.OpcodeOffset] == 0x62) return "shrink-wrapped: rsp operand that cannot move with rsp";
+            if (use.RspBased) {
+                if (use.RspDisp < 0) depth = std::max(depth, -use.RspDisp);
+                if (use.Indexed || (use.Address && use.RspDisp < 0)) wholeRedZone = true;
+            }
+            if (flow == ControlFlowKind::IndirectJump) return "shrink-wrapped: indirect jump";
+            if (flow == ControlFlowKind::UnconditionalJump || flow == ControlFlowKind::ConditionalBranch) {
+                const auto target = branchTarget(k);
+                if (!target) return "shrink-wrapped: branch leaves the function";
+                if (*target < last) return "shrink-wrapped: branch back before the push run";
+            }
+            if (flow != ControlFlowKind::Return) continue;
+            if (!isRet(k)) return "shrink-wrapped: ret with an immediate";
+            std::size_t q = k;
+            std::vector<std::uint8_t> pops;
+            while (q > last && pops.size() < pushed.size())
+                if (const auto reg = poppedRegister(at(q - 1), body[q - 1])) { pops.push_back(*reg); --q; } else break;
+            if (pops != pushed) return "shrink-wrapped: exit does not pop the push run";
+            for (auto j = q; j < k; ++j) popped.insert(j);
+            exits.push_back({q, k});
+        }
+        if (exits.empty()) return "shrink-wrapped: no ret exit";
+        for (std::size_t k = last; k < body.size(); ++k)
+            if (!popped.contains(k) && pushesOrPops(at(k), body[k])) return "shrink-wrapped: push or pop inside the body";
+        for (std::size_t k = 0; k < body.size(); ++k) {
+            const auto target = branchTarget(k);
+            if (!target) continue;
+            for (const auto& exit : exits) {
+                if (*target > exit.First && *target < exit.Ret) return "shrink-wrapped: branch into an exit's pops";
+                if (*target == exit.Ret && k >= last) return "shrink-wrapped: branch to a ret past the pops";
+            }
+        }
+        const auto shift = wholeRedZone ? kRedZoneBytes : std::min(kRedZoneBytes, (depth + kStackAlignment - 1) / kStackAlignment * kStackAlignment);
+        if (shift == 0) return "shrink-wrapped: no rsp operand below the push run";
+
+        auto entry = std::vector<std::uint8_t>(seg.begin() + static_cast<std::ptrdiff_t>(pushBegin), seg.begin() + static_cast<std::ptrdiff_t>(pushEnd));
+        const auto lower = lowerRsp(shift);
+        entry.insert(entry.end(), lower.begin(), lower.end());
+        auto entryEnd = pushEnd;
+        auto entryLast = last;
+        while (entryEnd - pushBegin < kJumpBytes && entryLast < body.size()) {
+            const auto& covered = body[entryLast];
+            if (covered.Offset != entryEnd || covered.Info.FlowKind != ControlFlowKind::Sequential || covered.Info.HasRipRelativeDisp || popped.contains(entryLast)) break;
+            const auto use = memoryUse(at(entryLast), covered);
+            const auto bytes = use.RspBased ? withDisplacement(at(entryLast), covered, use, use.RspDisp + shift) : std::vector<std::uint8_t>(at(entryLast), at(entryLast) + covered.Length);
+            if (!bytes) break;
+            entry.insert(entry.end(), bytes->begin(), bytes->end());
+            entryEnd += covered.Length;
+            ++entryLast;
+        }
+        if (entryEnd - pushBegin < kJumpBytes) return "shrink-wrapped: push run shorter than a jump";
+        if (targetInside(pushBegin, entryEnd)) return "shrink-wrapped: branch into the push run";
+        if (overlapsExisting(pushBegin, entryEnd)) return "shrink-wrapped: overlaps another stub";
+
+        struct Site {
+            std::size_t Begin;
+            std::size_t End;
+            std::vector<std::uint8_t> Code;
+        };
+        std::vector<Site> exitSites;
+        for (const auto& exit : exits) {
+            const auto begin = body[exit.First].Offset;
+            auto end = begin;
+            auto k = exit.First;
+            while (end - begin < kJumpBytes && k < exit.Ret) end += body[k++].Length;
+            if (end - begin < kJumpBytes && !targets.contains(body[exit.Ret].Offset)) end += body[exit.Ret].Length;
+            if (end - begin < kJumpBytes) return "shrink-wrapped: exit shorter than a jump";
+            if (targetInside(begin, end)) return "shrink-wrapped: branch into an exit";
+            if (overlapsExisting(begin, end) || (begin < entryEnd && pushBegin < end)) return "shrink-wrapped: overlaps another stub";
+            auto code = raiseRsp(shift);
+            code.insert(code.end(), seg.begin() + static_cast<std::ptrdiff_t>(begin), seg.begin() + static_cast<std::ptrdiff_t>(end));
+            exitSites.push_back({begin, end, std::move(code)});
+        }
+        std::vector<std::pair<std::size_t, std::vector<std::uint8_t>>> moves;
+        for (auto k = entryLast; k < body.size(); ++k) {
+            const auto use = memoryUse(at(k), body[k]);
+            if (!use.RspBased) continue;
+            if (overlapsExisting(body[k].Offset, body[k].Offset + body[k].Length)) return "shrink-wrapped: overlaps another stub";
+            auto moved = movedDisplacement(use, shift);
+            if (!moved) return "shrink-wrapped: rsp operand that cannot move";
+            moves.emplace_back(body[k].Offset + use.DispOffset, std::move(*moved));
+        }
+
+        const auto addSite = [&](const std::size_t begin, const std::size_t end, std::vector<std::uint8_t> code) {
+            TrampolineSite site;
+            site.Offset = ph.Offset + begin;
+            site.Address = ph.MappedAddress + begin;
+            site.Length = end - begin;
+            site.OriginalBytes.assign(seg.begin() + static_cast<std::ptrdiff_t>(begin), seg.begin() + static_cast<std::ptrdiff_t>(end));
+            site.ReturnBranchOffset = code.size();
+            code.insert(code.end(), std::begin(kJumpBack), std::end(kJumpBack));
+            site.Body = std::move(code);
+            taken.emplace_back(begin, end);
+            sites.push_back(std::move(site));
+        };
+        addSite(pushBegin, entryEnd, std::move(entry));
+        for (auto& site : exitSites) addSite(site.Begin, site.End, std::move(site.Code));
+        for (auto& [offset, bytes] : moves) displacements.push_back({ph.Offset + offset, std::move(bytes)});
+        ++report.Framed;
+        ++report.FramedWithoutFramePointer;
+        ++report.ShrinkWrapped;
+        report.Exits += exits.size();
+        report.MovedOperands += moves.size();
+        report.Leaves.push_back({function.Begin, function.End, {}});
+        return nullptr;
     };
     for (const auto& function : functions) {
         if (function.Begin < ph.MappedAddress || function.End <= function.Begin || function.End - ph.MappedAddress > segSize) continue;
@@ -386,6 +540,10 @@ void frameSegment(
         }
         if (!leaf || !redZone) continue;
         ++report.RedZoneFunctions;
+        if (shrinkWrapped && reason != nullptr && !rbpPrologue && pushed.empty() && allocation == 0 && std::any_of(body.begin(), body.end(), [&](const Insn& insn) { return pushedRegister(seg.data() + insn.Offset, insn).has_value(); })) {
+            reason = frameShrinkWrapped(function, body, start, limit);
+            if (reason == nullptr) continue;
+        }
         const auto prologueEnd = p > 0 ? body[p - 1].Offset + body[p - 1].Length : start;
         if (reason == nullptr && std::any_of(stackMoves.begin(), stackMoves.end(), [&](const std::size_t k) { return std::none_of(exits.begin(), exits.end(), [&](const ExitSite& exit) { return exit.Begin <= body[k].Offset && body[k].Offset < exit.End; }); })) reason = "push or pop inside the body";
         auto entryEnd = prologueEnd;
@@ -509,10 +667,11 @@ std::vector<TrampolineSite> FrameRedZoneFunctions(
     const std::vector<RedZoneFunction>& functions,
     const std::vector<TrampolineSite>& existing,
     RedZoneFrameReport& report,
-    std::vector<RedZoneDisplacement>& displacements
+    std::vector<RedZoneDisplacement>& displacements,
+    const bool shrinkWrapped
 ) {
     std::vector<TrampolineSite> sites;
-    for (const auto& ph : codeSegments) frameSegment(fileBytes, ph, functions, existing, sites, displacements, report);
+    for (const auto& ph : codeSegments) frameSegment(fileBytes, ph, functions, existing, sites, displacements, report, shrinkWrapped);
     return sites;
 }
 
