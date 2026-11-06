@@ -377,6 +377,36 @@ void framesShrinkWrappedLeavesOnlyWhenAsked() {
     require(displacements.size() == 2 && displacements[0].Bytes == std::vector<std::uint8_t>{0x08} && displacements[1].Bytes == std::vector<std::uint8_t>{0x08}, "the spill and load below rsp were not moved by the shift");
 }
 
+void skipsShrinkWrappedLeavesWithHiddenRspUsesOrOutsideEntries() {
+    const std::vector<std::uint8_t> head{0x48, 0x85, 0xff, 0x74, 0x0f, 0x53, 0x41, 0x56, 0x41, 0x57, 0x48, 0x89, 0x7c, 0x24, 0xf8};
+    const std::vector<std::uint8_t> tail{0x41, 0x5f, 0x41, 0x5e, 0x5b, 0xc3};
+    const auto shape = [&](const std::vector<std::uint8_t>& middle) {
+        auto bytes = head;
+        bytes[4] = static_cast<std::uint8_t>(10 + middle.size() + 5);
+        append(bytes, middle);
+        append(bytes, tail);
+        return bytes;
+    };
+    const auto leaveInBody = shape({0xc9, 0x90, 0x90});
+    const auto shortXchg = shape({0x48, 0x94, 0x90});
+    const auto movRspImm = shape({0x48, 0xbc, 1, 0, 0, 0, 0, 0, 0, 0});
+    const auto imulRsp = shape({0x48, 0x6b, 0x27, 0x02});
+    const auto gather = shape({0xc4, 0xe2, 0xe9, 0x90, 0x04, 0x24});
+    const auto target = shape({0x90, 0x90, 0x90});
+    const std::vector<std::uint8_t> intoBody{0xe9, 0, 0, 0, 0};
+    auto input = image({leaveInBody, shortXchg, movRspImm, imulRsp, gather, target, intoBody});
+    const auto from = static_cast<std::size_t>(input.functions[6].Begin - Base);
+    const auto into = static_cast<std::int32_t>(input.functions[5].Begin - Base + 15) - static_cast<std::int32_t>(from + 5);
+    for (std::size_t index = 0; index < 4; ++index) input.bytes[from + 1 + index] = static_cast<std::uint8_t>(static_cast<std::uint32_t>(into) >> (8 * index));
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements, true);
+    std::string seen;
+    for (const auto& [why, count] : report.Skipped) seen += why + "=" + std::to_string(count) + "; ";
+    require(sites.empty() && report.ShrinkWrapped == 0, "a shrink-wrapped leaf with a hidden rsp use or an outside entry was framed: " + seen);
+    require(report.Skipped.at("shrink-wrapped: other use of rsp") == 5 && report.Skipped.at("shrink-wrapped: branch from outside into the body") == 1, "the skipped leaves were not listed with their reasons: " + seen);
+}
+
 void skipsWideningOverBranchTargets() {
     const std::vector<std::uint8_t> loopToStart{0x48, 0x89, 0x7c, 0x24, 0xf0, 0xff, 0xc9, 0x75, 0xf7, 0x48, 0x8b, 0x44, 0x24, 0xf0, 0xc3};
     std::vector<std::uint8_t> jumpToPop = StoreBelowRsp;
@@ -874,6 +904,7 @@ int main() {
         framesLeavesWithoutPushes();
         skipsFragmentsThatPopWithoutPushing();
         framesShrinkWrappedLeavesOnlyWhenAsked();
+        skipsShrinkWrappedLeavesWithHiddenRspUsesOrOutsideEntries();
         skipsWideningOverBranchTargets();
         skipsBranchesIntoTheInstructionsAfterAShortPrologue();
         widensAShortPrologueThatAllocates();

@@ -431,6 +431,20 @@ std::string hex(const std::uint64_t value) {
     return text.str();
 }
 
+void runsAShrinkWrappedLeafThroughItsTakenEarlyExit() {
+    const std::vector<std::uint8_t> code{
+        0x89, 0xd0, 0x81, 0xff, 0x11, 0x11, 0x00, 0x00, 0x74, 0x14, 0x53, 0x41, 0x56, 0x41, 0x57,
+        0x48, 0x89, 0x7c, 0x24, 0xf0, 0x48, 0x03, 0x44, 0x24, 0xf0, 0x41, 0x5f, 0x41, 0x5e, 0x5b, 0xc3,
+    };
+    const auto image = place({{"early exit", code, kC}});
+    const auto framing = load(image, true, true);
+    require(framing.Report.ShrinkWrapped == 1, "the leaf with a taken early exit was not framed after its pushes");
+    for (const bool clobber : {false, true}) {
+        const auto result = run(image.Starts[0], clobber);
+        require(result.Result == kC, "the framed leaf returned " + hex(result.Result) + " through its taken early exit, not " + hex(kC));
+    }
+}
+
 Codegen::RedZoneFrameReport runLeaves(const std::vector<Leaf>& leaves, const bool shrinkWrapped = false) {
     const auto image = place(leaves);
     load(image, false);
@@ -473,6 +487,7 @@ int main() {
         const auto widened = runLeaves(widenedLeaves());
         require(widened.WidenedPrologues == 8 && widened.WidenedExits == 9 && widened.WidenedOperands == 12, "the leaves with short prologues and exits were framed with " + std::to_string(widened.WidenedPrologues) + " widened prologues, " + std::to_string(widened.WidenedExits) + " widened exits and " + std::to_string(widened.WidenedOperands) + " rsp operands in them, not 8, 9 and 12");
         const auto shrinkWrapped = runLeaves(shrinkWrappedLeaves(), true);
+        runsAShrinkWrappedLeafThroughItsTakenEarlyExit();
         require(shrinkWrapped.ShrinkWrapped == 2, "only " + std::to_string(shrinkWrapped.ShrinkWrapped) + " of 2 leaves pushing after an early exit were framed after their pushes");
         std::cout << "red-zone framer execution tests passed\n";
         return 0;

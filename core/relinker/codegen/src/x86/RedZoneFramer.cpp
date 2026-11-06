@@ -18,7 +18,7 @@ constexpr std::uint8_t kRegRbp = 5;
 constexpr std::size_t kJumpBytes = 5;
 constexpr std::int64_t kRedZoneBytes = 0x80;
 constexpr std::int64_t kStackAlignment = 16;
-constexpr std::uint8_t kJumpBack[] = {0xe9, 0x00, 0x00, 0x00, 0x00};
+constexpr std::uint8_t kJumpBack[] = {0xe9, 0x00, 0x00, 0x00, 0x00};
 
 std::vector<std::uint8_t> lowerRsp(const std::int64_t shift) {
     return {0x48, 0x8d, 0x64, 0x24, static_cast<std::uint8_t>(-shift)};
@@ -191,6 +191,28 @@ MemoryUse memoryUse(const std::uint8_t* code, const Insn& insn) {
     return use;
 }
 
+bool vexEncoded(const std::uint8_t* code, const Insn& insn) {
+    const auto lead = code[insn.Info.OpcodeOffset];
+    return insn.Info.RexPrefix == 0 && (lead == 0xc4 || lead == 0xc5 || lead == 0x62 || xopPrefixed(code, insn));
+}
+
+bool usesRspOutsideOperands(const std::uint8_t* code, const Insn& insn) {
+    const auto& info = insn.Info;
+    const auto lead = code[info.OpcodeOffset];
+    if (lead == 0xc8 || lead == 0xc9) return true;
+    if (vexEncoded(code, insn)) {
+        const auto map = lead == 0xc5 ? std::uint8_t{1} : static_cast<std::uint8_t>(code[info.OpcodeOffset + 1] & 0x1f);
+        const auto op = code[info.OpcodeOffset + (lead == 0xc5 ? 2 : 3)];
+        return lead == 0xc4 && map == 2 && op >= 0x90 && op <= 0x93 && memoryUse(code, insn).RspBased;
+    }
+    const bool b = (info.RexPrefix & 1) != 0;
+    const bool r = (info.RexPrefix & 4) != 0;
+    const auto reg = static_cast<std::uint8_t>((info.ModRmByte >> 3) & 7);
+    if (info.IsTwoByteOpcode) return info.Opcode == 0xc8 + kRegRsp && !b;
+    if ((info.Opcode == 0x90 + kRegRsp || info.Opcode == 0xb8 + kRegRsp) && !b) return true;
+    return (info.Opcode == 0x63 || info.Opcode == 0x69 || info.Opcode == 0x6b) && info.HasModRm && reg == kRegRsp && !r;
+}
+
 std::optional<std::vector<std::uint8_t>> movedDisplacement(const MemoryUse& use, const std::int64_t shift) {
     const auto moved = use.RspDisp + shift;
     if (use.Mod == 1 && moved <= std::numeric_limits<std::int8_t>::max()) return std::vector<std::uint8_t>{static_cast<std::uint8_t>(moved)};
@@ -282,8 +304,12 @@ void frameSegment(
             if (const auto reg = pushedRegister(at(last), body[last])) { pushed.push_back(*reg); ++last; } else break;
         const auto pushBegin = body[first].Offset;
         const auto pushEnd = body[last - 1].Offset + body[last - 1].Length;
+        const auto lastFlow = body.back().Info.FlowKind;
+        if (lastFlow != ControlFlowKind::Return && lastFlow != ControlFlowKind::UnconditionalJump) return "shrink-wrapped: falls through past its end";
         std::map<std::size_t, std::size_t> index;
         for (std::size_t k = 0; k < body.size(); ++k) index.emplace(body[k].Offset, k);
+        for (std::size_t k = 0; k < body.size(); ++k)
+            if (usesRspOutsideOperands(at(k), body[k])) return "shrink-wrapped: other use of rsp";
         const auto branchTarget = [&](const std::size_t k) -> std::optional<std::size_t> {
             const auto& info = body[k].Info;
             if (!info.HasBranchTarget || info.HasRipRelativeDisp) return std::nullopt;
@@ -341,6 +367,11 @@ void frameSegment(
         if (exits.empty()) return "shrink-wrapped: no ret exit";
         for (std::size_t k = last; k < body.size(); ++k)
             if (!popped.contains(k) && pushesOrPops(at(k), body[k])) return "shrink-wrapped: push or pop inside the body";
+        std::set<std::size_t> internal;
+        for (std::size_t k = 0; k < body.size(); ++k)
+            if (const auto target = branchTarget(k)) internal.insert(body[*target].Offset);
+        for (auto hit = targets.upper_bound(start); hit != targets.end() && *hit < limit; ++hit)
+            if (!internal.contains(*hit)) return "shrink-wrapped: branch from outside into the body";
         for (std::size_t k = 0; k < body.size(); ++k) {
             const auto target = branchTarget(k);
             if (!target) continue;
