@@ -420,6 +420,29 @@ void keepsLeavesThatBranchToAColdPartWhole() {
     require(!dead[1].empty() && dead[1].front().Begin == input.functions[2].Begin + 10, "a leaf that reads its spill before a store was not called dead from the store on");
 }
 
+void keepsLeavesWithHiddenReachOrForeignEntriesWhole() {
+    const std::vector<std::uint8_t> alone{0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x8b, 0x44, 0x24, 0xf8, 0x89, 0x06, 0x85, 0xd2, 0x74, 0x00, 0xc3};
+    const std::vector<std::uint8_t> bitIndexed{0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0xc7, 0xc1, 0xc0, 0xff, 0xff, 0xff, 0x48, 0x0f, 0xa3, 0x0c, 0x24, 0x0f, 0x92, 0xc0, 0xc3};
+    const std::vector<std::uint8_t> lowByteRsp{0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x8b, 0x44, 0x24, 0xf8, 0x40, 0xb4, 0x00, 0xc3};
+    const std::vector<std::uint8_t> setRsp{0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x8b, 0x44, 0x24, 0xf8, 0x40, 0x0f, 0x94, 0xc4, 0xc3};
+    const std::vector<std::uint8_t> jump{0xe9, 0, 0, 0, 0};
+    auto input = image({alone, bitIndexed, lowByteRsp, setRsp, alone, jump, alone, jump});
+    const auto patch = [&](const std::size_t from, const std::uint64_t to) {
+        const auto at = static_cast<std::size_t>(from - Base);
+        const auto rel = static_cast<std::int32_t>(to - from - 5);
+        for (std::size_t index = 0; index < 4; ++index) input.bytes[at + 1 + index] = static_cast<std::uint8_t>(static_cast<std::uint32_t>(rel) >> (8 * index));
+    };
+    patch(input.functions[5].Begin, input.functions[4].Begin);
+    patch(input.functions[7].Begin, input.functions[6].Begin + 16);
+    const auto dead = Codegen::FindRedZoneDeadRanges(input.bytes, input.segments, {input.functions[0], input.functions[1], input.functions[2], input.functions[3], input.functions[4], input.functions[6]});
+    require(!dead[0].empty(), "the plain leaf had no dead instructions, so the cases below prove nothing");
+    require(dead[1].empty(), "a leaf with a bit test indexed by a register below its RSP operand had instructions called dead");
+    require(dead[2].empty(), "a leaf that writes SPL had instructions called dead");
+    require(dead[3].empty(), "a leaf that sets SPL had instructions called dead");
+    require(dead[4].empty(), "a leaf another function jumps to, which may arrive with a pointer below its RSP, had instructions called dead");
+    require(dead[5].empty(), "a leaf whose internally targeted ret is also reached from another function had instructions called dead");
+}
+
 void skipsWideningOverBranchTargets() {
     const std::vector<std::uint8_t> loopToStart{0x48, 0x89, 0x7c, 0x24, 0xf0, 0xff, 0xc9, 0x75, 0xf7, 0x48, 0x8b, 0x44, 0x24, 0xf0, 0xc3};
     std::vector<std::uint8_t> jumpToPop = StoreBelowRsp;
@@ -919,6 +942,7 @@ int main() {
         framesShrinkWrappedLeavesOnlyWhenAsked();
         skipsShrinkWrappedLeavesWithHiddenRspUsesOrOutsideEntries();
         keepsLeavesThatBranchToAColdPartWhole();
+        keepsLeavesWithHiddenReachOrForeignEntriesWhole();
         skipsWideningOverBranchTargets();
         skipsBranchesIntoTheInstructionsAfterAShortPrologue();
         widensAShortPrologueThatAllocates();

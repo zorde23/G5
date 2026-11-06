@@ -35,6 +35,18 @@ struct Insn {
     DecodedInstructionInfo Info;
 };
 
+struct BranchSite {
+    std::size_t Target;
+    std::size_t Source;
+    bool Call;
+};
+
+bool enteredFromOutside(const std::vector<BranchSite>& branches, const std::size_t start, const std::size_t limit, const bool callAtStart) {
+    for (auto hit = std::lower_bound(branches.begin(), branches.end(), start, [](const BranchSite& site, const std::size_t value) { return site.Target < value; }); hit != branches.end() && hit->Target < limit; ++hit)
+        if ((hit->Source < start || hit->Source >= limit) && !(hit->Target == start && (callAtStart ? hit->Call : true))) return true;
+    return false;
+}
+
 std::optional<std::uint8_t> pushedRegister(const std::uint8_t* code, const Insn& insn) {
     if (insn.Length == 1 && code[0] >= 0x50 && code[0] <= 0x57 && code[0] != 0x50 + kRegRsp) return static_cast<std::uint8_t>(code[0] - 0x50);
     if (insn.Length == 2 && code[0] == 0x41 && code[1] >= 0x50 && code[1] <= 0x57) return static_cast<std::uint8_t>(code[1] - 0x50 + 8);
@@ -208,7 +220,10 @@ bool usesRspOutsideOperands(const std::uint8_t* code, const Insn& insn) {
     const bool b = (info.RexPrefix & 1) != 0;
     const bool r = (info.RexPrefix & 4) != 0;
     const auto reg = static_cast<std::uint8_t>((info.ModRmByte >> 3) & 7);
-    if (info.IsTwoByteOpcode) return info.Opcode == 0xc8 + kRegRsp && !b;
+    const auto mod = static_cast<std::uint8_t>(info.ModRmByte >> 6);
+    const auto rm = static_cast<std::uint8_t>(info.ModRmByte & 7);
+    if (info.IsTwoByteOpcode) return (info.Opcode == 0xc8 + kRegRsp && !b) || (info.Opcode >= 0x90 && info.Opcode <= 0x9f && info.HasModRm && mod == 3 && rm == kRegRsp && !b);
+    if (info.Opcode == 0xb0 + kRegRsp && info.RexPrefix != 0 && !b) return true;
     if ((info.Opcode == 0x90 + kRegRsp || info.Opcode == 0xb8 + kRegRsp) && !b) return true;
     return (info.Opcode == 0x63 || info.Opcode == 0x69 || info.Opcode == 0x6b) && info.HasModRm && reg == kRegRsp && !r;
 }
@@ -273,12 +288,16 @@ void frameSegment(
     const X64InstructionDecoder decoder;
 
     std::set<std::size_t> targets;
+    std::vector<BranchSite> branchSites;
     for (const auto& match : scanner->ScanCodeSection(seg, 0, seg.size())) {
         const auto info = decoder.DecodeInstruction(seg.data() + match.Offset, match.Length);
-        if (!info.HasBranchTarget || info.HasRipRelativeDisp || info.FlowKind == ControlFlowKind::Call) continue;
+        if (!info.HasBranchTarget || info.HasRipRelativeDisp) continue;
         const auto target = static_cast<std::int64_t>(match.Offset + match.Length) + info.BranchDisp;
-        if (target >= 0 && static_cast<std::size_t>(target) < seg.size()) targets.insert(static_cast<std::size_t>(target));
+        if (target < 0 || static_cast<std::size_t>(target) >= seg.size()) continue;
+        branchSites.push_back({static_cast<std::size_t>(target), static_cast<std::size_t>(match.Offset), info.FlowKind == ControlFlowKind::Call});
+        if (info.FlowKind != ControlFlowKind::Call) targets.insert(static_cast<std::size_t>(target));
     }
+    std::sort(branchSites.begin(), branchSites.end(), [](const BranchSite& left, const BranchSite& right) { return left.Target < right.Target; });
     std::vector<std::pair<std::size_t, std::size_t>> taken;
     for (const auto& site : existing) {
         if (site.Address < ph.MappedAddress || site.Address >= ph.MappedAddress + segSize) continue;
@@ -367,11 +386,7 @@ void frameSegment(
         if (exits.empty()) return "shrink-wrapped: no ret exit";
         for (std::size_t k = last; k < body.size(); ++k)
             if (!popped.contains(k) && pushesOrPops(at(k), body[k])) return "shrink-wrapped: push or pop inside the body";
-        std::set<std::size_t> internal;
-        for (std::size_t k = 0; k < body.size(); ++k)
-            if (const auto target = branchTarget(k)) internal.insert(body[*target].Offset);
-        for (auto hit = targets.upper_bound(start); hit != targets.end() && *hit < limit; ++hit)
-            if (!internal.contains(*hit)) return "shrink-wrapped: branch from outside into the body";
+        if (enteredFromOutside(branchSites, start, limit, false)) return "shrink-wrapped: branch from outside into the body";
         for (std::size_t k = 0; k < body.size(); ++k) {
             const auto target = branchTarget(k);
             if (!target) continue;
@@ -690,7 +705,8 @@ void frameSegment(
     }
 }
 
-std::vector<RedZoneDeadRange> deadRanges(const std::vector<std::uint8_t>& seg, const std::uint64_t base, const std::set<std::size_t>& targets, const std::size_t start, const std::size_t limit) {
+std::vector<RedZoneDeadRange> deadRanges(const std::vector<std::uint8_t>& seg, const std::uint64_t base, const std::vector<BranchSite>& branches, const std::size_t start, const std::size_t limit) {
+    if (enteredFromOutside(branches, start, limit, true)) return {};
     const auto scanner = MakeInstructionScanner();
     const X64InstructionDecoder decoder;
     const std::vector<std::uint8_t> code(seg.begin() + static_cast<std::ptrdiff_t>(start), seg.begin() + static_cast<std::ptrdiff_t>(limit));
@@ -707,7 +723,6 @@ std::vector<RedZoneDeadRange> deadRanges(const std::vector<std::uint8_t>& seg, c
     std::vector<std::vector<std::size_t>> next(count);
     std::vector<std::int64_t> effect(count, 0);
     std::vector<std::optional<std::int64_t>> reads(count);
-    std::set<std::size_t> internal;
     for (std::size_t k = 0; k < count; ++k) {
         const auto& insn = body[k];
         const auto flow = insn.Info.FlowKind;
@@ -716,7 +731,8 @@ std::vector<RedZoneDeadRange> deadRanges(const std::vector<std::uint8_t>& seg, c
             effect[k] = *adjustment;
         } else {
             const auto use = memoryUse(at(k), insn);
-            if (usesRspOutsideOperands(at(k), insn) || use.RegisterRsp || (use.RspBased && (use.Indexed || use.Address || at(k)[insn.Info.OpcodeOffset] == 0x62))) return {};
+            const bool bitIndexed = insn.Info.IsTwoByteOpcode && (insn.Info.Opcode == 0xa3 || insn.Info.Opcode == 0xab || insn.Info.Opcode == 0xb3 || insn.Info.Opcode == 0xbb);
+            if (usesRspOutsideOperands(at(k), insn) || use.RegisterRsp || (use.RspBased && (use.Indexed || use.Address || bitIndexed || at(k)[insn.Info.OpcodeOffset] == 0x62))) return {};
             if (pushedRegister(at(k), insn)) effect[k] = -8;
             else if (poppedRegister(at(k), insn)) { effect[k] = 8; reads[k] = 0; }
             else if (pushesOrPops(at(k), insn)) return {};
@@ -730,7 +746,6 @@ std::vector<RedZoneDeadRange> deadRanges(const std::vector<std::uint8_t>& seg, c
             const auto hit = index.find(static_cast<std::size_t>(target));
             if (hit == index.end()) return {};
             next[k].push_back(hit->second);
-            internal.insert(hit->first);
             if (flow == ControlFlowKind::UnconditionalJump) continue;
         } else if (flow != ControlFlowKind::Sequential) {
             return {};
@@ -738,9 +753,6 @@ std::vector<RedZoneDeadRange> deadRanges(const std::vector<std::uint8_t>& seg, c
         if (k + 1 == count || body[k + 1].Offset != insn.Offset + insn.Length) return {};
         next[k].push_back(k + 1);
     }
-    for (auto hit = targets.upper_bound(start); hit != targets.end() && *hit < limit; ++hit)
-        if (!internal.contains(*hit)) return {};
-
     std::vector<std::optional<std::int64_t>> depth(count);
     depth[0] = 0;
     std::vector<std::size_t> pending{0};
@@ -787,22 +799,23 @@ std::vector<std::vector<RedZoneDeadRange>> FindRedZoneDeadRanges(
         const auto segSize = static_cast<std::size_t>(ph.FileSize);
         if (segOffset > fileBytes.size() || segSize > fileBytes.size() - segOffset) continue;
         const std::vector<std::uint8_t> seg(fileBytes.begin() + static_cast<std::ptrdiff_t>(segOffset), fileBytes.begin() + static_cast<std::ptrdiff_t>(segOffset + segSize));
-        std::optional<std::set<std::size_t>> targets;
+        std::optional<std::vector<BranchSite>> branches;
         for (std::size_t index = 0; index < leaves.size(); ++index) {
             const auto& leaf = leaves[index];
             if (leaf.Begin < ph.MappedAddress || leaf.End <= leaf.Begin || leaf.End - ph.MappedAddress > segSize) continue;
-            if (!targets) {
-                targets.emplace();
+            if (!branches) {
+                branches.emplace();
                 const auto scanner = MakeInstructionScanner();
                 const X64InstructionDecoder decoder;
                 for (const auto& match : scanner->ScanCodeSection(seg, 0, seg.size())) {
                     const auto info = decoder.DecodeInstruction(seg.data() + match.Offset, match.Length);
                     if (!info.HasBranchTarget || info.HasRipRelativeDisp) continue;
                     const auto target = static_cast<std::int64_t>(match.Offset + match.Length) + info.BranchDisp;
-                    if (target >= 0 && static_cast<std::size_t>(target) < seg.size()) targets->insert(static_cast<std::size_t>(target));
+                    if (target >= 0 && static_cast<std::size_t>(target) < seg.size()) branches->push_back({static_cast<std::size_t>(target), static_cast<std::size_t>(match.Offset), info.FlowKind == ControlFlowKind::Call});
                 }
+                std::sort(branches->begin(), branches->end(), [](const BranchSite& left, const BranchSite& right) { return left.Target < right.Target; });
             }
-            result[index] = deadRanges(seg, ph.MappedAddress, *targets, static_cast<std::size_t>(leaf.Begin - ph.MappedAddress), static_cast<std::size_t>(leaf.End - ph.MappedAddress));
+            result[index] = deadRanges(seg, ph.MappedAddress, *branches, static_cast<std::size_t>(leaf.Begin - ph.MappedAddress), static_cast<std::size_t>(leaf.End - ph.MappedAddress));
         }
     }
     return result;
