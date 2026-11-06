@@ -17,6 +17,7 @@ struct ConversionOptions {
     bool ToRosetta = false;
     bool FrameRedZone = false;
     bool FrameShrinkWrapped = false;
+    bool PreciseRedZoneGuard = false;
     bool SkipSyscallCheck = false;
     bool TrapSdkSyscallStubs = false;
     bool LazyBinding = false;

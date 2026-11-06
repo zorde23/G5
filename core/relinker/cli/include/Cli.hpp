@@ -19,6 +19,7 @@ struct Args {
     bool toRosetta = false;
     bool frameRedZone = false;
     bool frameShrinkWrapped = false;
+    bool preciseRedZoneGuard = false;
     bool writeRegistry = false;
     bool toWindows = false;
     bool toMacos = false;

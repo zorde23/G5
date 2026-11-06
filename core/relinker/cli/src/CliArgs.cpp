@@ -13,7 +13,7 @@
 namespace Cli {
 
 const char* Usage() {
-    return "Usage: relinker [--help] [--version] [--windows | --macos] [--windows-diagnostics] [--windows-gui] [--trace-imports] [--windows-fixed-base <address>] [--linux-fixed-base <address>] [--macos-fixed-base <address>] [--skip-syscall-check | --trap-sdk-syscall-stubs] [--skip-sce-module | --sce-module-path <path>] [--exclude-sce-module <file>]... [--module-dir <dir>]... [--executable <path>]... [--to-intel] [--to-rosetta] [--frame-red-zone [--frame-shrink-wrapped]] [unused-filter=0|1|2] [--registry] [--rpath <path>] [--lazy-binding] [--autorun] [--patches <file> | --no-patches] <input.elf> <output.elf>\n"
+    return "Usage: relinker [--help] [--version] [--windows | --macos] [--windows-diagnostics] [--windows-gui] [--trace-imports] [--windows-fixed-base <address>] [--linux-fixed-base <address>] [--macos-fixed-base <address>] [--skip-syscall-check | --trap-sdk-syscall-stubs] [--skip-sce-module | --sce-module-path <path>] [--exclude-sce-module <file>]... [--module-dir <dir>]... [--executable <path>]... [--to-intel] [--to-rosetta] [--frame-red-zone [--frame-shrink-wrapped] [--precise-red-zone-guard]] [unused-filter=0|1|2] [--registry] [--rpath <path>] [--lazy-binding] [--autorun] [--patches <file> | --no-patches] <input.elf> <output.elf>\n"
            "       relinker --verify-patches <file> [--verify-output] [--skip-sce-module | --sce-module-path <path>] [--exclude-sce-module <file>]... [--module-dir <dir>]... [--executable <path>]... <path>\n"
            "Example: relinker input.elf output.elf";
 }
@@ -22,7 +22,7 @@ namespace {
 
 constexpr std::string_view kVerifyRejectedOptions[] = {
     "--windows", "--macos", "--windows-gui", "--windows-diagnostics", "--windows-fixed-base", "--trace-imports", "--linux-fixed-base", "--macos-fixed-base",
-    "--to-intel", "--to-rosetta", "--frame-red-zone", "--frame-shrink-wrapped", "--skip-syscall-check", "--trap-sdk-syscall-stubs", "unused-filter=",
+    "--to-intel", "--to-rosetta", "--frame-red-zone", "--frame-shrink-wrapped", "--precise-red-zone-guard", "--skip-syscall-check", "--trap-sdk-syscall-stubs", "unused-filter=",
     "--rpath", "--registry", "--lazy-binding", "--autorun", "--patches", "--no-patches",
 };
 
@@ -112,6 +112,8 @@ Args ParseArgs(int argc, char* argv[]) {
             args.frameRedZone = true;
         } else if (arg == "--frame-shrink-wrapped") {
             args.frameShrinkWrapped = true;
+        } else if (arg == "--precise-red-zone-guard") {
+            args.preciseRedZoneGuard = true;
         } else if (arg == "--to-rosetta") {
             args.toRosetta = true;
             args.toIntel = true;
@@ -204,6 +206,8 @@ Args ParseArgs(int argc, char* argv[]) {
         throw std::runtime_error("--frame-red-zone requires --windows");
     if (args.frameShrinkWrapped && !args.frameRedZone)
         throw std::runtime_error("--frame-shrink-wrapped requires --frame-red-zone");
+    if (args.preciseRedZoneGuard && !args.frameRedZone)
+        throw std::runtime_error("--precise-red-zone-guard requires --frame-red-zone");
 
     if (args.windowsGui && !args.toWindows)
         throw std::runtime_error("--windows-gui requires --windows");

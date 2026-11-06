@@ -39,6 +39,17 @@ struct RedZoneFrameReport {
     std::vector<RedZoneLeaf> Leaves;
 };
 
+struct RedZoneDeadRange {
+    std::uint64_t Begin = 0;
+    std::uint64_t End = 0;
+};
+
+std::vector<std::vector<RedZoneDeadRange>> FindRedZoneDeadRanges(
+    const std::vector<std::uint8_t>& fileBytes,
+    const std::vector<Domain::ProgramHeader>& codeSegments,
+    const std::vector<RedZoneFunction>& leaves
+);
+
 struct RedZoneDisplacement {
     Domain::FileByteOffset Offset;
     std::vector<std::uint8_t> Bytes;

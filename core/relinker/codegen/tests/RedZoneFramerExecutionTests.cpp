@@ -3,6 +3,7 @@
 #define NOMINMAX
 #include <windows.h>
 #endif
+#include <codegen/IInstructionScanner.hpp>
 #include <codegen/x86/RedZoneFramer.hpp>
 #include <codegen/x86/StubBodyBuilder.hpp>
 #include <algorithm>
@@ -39,6 +40,8 @@ constexpr std::uint64_t kA = 0x1111, kB = 0x2222, kC = 0x3333, kD = 0x4444;
 std::uint8_t* arena = nullptr;
 volatile std::sig_atomic_t steps = 0;
 volatile std::sig_atomic_t outsideSteps = 0;
+bool clobberOnly[kArenaBytes] = {};
+volatile bool clobberMasked = false;
 
 #ifdef _WIN32
 DWORD steppingThread = 0;
@@ -61,7 +64,7 @@ LONG CALLBACK clobberBelowRsp(EXCEPTION_POINTERS* exception) {
         outsideSteps = outsideSteps + 1;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
-    std::memset(reinterpret_cast<void*>(registers.Rsp - 0x80), kClobber, 0x80);
+    if (!clobberMasked || clobberOnly[registers.Rip - base]) std::memset(reinterpret_cast<void*>(registers.Rsp - 0x80), kClobber, 0x80);
     registers.EFlags |= 0x100u;
     steps = steps + 1;
     return EXCEPTION_CONTINUE_EXECUTION;
@@ -77,7 +80,7 @@ void clobberBelowRsp(int, siginfo_t*, void* context) {
         outsideSteps = outsideSteps + 1;
         return;
     }
-    std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(registers[REG_RSP]) - 0x80), kClobber, 0x80);
+    if (!clobberMasked || clobberOnly[rip - base]) std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(registers[REG_RSP]) - 0x80), kClobber, 0x80);
     steps = steps + 1;
 }
 #endif
@@ -431,6 +434,57 @@ std::string hex(const std::uint64_t value) {
     return text.str();
 }
 
+struct Precision {
+    std::size_t Dead = 0;
+    std::size_t Broken = 0;
+};
+
+Precision checkDeadRangesAreNeverOptimistic(const std::vector<Leaf>& leaves) {
+    const auto image = place(leaves);
+    load(image, false);
+    const auto base = reinterpret_cast<std::uint64_t>(arena);
+    const std::vector<Domain::ProgramHeader> segments{{1, 5, 0, base, base, image.Bytes.size(), image.Bytes.size(), 16}};
+    std::vector<Codegen::RedZoneFunction> functions;
+    for (std::size_t index = 0; index < leaves.size(); ++index) functions.push_back({base + image.Starts[index], base + image.Ends[index]});
+    const auto dead = Codegen::FindRedZoneDeadRanges(image.Bytes, segments, functions);
+    const auto scanner = Codegen::MakeInstructionScanner();
+    Precision precision;
+    for (std::size_t index = 0; index < leaves.size(); ++index) {
+        const auto& leaf = leaves[index];
+        const auto isDead = [&](const std::uint64_t address) { return std::any_of(dead[index].begin(), dead[index].end(), [&](const auto& range) { return range.Begin <= address && address < range.End; }); };
+        std::vector<std::size_t> deadOffsets;
+        for (const auto& match : scanner->ScanCodeSection(leaf.Code, 0, leaf.Code.size())) {
+            const auto offset = image.Starts[index] + static_cast<std::size_t>(match.Offset);
+            std::fill_n(clobberOnly, kArenaBytes, false);
+            clobberOnly[offset] = true;
+            clobberMasked = true;
+            const auto result = run(image.Starts[index], true);
+            clobberMasked = false;
+            if (isDead(base + offset)) { deadOffsets.push_back(offset); ++precision.Dead; }
+            if (result.Result == leaf.Expected) continue;
+            ++precision.Broken;
+            require(!isDead(base + offset), std::string(leaf.Name) + ": writes below rsp at +" + hex(match.Offset) + " changed the result to " + hex(result.Result) + ", but the analysis calls that instruction dead");
+        }
+        std::fill_n(clobberOnly, kArenaBytes, false);
+        for (const auto offset : deadOffsets) clobberOnly[offset] = true;
+        clobberMasked = true;
+        const auto all = run(image.Starts[index], true);
+        clobberMasked = false;
+        require(all.Result == leaf.Expected, std::string(leaf.Name) + ": writes below rsp at every instruction called dead changed the result to " + hex(all.Result));
+        std::cout << leaf.Name << ": " << deadOffsets.size() << " instructions dead, survived writes below rsp at all of them\n";
+    }
+    return precision;
+}
+
+std::vector<Leaf> leavesWithADeadTail() {
+    return {
+        {"leaf whose spill is last read in a loop, then adds two registers before its pops", {
+            0x48, 0x85, 0xff, 0x74, 0x21, 0x53, 0x41, 0x56, 0x48, 0x89, 0x74, 0x24, 0xf8, 0x31, 0xc0, 0xb9, 0x04, 0x00, 0x00, 0x00,
+            0x48, 0x03, 0x44, 0x24, 0xf8, 0xff, 0xc9, 0x75, 0xf7, 0x48, 0x01, 0xf8, 0x48, 0x01, 0xd8, 0x41, 0x5e, 0x5b, 0xc3,
+        }, 4 * kB + kA + kD},
+    };
+}
+
 void runsAShrinkWrappedLeafThroughItsTakenEarlyExit() {
     const std::vector<std::uint8_t> code{
         0x89, 0xd0, 0x81, 0xff, 0x11, 0x11, 0x00, 0x00, 0x74, 0x14, 0x53, 0x41, 0x56, 0x41, 0x57,
@@ -488,6 +542,16 @@ int main() {
         require(widened.WidenedPrologues == 8 && widened.WidenedExits == 9 && widened.WidenedOperands == 12, "the leaves with short prologues and exits were framed with " + std::to_string(widened.WidenedPrologues) + " widened prologues, " + std::to_string(widened.WidenedExits) + " widened exits and " + std::to_string(widened.WidenedOperands) + " rsp operands in them, not 8, 9 and 12");
         const auto shrinkWrapped = runLeaves(shrinkWrappedLeaves(), true);
         runsAShrinkWrappedLeafThroughItsTakenEarlyExit();
+        Precision precision;
+        for (const auto& leaves : {framedLeaves(), stubbedLeaves(), backwardStubbedLeaves(), widenedLeaves(), shrinkWrappedLeaves(), leavesWithADeadTail()}) {
+            const auto checked = checkDeadRangesAreNeverOptimistic(leaves);
+            precision.Dead += checked.Dead;
+            precision.Broken += checked.Broken;
+        }
+        const auto tail = checkDeadRangesAreNeverOptimistic(leavesWithADeadTail());
+        require(tail.Dead == 5, "the leaf with a dead tail had " + std::to_string(tail.Dead) + " instructions called dead, not its 5 after the loop");
+        require(precision.Broken > 0 && precision.Dead > 0, "the precision check saw " + std::to_string(precision.Broken) + " instructions where writes below rsp break a leaf and " + std::to_string(precision.Dead) + " called dead, so it proves nothing");
+        std::cout << "dead-range check: " << precision.Dead << " instructions called dead, " << precision.Broken << " where writes below rsp break the leaf, none of them called dead\n";
         require(shrinkWrapped.ShrinkWrapped == 2, "only " + std::to_string(shrinkWrapped.ShrinkWrapped) + " of 2 leaves pushing after an early exit were framed after their pushes");
         std::cout << "red-zone framer execution tests passed\n";
         return 0;

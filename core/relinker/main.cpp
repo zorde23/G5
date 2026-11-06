@@ -63,6 +63,7 @@ ConvertedExecutable Convert(const Cli::Args& args, const std::string& inputPath,
     options.ToRosetta = args.toRosetta;
     options.FrameRedZone = args.frameRedZone;
     options.FrameShrinkWrapped = args.frameShrinkWrapped;
+    options.PreciseRedZoneGuard = args.preciseRedZoneGuard;
     options.SkipSyscallCheck = args.skipSyscallCheck;
     options.TrapSdkSyscallStubs = args.trapSdkSyscallStubs;
     options.UnusedFilterLevel = args.unusedFilterLevel;

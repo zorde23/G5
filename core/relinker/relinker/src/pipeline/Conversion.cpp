@@ -133,7 +133,9 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
         if (report.ShrinkWrapped != 0) { std::ostringstream message; message << "Red-zone framing: " << report.ShrinkWrapped << " of them push their registers after an early exit and are framed after the pushes\n"; inputProgress.Message(message.str()); }
         if (report.WidenedPrologues != 0 || report.WidenedExits != 0) { std::ostringstream message; message << "Red-zone framing: " << report.WidenedPrologues << " prologues widened over the instructions after them and " << report.WidenedExits << " exits over the instructions before them, as they were shorter than a jump (" << report.WidenedOperands << " rsp operands moved into their stubs)\n"; inputProgress.Message(message.str()); }
         for (const auto& [reason, count] : report.Skipped) { std::ostringstream message; message << "Red-zone framing: skipped " << count << ": " << reason << '\n'; inputProgress.Message(message.str()); }
-        redZoneTable = RedZoneGuardTable(sourceBytes, headers, trampolines, &report);
+        RedZoneGuardStats guard;
+        redZoneTable = RedZoneGuardTable(sourceBytes, headers, trampolines, &report, options.PreciseRedZoneGuard, &guard);
+        if (options.PreciseRedZoneGuard) { std::ostringstream message; message << "Red-zone guard: " << guard.LeavesWithDeadCode << " of " << guard.Leaves << " unframed leaves have code where nothing below RSP is read again; " << guard.DeadBytes << " of " << guard.LeafBytes << " bytes left out of the guard table\n"; inputProgress.Message(message.str()); }
         trampolines.insert(trampolines.end(), std::make_move_iterator(framed.begin()), std::make_move_iterator(framed.end()));
     }
     GamePatch::CheckOverlaps(options.TargetName, patchedRanges, {.RelinkPatches = result.Patches, .RelaData = result.DynamicSection.RelaData, .RelaPltData = result.DynamicSection.RelaPltData, .RedZoneSites = std::span<const Codegen::TrampolineSite>(trampolines).subspan(intelSites), .RedZoneDisplacements = displacements});

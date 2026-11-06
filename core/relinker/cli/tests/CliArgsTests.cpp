@@ -209,6 +209,10 @@ void frameRedZoneRequiresWindows() {
     require(!ok.frameShrinkWrapped, "--frame-shrink-wrapped was on without being asked");
     const auto shrinkWrapped = parse({"--windows", "--frame-red-zone", "--frame-shrink-wrapped", "input.elf", "output.elf"});
     require(shrinkWrapped.frameRedZone && shrinkWrapped.frameShrinkWrapped, "--frame-shrink-wrapped with --frame-red-zone was rejected");
+    expectThrows({"--windows", "--precise-red-zone-guard", "input.elf", "output.elf"}, "--precise-red-zone-guard requires --frame-red-zone");
+    require(!ok.preciseRedZoneGuard, "--precise-red-zone-guard was on without being asked");
+    const auto precise = parse({"--windows", "--frame-red-zone", "--precise-red-zone-guard", "input.elf", "output.elf"});
+    require(precise.frameRedZone && precise.preciseRedZoneGuard, "--precise-red-zone-guard with --frame-red-zone was rejected");
 }
 
 void missingPositionals() {
@@ -334,7 +338,7 @@ void verifyMode() {
     expectThrows({"--verify-patches", "p.toml", "--verify-output", "out.elf", "--exclude-sce-module", "x.prx"}, noEffect);
     expectThrows({"--verify-patches", "p.toml", "--verify-output", "out.elf", "--skip-sce-module"}, noEffect);
     expectThrows({"--verify-patches", "p.toml", "in.elf", "extra"}, "unexpected argument: extra");
-    for (const auto* option : {"--windows", "--macos", "--to-intel", "--to-rosetta", "--frame-red-zone", "--frame-shrink-wrapped", "--trace-imports", "--lazy-binding", "--autorun", "--registry", "--skip-syscall-check", "--no-patches"})
+    for (const auto* option : {"--windows", "--macos", "--to-intel", "--to-rosetta", "--frame-red-zone", "--frame-shrink-wrapped", "--precise-red-zone-guard", "--trace-imports", "--lazy-binding", "--autorun", "--registry", "--skip-syscall-check", "--no-patches"})
         expectThrows({"--verify-patches", "p.toml", option, "in.elf"}, std::string(option) + " cannot be used with --verify-patches");
     expectThrows({"--verify-patches", "p.toml", "--rpath", "x", "in.elf"}, "--rpath cannot be used with --verify-patches");
     expectThrows({"--verify-patches", "p.toml", "--patches", "q.toml", "in.elf"}, "--patches cannot be used with --verify-patches");

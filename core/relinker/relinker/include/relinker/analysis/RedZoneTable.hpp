@@ -10,7 +10,14 @@
 
 namespace Relinker {
 
-std::string RedZoneGuardTable(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::vector<Codegen::TrampolineSite>& existing, const Codegen::RedZoneFrameReport* framed);
+struct RedZoneGuardStats {
+    std::size_t Leaves = 0;
+    std::size_t LeavesWithDeadCode = 0;
+    std::uint64_t LeafBytes = 0;
+    std::uint64_t DeadBytes = 0;
+};
+
+std::string RedZoneGuardTable(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::vector<Codegen::TrampolineSite>& existing, const Codegen::RedZoneFrameReport* framed, bool precise = false, RedZoneGuardStats* stats = nullptr);
 
 }
 

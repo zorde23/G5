@@ -38,7 +38,7 @@ void AddUncovered(const std::vector<std::uint8_t>& bytes, const Domain::ProgramH
 
 }
 
-std::string RedZoneGuardTable(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::vector<Codegen::TrampolineSite>& existing, const Codegen::RedZoneFrameReport* framed) {
+std::string RedZoneGuardTable(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::vector<Codegen::TrampolineSite>& existing, const Codegen::RedZoneFrameReport* framed, const bool precise, RedZoneGuardStats* stats) {
     std::vector<Domain::ProgramHeader> codeSegments;
     std::uint64_t firstAddress = std::numeric_limits<std::uint64_t>::max();
     for (const auto& header : headers) {
@@ -63,9 +63,30 @@ std::string RedZoneGuardTable(const std::vector<std::uint8_t>& bytes, const std:
         std::vector<Codegen::RedZoneDisplacement> displacements;
         Codegen::FrameRedZoneFunctions(bytes, codeSegments, functions, existing, scanned, displacements);
     }
+    std::vector<Codegen::RedZoneLeaf> listed;
     for (const auto& leaf : (framed != nullptr ? *framed : scanned).Leaves) {
-        if (framed == nullptr) ranges.push_back({leaf.Begin, leaf.End, "module not framed"});
-        else if (!leaf.Reason.empty()) ranges.push_back({leaf.Begin, leaf.End, leaf.Reason});
+        if (framed == nullptr) listed.push_back({leaf.Begin, leaf.End, "module not framed"});
+        else if (!leaf.Reason.empty()) listed.push_back(leaf);
+    }
+    std::vector<std::vector<Codegen::RedZoneDeadRange>> dead(listed.size());
+    if (precise) {
+        std::vector<Codegen::RedZoneFunction> leaves;
+        for (const auto& leaf : listed) leaves.push_back({leaf.Begin, leaf.End});
+        dead = Codegen::FindRedZoneDeadRanges(bytes, codeSegments, leaves);
+    }
+    for (std::size_t index = 0; index < listed.size(); ++index) {
+        auto cursor = listed[index].Begin;
+        for (const auto& range : dead[index]) {
+            if (range.Begin > cursor) ranges.push_back({cursor, range.Begin, listed[index].Reason});
+            cursor = std::max(cursor, range.End);
+        }
+        if (cursor < listed[index].End) ranges.push_back({cursor, listed[index].End, listed[index].Reason});
+        if (stats != nullptr) {
+            ++stats->Leaves;
+            if (!dead[index].empty()) ++stats->LeavesWithDeadCode;
+            for (const auto& range : dead[index]) stats->DeadBytes += range.End - range.Begin;
+            stats->LeafBytes += listed[index].End - listed[index].Begin;
+        }
     }
     for (const auto& segment : codeSegments) AddUncovered(bytes, segment, functions, ranges);
 
