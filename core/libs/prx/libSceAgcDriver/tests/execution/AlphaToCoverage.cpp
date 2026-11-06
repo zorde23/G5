@@ -427,7 +427,7 @@ void DitheredCoverage(AgcDriver::VulkanDevice& device, std::uint32_t samples, st
 void UnditheredFourSampleCoverage(AgcDriver::VulkanDevice& device) {
     const ColorTargetLayout layout(Width, Height, ColorTileMode::RenderTarget, 8);
     constexpr std::uint32_t samples = 4;
-    for (const float alpha : {0.0f, 0.5f, 1.0f}) {
+    for (const float alpha : {0.0f, 0.25f, 0.4999f, 0.5f, 0.75f, 1.0f}) {
         Block source(layout.Bytes() * samples);
         std::memset(source.data, 0, source.bytes);
         const auto multisampled = DecodeTarget(source, samples);
@@ -443,8 +443,7 @@ void UnditheredFourSampleCoverage(AgcDriver::VulkanDevice& device) {
         for (std::uint32_t y = 0; y < Height; ++y) {
             for (std::uint32_t x = 0; x < Width; ++x) {
                 const auto actual = FromHalf(stored[layout.Offset(x, y) / 2u]);
-                const bool covered = actual == 0.25f || actual == 0.5f || actual == 0.75f || actual == 1.0f;
-                const bool match = x >= ScissorWidth ? actual == 0.0f : alpha == 0.0f ? actual == 0.0f : alpha == 1.0f ? actual == 1.0f : covered;
+                const bool match = actual == (x < ScissorWidth && alpha >= 0.5f ? 1.0f : 0.0f);
                 if (match) continue;
                 char detail[160];
                 std::snprintf(detail, sizeof(detail), "undithered four-sample coverage alpha %.2g pixel (%u,%u): resolved %.9g", alpha, x, y, actual);
