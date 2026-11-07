@@ -136,7 +136,7 @@ void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path
     }
     const auto stages = PrepareGraphicsStages(prepared, target);
     Require(stages.size() == (tessellation ? 4u : 2u), "graphics preparation compiled the wrong stages");
-    if (!mesh && !tessellation && target.registrationModules) {
+    if (!mesh && !tessellation && target.registrationModules && target.registrationWordLimit != 0u) {
         const auto prebuild = [&](const std::vector<PreparedGraphicsStage>& group, std::initializer_list<std::size_t> picked) {
             std::vector<AgcDriver::Graphics::CompiledShader> shaders;
             for (const auto index : picked) {
@@ -351,7 +351,7 @@ void PrebuildPolicyReadback(AgcDriver::VulkanDevice& device, bool disabled) {
     Require(stages.size() == 2u, "prebuild policy lost a required graphics stage");
     for (const auto& stage : stages) {
         Require(stage.entry.handle != nullptr && stage.snapshot != nullptr, "prebuild policy lost a required source handle");
-        Require(disabled ? stage.registration == nullptr : stage.registration != nullptr, "prebuild policy retained or skipped registration-default materialization");
+        Require(disabled || target.registrationWordLimit == 0u ? stage.registration == nullptr : stage.registration != nullptr, "prebuild policy retained or skipped registration-default materialization");
         stage.snapshot->prepared->entries.push_back(stage.entry);
     }
     std::vector<LinkedProgram> linked;

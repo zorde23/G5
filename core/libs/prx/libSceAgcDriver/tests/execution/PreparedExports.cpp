@@ -85,7 +85,7 @@ void Run(AgcDriver::VulkanDevice& device, bool integer) {
             request.useCache = cached;
             const auto materialized = MaterializeShader(request, *capture, *handle);
             Require(materialized->spirv.data() == pixel->spirv.data() && materialized->PipelineVariantId() == pixel->PipelineVariantId(), "export mapping did not reuse its specialized module");
-            if (device.Target().registrationModules) {
+            if (device.Target().registrationModules && device.Target().registrationWordLimit != 0u) {
                 Require(materialized->PipelineVariantId() == first->PipelineVariantId(), "registration modules: the export mapping specialized the fragment module");
                 continue;
             }

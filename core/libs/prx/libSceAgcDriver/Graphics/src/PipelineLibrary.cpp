@@ -3,7 +3,9 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <functional>
@@ -283,6 +285,15 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     }
     lock.lock();
     ++device.counters.linked;
+    static const bool reportLibraries = std::getenv("APS5_GPU_REGISTRATION_WORD_LIMIT") != nullptr;
+    if (reportLibraries) {
+        static auto lastReport = std::chrono::steady_clock::now();
+        if (const auto now = std::chrono::steady_clock::now(); now - lastReport >= std::chrono::seconds(60)) {
+            lastReport = now;
+            const auto& parts = device.parts;
+            std::fprintf(stderr, "[gpl-libraries] %zu libraries, %llu linked pipelines (vertex-input %zu, pre-rasterization %zu, fragment %zu, fragment-output %zu, %zu layouts, %zu retained modules, %llu optimized)\n", parts[0].size() + parts[1].size() + parts[2].size() + parts[3].size(), static_cast<unsigned long long>(device.counters.linked), parts[0].size(), parts[1].size(), parts[2].size(), parts[3].size(), device.layouts.size(), device.modules.size(), static_cast<unsigned long long>(device.counters.optimized));
+        }
+    }
     if (optimize && optimized != nullptr) {
         auto slot = std::make_shared<OptimizedPipeline>();
         slot->device = context.device;
