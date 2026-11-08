@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
@@ -20,6 +21,7 @@ bool Driver::captureStable(std::span<const ShaderRecompiler::MemoryRegion> captu
     for (const auto& region : captured) {
         if (!stable) break;
         if (ShaderMemory::FinisherReadQueued(3, region.guestAddress, region.bytes.size())) ShaderMemory::NoteFinisherRead(region.guestAddress, region.bytes.data(), region.bytes.size());
+        if (DrawPipeline::FinisherWaitQueue0() && DrawFinisher::OnFinisherThread() && DrawPipeline::Queue0().WaitRetired(region.guestAddress, region.bytes.size())) pending.Load();
         known.resize(region.bytes.size());
         const auto policy = validateSkipEnabled() ? classifyPendingWrite(region.guestAddress, region.bytes.size(), reason, pending, known) : Policy::Sync;
         if (policy == Policy::KnownValue || policy == Policy::VerifyKnownValue) {

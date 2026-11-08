@@ -29,6 +29,15 @@ public:
         std::size_t items = 0;
         std::vector<Range> writes;
     };
+    struct QueuedWrite {
+        bool found = false;
+        bool draw = false;
+        std::uint32_t opcode = 0;
+        std::uint64_t labelAddress = 0;
+        std::uint64_t sequence = 0;
+        std::size_t index = 0;
+        Range write{};
+    };
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
 
     static DrawPipeline& Queue0();
@@ -50,6 +59,15 @@ public:
     std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
     bool Overlaps(std::uint64_t address, std::size_t bytes);
     bool OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+    static bool FinisherWaitQueue0();
+    static bool FinisherQueuedBytes();
+    QueuedWrite FirstQueuedWrite(std::uint64_t address, std::size_t bytes);
+    bool WaitRetired(std::span<const Range> ranges);
+    bool WaitRetired(std::uint64_t address, std::size_t bytes);
+    bool QueuedBytes(std::uint64_t address, std::span<std::byte> bytes);
+    std::uint64_t TakeFinisherWaits() { return finisherWaits.exchange(0, std::memory_order_relaxed); }
+    std::uint64_t TakeFinisherKnown() { return finisherKnown.exchange(0, std::memory_order_relaxed); }
+    void NoteFinisherKnown() { finisherKnown.fetch_add(1, std::memory_order_relaxed); }
     Watch WatchWrites();
     bool WrittenSince(const Watch& watch, const std::vector<Range>& reads);
     std::uint64_t Retired() const { return retiredItems.load(std::memory_order_acquire); }
@@ -71,6 +89,7 @@ private:
         std::vector<std::byte> labelBytes;
         std::vector<Range> reads;
         bool draw = false;
+        std::uint32_t opcode = 0;
     };
     DrawPipeline() = default;
     void run();
@@ -91,6 +110,11 @@ private:
     std::uint64_t reportedDecodeDrains = 0;
     std::uint32_t idleWaiters = 0;
     std::uint32_t fullWaiters = 0;
+    std::uint32_t retireWaiters = 0;
+    std::atomic<std::uint64_t> queuedLow{0};
+    std::atomic<std::uint64_t> queuedHigh{~std::uint64_t{0}};
+    std::atomic<std::uint64_t> finisherWaits{0};
+    std::atomic<std::uint64_t> finisherKnown{0};
     std::uint64_t idleNotifies = 0;
     std::size_t resumeAt = 0;
     bool committerWaiting = false;

@@ -319,6 +319,7 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
         const auto address = store->address;
         std::vector<std::byte> bytes(store->Bytes().begin(), store->Bytes().end());
         const auto size = bytes.size();
+        auto queuedBytes = DrawPipeline::FinisherQueuedBytes() ? bytes : std::vector<std::byte>{};
         const bool metadataFill = Pm4::DmaDestination(packet) != 1;
         const auto fillAddress = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
         const auto fillBytes = packet[6] & 0x3ffffffu;
@@ -330,7 +331,7 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
                 Graphics::NoteColorMetadataFill(fillAddress, fillBytes, pattern);
             }
             commitDmaStore(queue, address, bytes);
-        }, {{address, address + size}});
+        }, {{address, address + size}}, queuedBytes.empty() ? 0 : address, std::move(queuedBytes));
         return true;
     }
     if (Pm4::DmaSource(packet) == 0 || Pm4::DmaSource(packet) == 3) Graphics::RequireNoMultisampleTarget(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), packet[6] & 0x3ffffffu, "a DMA copy");

@@ -54,6 +54,16 @@ bool verifyFinisherReads() {
     return enabled;
 }
 
+const auto driverLoaded = std::chrono::steady_clock::now();
+
+double finisherReadDetailAfterSeconds() {
+    static const double seconds = [] {
+        const char* text = std::getenv("APS5_VERIFY_FINISHER_READS_DETAIL_AFTER_S");
+        return text == nullptr ? 0.0 : std::strtod(text, nullptr);
+    }();
+    return seconds;
+}
+
 struct FinisherReadCounts {
     std::array<std::atomic<std::uint64_t>, 5> overlaps{};
     std::atomic<std::uint64_t> draws{0};
@@ -69,8 +79,11 @@ FinisherReadCounts& finisherReadCounts() {
     return counts;
 }
 
-bool finisherReadQueued(unsigned site, std::uint64_t address, std::size_t bytes) {
-    if (bytes == 0 || !DrawFinisher::OnFinisherThread() || !DrawPipeline::Queue0().Overlaps(address, bytes)) return false;
+bool finisherReadQueued(unsigned site, std::uint64_t address, std::size_t bytes, ShaderMemory::FinisherReadOrigin& origin) {
+    if (bytes == 0 || !DrawFinisher::OnFinisherThread()) return false;
+    const auto hit = DrawPipeline::Queue0().FirstQueuedWrite(address, bytes);
+    if (!hit.found) return false;
+    origin = {site, true, hit.draw, hit.opcode, hit.labelAddress, hit.sequence, hit.index, hit.write.first, hit.write.second};
     finisherReadCounts().overlaps[site].fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -82,7 +95,9 @@ void checkFinisherReads(std::span<const ShaderMemory::FinisherRead> reads) {
     for (const auto& read : reads) {
         if (GuestMemory::EqualsCommitted(read.address, read.bytes)) continue;
         counts.stale.fetch_add(1, std::memory_order_relaxed);
-        if (counts.reported.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[finisher-reads] stale: 0x%llx+0x%zx read by the finisher differs from the committed bytes before its draw\n", static_cast<unsigned long long>(read.address), read.bytes.size());
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - driverLoaded).count() < finisherReadDetailAfterSeconds() || counts.reported.fetch_add(1, std::memory_order_relaxed) >= 20) continue;
+        const auto& origin = read.origin;
+        std::fprintf(stderr, "[finisher-reads] stale: 0x%llx+0x%zx read by the finisher at R%u differs from the committed bytes before its draw; queued at read: %s item #%llu (index %zu), opcode 0x%x, label 0x%llx, write [0x%llx, 0x%llx)\n", static_cast<unsigned long long>(read.address), read.bytes.size(), origin.site, origin.found ? (origin.draw ? "draw" : "non-draw") : "no", static_cast<unsigned long long>(origin.sequence), origin.index, origin.opcode, static_cast<unsigned long long>(origin.labelAddress), static_cast<unsigned long long>(origin.writeBegin), static_cast<unsigned long long>(origin.writeEnd));
     }
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     auto last = counts.lastReport.load(std::memory_order_relaxed);
@@ -94,7 +109,9 @@ void checkFinisherReads(std::span<const ShaderMemory::FinisherRead> reads) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto r1 = take(counts.overlaps[1]), r2 = take(counts.overlaps[2]), r3 = take(counts.overlaps[3]), r4 = take(counts.overlaps[4]);
     const auto draws = take(counts.draws), recorded = take(counts.recorded), checked = take(counts.checked), stale = take(counts.stale);
-    std::fprintf(stderr, "[finisher-reads] 10 s: overlaps at read R1 %llu, R2 %llu, R3 %llu, R4 %llu; draws with recorded reads %llu, regions recorded %llu, checked %llu, stale %llu\n", r1, r2, r3, r4, draws, recorded, checked, stale);
+    auto& queue = DrawPipeline::Queue0();
+    const auto waited = static_cast<unsigned long long>(queue.TakeFinisherWaits()), known = static_cast<unsigned long long>(queue.TakeFinisherKnown());
+    std::fprintf(stderr, "[finisher-reads] 10 s: overlaps at read R1 %llu, R2 %llu, R3 %llu, R4 %llu; waited-on-queue %llu, known-from-queue %llu; draws with recorded reads %llu, regions recorded %llu, checked %llu, stale %llu\n", r1, r2, r3, r4, waited, known, draws, recorded, checked, stale);
 }
 
 std::string ExceptionReason(const std::exception_ptr& failure) {
@@ -916,6 +933,15 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         decodeReads[i].clear();
         const auto retired = watchFinisherReads ? DrawPipeline::Queue0().Retired() : 0;
         vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i], false, 8u - program.firstUserSgpr);
+        const auto decodeRanges = [&] {
+            std::vector<DrawPipeline::Range> ranges;
+            for (const auto& read : decodeReads[i]) ranges.emplace_back(read.address, read.address + read.size);
+            return ranges;
+        };
+        while (DrawPipeline::FinisherWaitQueue0() && DrawFinisher::OnFinisherThread() && DrawPipeline::Queue0().WaitRetired(decodeRanges())) {
+            decodeReads[i].clear();
+            vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i], false, 8u - program.firstUserSgpr);
+        }
         if (watchFinisherReads) {
             for (const auto& read : decodeReads[i]) {
                 if (ShaderMemory::FinisherReadQueued(4, read.address, read.size) || DrawPipeline::Queue0().Retired() != retired) ShaderMemory::NoteFinisherRead(read.address, read.data.data(), read.size);
@@ -1306,6 +1332,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto epoch = DrawFinisher::OnFinisherThread() ? tail.epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
         auto finisherReads = watchFinisherReads ? std::move(ShaderMemory::FinisherReads()) : std::vector<ShaderMemory::FinisherRead>{};
+        if (watchFinisherReads && shaderMemory != nullptr) shaderMemory->KeepReadWords(finisherReads);
         if (watchFinisherReads) finisherReadCounts().recorded.fetch_add(finisherReads.size(), std::memory_order_relaxed);
         // APS5_FINISHER_DRAW_PREP; captured last, so its pipeline goes before the device.
         std::optional<Graphics::DrawPrep> prep;

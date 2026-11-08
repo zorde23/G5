@@ -58,15 +58,28 @@ public:
     // by the driver: the [capture] line charges the waits made inside a capture to it.
     using WaitedMsProvider = double (*)();
     static void SetWaitedMsProvider(WaitedMsProvider provider);
+    struct FinisherReadOrigin {
+        unsigned site = 0;
+        bool found = false;
+        bool draw = false;
+        std::uint32_t opcode = 0;
+        std::uint64_t labelAddress = 0;
+        std::uint64_t sequence = 0;
+        std::size_t index = 0;
+        std::uint64_t writeBegin = 0;
+        std::uint64_t writeEnd = 0;
+    };
     struct FinisherRead {
         std::uint64_t address = 0;
         std::vector<std::byte> bytes;
+        FinisherReadOrigin origin;
     };
-    using FinisherReadQuery = bool (*)(unsigned site, std::uint64_t address, std::size_t bytes);
+    using FinisherReadQuery = bool (*)(unsigned site, std::uint64_t address, std::size_t bytes, FinisherReadOrigin& origin);
     static void SetFinisherReadQuery(FinisherReadQuery query);
     static bool FinisherReadQueued(unsigned site, std::uint64_t address, std::size_t bytes);
     static void NoteFinisherRead(std::uint64_t address, const void* bytes, std::size_t size);
     static std::vector<FinisherRead>& FinisherReads();
+    void KeepReadWords(std::vector<FinisherRead>& reads) const;
     explicit ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> initial, PendingWriteQuery pendingWrite = nullptr, PendingWriteObserver observe = nullptr, HookWaitCounter hookWaits = nullptr, PendingWriteQuery pendingSpan = nullptr);
     ~ShaderMemory();
     ShaderMemory(const ShaderMemory&) = delete;

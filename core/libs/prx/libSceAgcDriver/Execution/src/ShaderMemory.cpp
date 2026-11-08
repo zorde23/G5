@@ -96,6 +96,7 @@ CaptureProfile& CaptureTotals() {
 
 std::atomic<ShaderMemory::WaitedMsProvider> waitedMsProvider{nullptr};
 std::atomic<ShaderMemory::FinisherReadQuery> finisherReadQuery{nullptr};
+thread_local ShaderMemory::FinisherReadOrigin finisherReadOrigin{};
 
 double WaitedMs() {
     const auto provider = waitedMsProvider.load(std::memory_order_acquire);
@@ -162,12 +163,41 @@ void ShaderMemory::SetFinisherReadQuery(FinisherReadQuery query) {
 
 bool ShaderMemory::FinisherReadQueued(unsigned site, std::uint64_t address, std::size_t bytes) {
     const auto query = finisherReadQuery.load(std::memory_order_acquire);
-    return query != nullptr && query(site, address, bytes);
+    if (query == nullptr) return false;
+    finisherReadOrigin = {site};
+    return query(site, address, bytes, finisherReadOrigin);
 }
 
 void ShaderMemory::NoteFinisherRead(std::uint64_t address, const void* bytes, std::size_t size) {
     const auto* first = static_cast<const std::byte*>(bytes);
-    FinisherReads().push_back({address, {first, first + size}});
+    FinisherReads().push_back({address, {first, first + size}, finisherReadOrigin});
+}
+
+void ShaderMemory::KeepReadWords(std::vector<FinisherRead>& reads) const {
+    std::vector<FinisherRead> kept;
+    kept.reserve(reads.size());
+    for (auto& read : reads) {
+        const auto base = read.address & ~static_cast<std::uint64_t>(PageBytes - 1);
+        const auto position = pageAtOrAfter(base);
+        if (read.origin.site != 1 || position == pages.size() || pages[position].first != base) {
+            kept.push_back(std::move(read));
+            continue;
+        }
+        const auto& marks = pages[position].second->read;
+        const auto first = static_cast<std::size_t>((read.address - base) / sizeof(std::uint32_t));
+        const auto words = read.bytes.size() / sizeof(std::uint32_t);
+        for (std::size_t word = 0; word < words;) {
+            if (!marks.Test(first + word)) {
+                ++word;
+                continue;
+            }
+            auto last = word;
+            while (last < words && marks.Test(first + last)) ++last;
+            kept.push_back({read.address + word * sizeof(std::uint32_t), {read.bytes.begin() + static_cast<std::ptrdiff_t>(word * sizeof(std::uint32_t)), read.bytes.begin() + static_cast<std::ptrdiff_t>(last * sizeof(std::uint32_t))}, read.origin});
+            word = last;
+        }
+    }
+    reads = std::move(kept);
 }
 
 std::vector<ShaderMemory::FinisherRead>& ShaderMemory::FinisherReads() {
