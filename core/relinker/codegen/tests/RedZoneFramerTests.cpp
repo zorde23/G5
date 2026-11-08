@@ -407,6 +407,19 @@ void skipsShrinkWrappedLeavesWithHiddenRspUsesOrOutsideEntries() {
     require(report.Skipped.at("shrink-wrapped: other use of rsp") == 5 && report.Skipped.at("shrink-wrapped: branch from outside into the body") == 1, "the skipped leaves were not listed with their reasons: " + seen);
 }
 
+void keepsLeavesThatBranchToAColdPartWhole() {
+    const std::vector<std::uint8_t> hot{0x48, 0x89, 0x7c, 0x24, 0xf8, 0x89, 0x06, 0x85, 0xd2, 0x0f, 0x85, 0, 0, 0, 0, 0xc3};
+    const std::vector<std::uint8_t> cold{0x48, 0x8b, 0x44, 0x24, 0xf8, 0xc3};
+    const std::vector<std::uint8_t> alone{0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x8b, 0x44, 0x24, 0xf8, 0x89, 0x06, 0x85, 0xd2, 0x74, 0x00, 0xc3};
+    auto input = image({hot, cold, alone});
+    const auto from = static_cast<std::size_t>(input.functions[0].Begin - Base) + 9;
+    const auto into = static_cast<std::int32_t>(input.functions[1].Begin - Base) - static_cast<std::int32_t>(from + 6);
+    for (std::size_t index = 0; index < 4; ++index) input.bytes[from + 2 + index] = static_cast<std::uint8_t>(static_cast<std::uint32_t>(into) >> (8 * index));
+    const auto dead = Codegen::FindRedZoneDeadRanges(input.bytes, input.segments, {input.functions[0], input.functions[2]});
+    require(dead[0].empty(), "a leaf whose cold part reads its red zone had instructions called dead");
+    require(!dead[1].empty() && dead[1].front().Begin == input.functions[2].Begin + 10, "a leaf that reads its spill before a store was not called dead from the store on");
+}
+
 void skipsWideningOverBranchTargets() {
     const std::vector<std::uint8_t> loopToStart{0x48, 0x89, 0x7c, 0x24, 0xf0, 0xff, 0xc9, 0x75, 0xf7, 0x48, 0x8b, 0x44, 0x24, 0xf0, 0xc3};
     std::vector<std::uint8_t> jumpToPop = StoreBelowRsp;
@@ -905,6 +918,7 @@ int main() {
         skipsFragmentsThatPopWithoutPushing();
         framesShrinkWrappedLeavesOnlyWhenAsked();
         skipsShrinkWrappedLeavesWithHiddenRspUsesOrOutsideEntries();
+        keepsLeavesThatBranchToAColdPartWhole();
         skipsWideningOverBranchTargets();
         skipsBranchesIntoTheInstructionsAfterAShortPrologue();
         widensAShortPrologueThatAllocates();

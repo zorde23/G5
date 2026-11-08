@@ -716,7 +716,7 @@ std::vector<RedZoneDeadRange> deadRanges(const std::vector<std::uint8_t>& seg, c
             effect[k] = *adjustment;
         } else {
             const auto use = memoryUse(at(k), insn);
-            if (usesRspOutsideOperands(at(k), insn) || use.RegisterRsp || (use.RspBased && (use.Indexed || use.Address))) return {};
+            if (usesRspOutsideOperands(at(k), insn) || use.RegisterRsp || (use.RspBased && (use.Indexed || use.Address || at(k)[insn.Info.OpcodeOffset] == 0x62))) return {};
             if (pushedRegister(at(k), insn)) effect[k] = -8;
             else if (poppedRegister(at(k), insn)) { effect[k] = 8; reads[k] = 0; }
             else if (pushesOrPops(at(k), insn)) return {};
@@ -726,12 +726,11 @@ std::vector<RedZoneDeadRange> deadRanges(const std::vector<std::uint8_t>& seg, c
         if (flow == ControlFlowKind::UnconditionalJump || flow == ControlFlowKind::ConditionalBranch) {
             if (!insn.Info.HasBranchTarget || insn.Info.HasRipRelativeDisp) return {};
             const auto target = static_cast<std::int64_t>(insn.Offset + insn.Length) + insn.Info.BranchDisp;
-            if (target >= static_cast<std::int64_t>(start) && target < static_cast<std::int64_t>(limit)) {
-                const auto hit = index.find(static_cast<std::size_t>(target));
-                if (hit == index.end()) return {};
-                next[k].push_back(hit->second);
-                internal.insert(hit->first);
-            }
+            if (target < static_cast<std::int64_t>(start) || target >= static_cast<std::int64_t>(limit)) return {};
+            const auto hit = index.find(static_cast<std::size_t>(target));
+            if (hit == index.end()) return {};
+            next[k].push_back(hit->second);
+            internal.insert(hit->first);
             if (flow == ControlFlowKind::UnconditionalJump) continue;
         } else if (flow != ControlFlowKind::Sequential) {
             return {};
