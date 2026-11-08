@@ -44,6 +44,10 @@ struct ShaderStages {
     std::optional<ShaderRecompiler::MeshConfiguration> tessellationGeometry;
 };
 
+inline bool operator==(const VkExtent2D& a, const VkExtent2D& b) {
+    return a.width == b.width && a.height == b.height;
+}
+
 struct ColorTarget {
     std::uint64_t address;
     VkExtent2D extent;
@@ -83,6 +87,7 @@ struct ColorTarget {
     std::uint64_t fmaskAddress = 0;
     std::uint32_t fmaskPipeBankXor = 0;
     std::uint16_t partialWriteMask = 0;
+    bool operator==(const ColorTarget&) const = default;
 };
 
 struct DepthTarget {
@@ -103,6 +108,7 @@ struct DepthTarget {
     bool htilePipeAligned = false;
     std::uint32_t htileVrsEncoding = 0;
     bool htileDepthOnly = false;
+    bool operator==(const DepthTarget&) const = default;
 };
 
 struct State {
