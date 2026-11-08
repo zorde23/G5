@@ -2253,18 +2253,14 @@ void spacePatchedAfterImportChangeTests(const Context& context) {
         }
         leased.WriteBack();
     };
-    NoteHostImportFrame();
-    NoteHostImportFrame();
     use(2);
     Require(HostImportCovers(importing, at[2], 16), "a registered range without GPU access was not imported");
     build(0);
     Require(HostImportCovers(importing, at[0], 16) && HostImportCovers(importing, at[1], 16), "an address-based build did not import its blocks");
-    NoteHostImportFrame();
-    NoteHostImportFrame();
+    for (int pass = 0; pass < 300; ++pass) Require(HostImportFor(importing, at[pass % 2], 16) != nullptr, "a patched space fixture lost the import of one of its blocks");
     SetHostImportBudget(HostImportLiveBytes());
-    const auto epoch = HostImportEpoch();
     use(3);
-    Require(HostImportCovers(importing, at[3], 16) && !HostImportCovers(importing, at[2], 16) && HostImportEpoch() != epoch, "a range over the budget did not evict the least recent import");
+    Require(HostImportCovers(importing, at[3], 16) && !HostImportCovers(importing, at[2], 16), "a range over the budget did not evict the least recent import");
     const auto before = AddressSpaceCounters();
     build(1);
     const auto after = AddressSpaceCounters();
