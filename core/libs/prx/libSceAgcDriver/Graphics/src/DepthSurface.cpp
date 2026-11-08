@@ -37,9 +37,8 @@
 namespace AgcDriver::Graphics {
 namespace {
 
-std::atomic<std::uint64_t> depthWrites{0};
-std::atomic<std::uint64_t> mirrorEpoch{0};
-std::atomic<std::uint64_t> depthEvents{0};
+std::uint64_t depthWrites = 0;
+std::uint64_t mirrorEpoch = 0;
 
 std::pair<std::uint32_t, std::uint32_t> DepthBlockExtent(std::uint32_t bytesPerTexel) {
     return {bytesPerTexel == 4 ? 128u : 256u, bytesPerTexel == 1 ? 256u : 128u};
@@ -506,12 +505,10 @@ public:
     void NoteHtileClear(VkImageAspectFlags aspects) {
         ForgetClear(aspects);
         pendingClear |= aspects;
-        depthEvents.fetch_add(1, std::memory_order_relaxed);
     }
 
     void NotePlaneFill(VkImageAspectFlagBits aspect, float depth, std::uint8_t stencil) {
         pendingClear |= aspect;
-        depthEvents.fetch_add(1, std::memory_order_relaxed);
         if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT) depthFill = depth;
         else stencilFill = stencil;
     }
@@ -846,7 +843,6 @@ public:
         unitBytes = bytes;
         staleUnits.assign(count, false);
         staleCount = 0;
-        depthEvents.fetch_add(1, std::memory_order_relaxed);
         unitGeneration.assign(count, 0);
     }
 
@@ -863,17 +859,14 @@ public:
     void ClearStale() {
         staleUnits.assign(staleUnits.size(), false);
         staleCount = 0;
-        depthEvents.fetch_add(1, std::memory_order_relaxed);
     }
 
     void ClearStale(const std::vector<bool>& units) {
-        const auto before = staleCount;
         for (std::size_t unit = 0; unit < units.size() && unit < staleUnits.size(); ++unit) {
             if (!units[unit] || !staleUnits[unit]) continue;
             staleUnits[unit] = false;
             --staleCount;
         }
-        if (staleCount != before) depthEvents.fetch_add(1, std::memory_order_relaxed);
     }
 
     std::vector<bool> StaleUnitsIn(std::uint64_t planeBytes, std::uint64_t begin, std::uint64_t end) const {
@@ -1615,7 +1608,7 @@ struct PlaneOwner {
 
 using PlaneOwners = std::map<std::pair<VkDevice, std::uint64_t>, PlaneOwner>;
 
-std::atomic<std::uint64_t> planeBinds{0};
+std::uint64_t planeBinds = 0;
 
 PlaneOwners& depthOwners() {
     static auto* owners = new PlaneOwners();
@@ -1744,7 +1737,6 @@ void forgetHtileReads(std::uint64_t address, std::size_t bytes) {
     std::lock_guard lock(htileReadsMutex());
     auto& reads = htileReads();
     reads.erase(reads.lower_bound(address), reads.lower_bound(address + bytes));
-    depthEvents.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool RoutesToNativeDepthOwner(const DepthTarget& target) {
@@ -1893,7 +1885,6 @@ void verifyHtileSpeculation(const Recorder& recorder, const HtileSpeculationKey&
         if (!cpuWrote && !newer) {
             std::lock_guard reads(htileReadsMutex());
             htileReads()[key.address] = generation;
-            depthEvents.fetch_add(1, std::memory_order_relaxed);
         }
         reportHtileSpeculation();
         return;
@@ -1913,7 +1904,6 @@ void verifyHtileSpeculation(const Recorder& recorder, const HtileSpeculationKey&
         const auto stored = GuestMemory::CollectWritesUncached(key.address, key.bytes);
         std::lock_guard reads(htileReadsMutex());
         htileReads()[key.address] = stored;
-        depthEvents.fetch_add(1, std::memory_order_relaxed);
     }
     reportHtileSpeculation();
 }
@@ -1956,14 +1946,12 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
             if (cleared == 0) {
                 std::lock_guard lock(htileReadsMutex());
                 htileReads()[target.htileAddress] = collected;
-                depthEvents.fetch_add(1, std::memory_order_relaxed);
                 return 0;
             }
             if (storeHtileOnGpu(context, *recorder, target.htileAddress, bytes, expandedHtileWord(*landed, target.htileStencil, cleared))) {
                 const auto generation = GuestMemory::CollectWrites(target.htileAddress, bytes);
                 std::lock_guard lock(htileReadsMutex());
                 htileReads()[target.htileAddress] = generation;
-                depthEvents.fetch_add(1, std::memory_order_relaxed);
                 return cleared;
             }
         }
@@ -1990,7 +1978,6 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
     }
     std::lock_guard lock(htileReadsMutex());
     htileReads()[target.htileAddress] = generation;
-    depthEvents.fetch_add(1, std::memory_order_relaxed);
     return cleared;
 }
 
@@ -2015,7 +2002,6 @@ void publishStaleHull(StalePlanes& planes) {
     }
     planes.begin.store(begin, std::memory_order_release);
     planes.end.store(end, std::memory_order_release);
-    depthEvents.fetch_add(1, std::memory_order_relaxed);
 }
 
 void noteStalePlane(std::uint64_t begin, std::uint64_t end) {
@@ -2060,7 +2046,6 @@ std::pair<std::uint64_t, std::uint64_t> stalePlaneRange(const DepthSurface& surf
 
 void retire(DepthSurface& surface) {
     surface.retired = true;
-    depthEvents.fetch_add(1, std::memory_order_relaxed);
     for (auto* owners : {&depthOwners(), &stencilOwners()}) {
         std::erase_if(*owners, [&](const auto& entry) { return entry.second.surface == &surface; });
     }
@@ -2117,7 +2102,7 @@ bool sameDepthTarget(const DepthTarget& a, const DepthTarget& b) {
 }
 
 std::array<std::uint64_t, 6> depthViewCounters() {
-    return {surfacesSerial.load(std::memory_order_acquire), surfacesReleased.load(std::memory_order_acquire), mirrorEpoch.load(std::memory_order_relaxed), depthWrites.load(std::memory_order_relaxed), planeBinds.load(std::memory_order_relaxed), static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(drawnDepth))};
+    return {surfacesSerial.load(std::memory_order_acquire), surfacesReleased.load(std::memory_order_acquire), mirrorEpoch, depthWrites, planeBinds, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(drawnDepth))};
 }
 
 // The collect epoch, proof serial and pending-store serial (as ShaderResources::Revalidate), and
@@ -2429,8 +2414,8 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
     if (drawnDepth != nullptr && drawnDepth != surface) drawnDepth->written = ++depthWrites;
     surface->written = ++depthWrites;
     surface->NoteMemory();
-    if (mirrorable(target) && surface->scannedEpoch != mirrorEpoch.load(std::memory_order_relaxed)) {
-        surface->scannedEpoch = mirrorEpoch.load(std::memory_order_relaxed);
+    if (mirrorable(target) && surface->scannedEpoch != mirrorEpoch) {
+        surface->scannedEpoch = mirrorEpoch;
         const auto plane = stalePlaneRange(*surface);
         for (const auto& other : surfaces()) {
             if (other.get() == surface || other->context.device != context.device || other->written >= surface->written || !mirrorable(other->target)) continue;
@@ -2465,20 +2450,6 @@ VkImageView RepeatDepthSurfaceView(const Context& context, const DepthTarget& ta
     depthViewMemoRepeat(*surface, target, depthWritten);
     depthViewMemoHits.fetch_add(1, std::memory_order_relaxed);
     return surface->view;
-}
-
-std::array<std::uint64_t, 7> DepthViewStamp() {
-    return {RuntimeSwitches::Set(RuntimeSwitch::DepthViewMemo) ? 1u : 0u, surfacesSerial.load(std::memory_order_acquire), surfacesReleased.load(std::memory_order_acquire), mirrorEpoch.load(std::memory_order_acquire), depthWrites.load(std::memory_order_acquire), planeBinds.load(std::memory_order_acquire), depthEvents.load(std::memory_order_acquire)};
-}
-
-bool DepthPlaneStaleOver(std::uint64_t address, std::size_t bytes) {
-    return overlapsStalePlane(address, bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes);
-}
-
-bool DepthHtilePending(const Context& context, const DepthTarget& target) {
-    if (target.htileAddress == 0) return false;
-    auto* recorder = RecorderFor(context);
-    return recorder != nullptr && recorder->PendingWriteOverlaps(target.htileAddress, static_cast<std::size_t>(HtileMetadataBytes(target.extent)));
 }
 
 bool DepthMetadataUnchanged(const Context& context, const DepthTarget& target) {
@@ -2751,7 +2722,6 @@ bool NoteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes, std::siz
         existing = true;
     }
     if (!existing) clearedHtiles()[htileAddress] = bytes;
-    depthEvents.fetch_add(1, std::memory_order_relaxed);
     return completionCandidate;
 }
 
