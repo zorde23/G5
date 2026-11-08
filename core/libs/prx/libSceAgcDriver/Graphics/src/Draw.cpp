@@ -2823,7 +2823,7 @@ std::uint64_t TargetSkipVerifyEvery() {
 enum class TargetSkipMiss : std::size_t { None, NoPrevious, Recorder, WriteNote, PassClosed, PreviousWrote, Targets, Dcc, Resident, DepthMemo, Count };
 
 struct TargetSkipCounts {
-    std::atomic<std::uint64_t> eligible{0}, skipped{0}, verified{0}, mismatches{0}, cpuWroteMetadata{0};
+    std::atomic<std::uint64_t> eligible{0}, skipped{0}, verified{0}, mismatches{0}, cpuWroteMetadata{0}, keyDrift{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TargetSkipMiss::Count)> missed{};
     std::atomic<std::int64_t> reportedAt{0};
 };
@@ -2844,7 +2844,7 @@ void reportTargetSkip() {
         std::snprintf(item, sizeof(item), "%s %s %llu", index == 1 ? "" : ",", names[index], static_cast<unsigned long long>(counts.missed[index].load(std::memory_order_relaxed)));
         text += item;
     }
-    std::fprintf(stderr, "[target-skip] eligible %llu, skipped %llu, verified %llu, mismatches %llu, cpu-wrote-metadata %llu; not skipped:%s\n", static_cast<unsigned long long>(counts.eligible.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.verified.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.mismatches.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.cpuWroteMetadata.load(std::memory_order_relaxed)), text.c_str());
+    std::fprintf(stderr, "[target-skip] eligible %llu, skipped %llu, verified %llu, mismatches %llu, cpu-wrote-metadata %llu, key-only-diff %llu; not skipped:%s\n", static_cast<unsigned long long>(counts.eligible.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.verified.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.mismatches.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.cpuWroteMetadata.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.keyDrift.load(std::memory_order_relaxed)), text.c_str());
 }
 
 struct TargetSkipState {
@@ -2923,7 +2923,7 @@ bool targetMetadataUnchanged(const Context& context, const State& state) {
     return same;
 }
 
-void verifyTargetSkip(const Context& context, const PreparedDraw& prepared) {
+void verifyTargetSkip(const PreparedDraw& prepared) {
     const auto& skip = targetSkipState;
     targetSkipCounts().verified.fetch_add(1, std::memory_order_relaxed);
     std::string differences;
@@ -2933,9 +2933,8 @@ void verifyTargetSkip(const Context& context, const PreparedDraw& prepared) {
     for (std::size_t index = 0; index < prepared.targets.size() && index < skip.residents.size(); ++index) {
         const auto remembered = skip.residents[index].lock();
         const auto& binding = prepared.targets[index];
-        const bool sameKey = targetMemoKey(context, binding.color) == skip.keys[index];
-        if (binding.resident == remembered && binding.proxied == skip.proxied[index] && sameKey) continue;
-        std::snprintf(item, sizeof(item), " color %zu at 0x%llx: resident %p (proxied %d) against %p (proxied %d), memo key %s;", index, static_cast<unsigned long long>(binding.color.address), static_cast<const void*>(binding.resident.get()), binding.proxied ? 1 : 0, static_cast<const void*>(remembered.get()), skip.proxied[index] ? 1 : 0, sameKey ? "same" : "differs");
+        if (binding.resident == remembered && binding.proxied == skip.proxied[index]) continue;
+        std::snprintf(item, sizeof(item), " color %zu at 0x%llx: resident %p (proxied %d) against %p (proxied %d);", index, static_cast<unsigned long long>(binding.color.address), static_cast<const void*>(binding.resident.get()), binding.proxied ? 1 : 0, static_cast<const void*>(remembered.get()), skip.proxied[index] ? 1 : 0);
         differences += item;
     }
     if (differences.empty()) return;
@@ -3035,6 +3034,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             counts.eligible.fetch_add(1, std::memory_order_relaxed);
             thread_local std::uint64_t eligibleDraws = 0;
             skipVerify = TargetSkipVerifyEvery() != 0 && ++eligibleDraws % TargetSkipVerifyEvery() == 0;
+            if (skipVerify && !std::ranges::equal(state.colors, targetSkipState.keys, [&](const ColorTarget& color, const TargetMemoKey& key) { return targetMemoKey(context, color) == key; })) counts.keyDrift.fetch_add(1, std::memory_order_relaxed);
             if (skipVerify && !targetMetadataUnchanged(context, state)) counts.cpuWroteMetadata.fetch_add(1, std::memory_order_relaxed);
             if (!skipVerify) miss = reuseTargets(context, state, prepared);
             skipped = !skipVerify && miss == TargetSkipMiss::None;
@@ -3197,7 +3197,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         if (writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
     }
     if (targetSkip && !skipped) {
-        if (skipVerify) verifyTargetSkip(context, prepared);
+        if (skipVerify) verifyTargetSkip(prepared);
         rememberTargets(context, state, prepared, Recorder::Active());
     }
     timer.phase(PhasePrepare);
