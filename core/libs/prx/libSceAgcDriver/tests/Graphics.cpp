@@ -4956,6 +4956,10 @@ void DitheredAlphaFallbackTests() {
     dithered.context[0x1c5] = 1;
     Require(AgcDriver::Graphics::DrawRejection(dithered, false).find("floating-point alpha") != std::string::npos, "the fallback accepted an export without a floating-point alpha");
     dithered.context[0x1c5] = 4;
+    dithered.context[0x292] = 2;
+    Require(AgcDriver::Graphics::DrawRejection(dithered, false).find("eight matched") != std::string::npos, "the fallback accepted a multisampled target without MSAA_ENABLE that the decoder refuses");
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(dithered); }, "alpha-to-coverage");
+    dithered.context[0x292] = 3;
     dithered.context[0x201] = 0x00133303;
     dithered.context[0x2f8] = 0x0030e003;
     dithered.context[0x31d] = 0x1b000;

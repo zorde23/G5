@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <atomic>
 #include <mutex>
 #include <set>
 #include <span>
@@ -313,6 +314,13 @@ bool DitheredAlphaFallback() {
     return fallback;
 }
 
+bool fallbackApplies(const Registers& cx) {
+    if (!DitheredAlphaFallback()) return false;
+    const auto config = find(cx, 0x2f8);
+    const auto mode = find(cx, 0x292);
+    return config == cx.end() || (config->second & 7u) == 0 || (mode != cx.end() && (mode->second & 1u) != 0);
+}
+
 void reportUnmeasuredDitheredAlpha(const Registers& cx) {
     std::array<std::uint32_t, 23> words{};
     const std::array<std::uint32_t, 7> registers{0x2dc, 0x2f8, 0x201, 0x292, 0x293, 0x203, 0x1c5};
@@ -320,14 +328,19 @@ void reportUnmeasuredDitheredAlpha(const Registers& cx) {
         if (const auto hit = find(cx, registers[index]); hit != cx.end()) words[index] = hit->second;
     for (std::uint32_t slot = 0; slot < 16; ++slot)
         if (const auto hit = find(cx, 0x2fe + slot); hit != cx.end()) words[registers.size() + slot] = hit->second;
+    std::uint64_t hash = 14695981039346656037ull;
+    for (const auto word : words) hash = (hash ^ word) * 1099511628211ull;
+    static std::atomic<std::uint64_t> last{0};
+    if (last.load(std::memory_order_relaxed) == hash) return;
     static std::mutex lock;
     static std::set<std::array<std::uint32_t, 23>> seen;
     {
         const std::lock_guard guard(lock);
+        last.store(hash, std::memory_order_relaxed);
         if (!seen.insert(words).second) return;
     }
     std::ostringstream text;
-    text << "[gpu] dithered alpha-to-coverage outside the measured eight- and two-sample setups, " << (DitheredAlphaFallback() ? "drawn undithered (APS5_DITHERED_ALPHA_FALLBACK)" : "refused") << std::hex
+    text << "[gpu] dithered alpha-to-coverage outside the measured eight-sample setup, " << (fallbackApplies(cx) ? "drawn undithered (APS5_DITHERED_ALPHA_FALLBACK)" : DitheredAlphaFallback() ? "refused: a multisampled target without MSAA_ENABLE" : "refused") << std::hex
          << ": DB_ALPHA_TO_MASK=0x" << words[0] << " PA_SC_AA_CONFIG=0x" << words[1] << " DB_EQAA=0x" << words[2] << " PA_SC_MODE_CNTL_0=0x" << words[3] << " PA_SC_MODE_CNTL_1=0x" << words[4] << " DB_SHADER_CONTROL=0x" << words[5] << " SPI_SHADER_COL_FORMAT=0x" << words[6] << " PA_SC_AA_SAMPLE_LOCS=";
     for (std::size_t slot = 0; slot < 16; ++slot) text << (slot == 0 ? "" : ",") << "0x" << words[registers.size() + slot];
     text << '\n';
@@ -336,7 +349,7 @@ void reportUnmeasuredDitheredAlpha(const Registers& cx) {
 
 bool fallsBackFromDitheredAlpha(const Registers& cx) {
     reportUnmeasuredDitheredAlpha(cx);
-    return DitheredAlphaFallback();
+    return fallbackApplies(cx);
 }
 
 bool depthSurfaceBound(const Registers& cx) {
