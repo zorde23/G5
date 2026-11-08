@@ -220,13 +220,11 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
         if (pipeline.Busy() && pipeline.Overlaps(address, bytes)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
     } else if ((DrawPipeline::FinisherWaitQueue0() || DrawPipeline::FinisherQueuedBytes()) && DrawFinisher::OnFinisherThread()) {
         auto& pipeline = DrawPipeline::Queue0();
-        if (DrawPipeline::FinisherQueuedBytes()) {
-            if (known.size() == bytes && pipeline.QueuedBytes(address, known)) {
-                pipeline.NoteFinisherKnown();
-                return ShaderMemory::PendingWrite::KnownValue;
-            }
-            if (known.empty() && pipeline.FirstQueuedWrite(address, bytes).found) return ShaderMemory::PendingWrite::Sync;
+        if (DrawPipeline::FinisherQueuedBytes() && known.size() == bytes && pipeline.QueuedBytes(address, known)) {
+            pipeline.NoteFinisherKnown();
+            return ShaderMemory::PendingWrite::KnownValue;
         }
+        if (known.empty() && pipeline.FirstQueuedWrite(address, bytes).found) return ShaderMemory::PendingWrite::Sync;
         if (DrawPipeline::FinisherWaitQueue0()) pipeline.WaitRetired(address, bytes);
     }
     std::uint64_t ValidateCounters::*reason = nullptr;

@@ -225,6 +225,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
         running = true;
         thread = std::thread([this] {
             finisherThread = true;
+            GuestMemory::MarkFinisherProofThread();
             run();
         });
     }

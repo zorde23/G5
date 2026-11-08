@@ -119,6 +119,13 @@ void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
 void BreakProofs();
 void MarkProofThread();
+void MarkFinisherProofThread();
+struct ProofBreaks {
+    std::uint64_t total;
+    std::uint64_t finisher;
+    std::uint64_t committer;
+};
+ProofBreaks TakeProofBreaks();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
 std::uint64_t ThreadCollectEpoch();

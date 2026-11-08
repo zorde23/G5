@@ -111,7 +111,8 @@ void checkFinisherReads(std::span<const ShaderMemory::FinisherRead> reads) {
     const auto draws = take(counts.draws), recorded = take(counts.recorded), checked = take(counts.checked), stale = take(counts.stale);
     auto& queue = DrawPipeline::Queue0();
     const auto waited = static_cast<unsigned long long>(queue.TakeFinisherWaits()), known = static_cast<unsigned long long>(queue.TakeFinisherKnown());
-    std::fprintf(stderr, "[finisher-reads] 10 s: overlaps at read R1 %llu, R2 %llu, R3 %llu, R4 %llu; waited-on-queue %llu, known-from-queue %llu; draws with recorded reads %llu, regions recorded %llu, checked %llu, stale %llu\n", r1, r2, r3, r4, waited, known, draws, recorded, checked, stale);
+    const auto breaks = GuestMemory::TakeProofBreaks();
+    std::fprintf(stderr, "[finisher-reads] 10 s: overlaps at read R1 %llu, R2 %llu, R3 %llu, R4 %llu; waited-on-queue %llu, known-from-queue %llu; draws with recorded reads %llu, regions recorded %llu, checked %llu, stale %llu; proof breaks %llu (finisher %llu, committer %llu)\n", r1, r2, r3, r4, waited, known, draws, recorded, checked, stale, static_cast<unsigned long long>(breaks.total), static_cast<unsigned long long>(breaks.finisher), static_cast<unsigned long long>(breaks.committer));
 }
 
 std::string ExceptionReason(const std::exception_ptr& failure) {
