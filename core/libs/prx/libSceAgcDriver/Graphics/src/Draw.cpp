@@ -2823,7 +2823,7 @@ std::uint64_t TargetSkipVerifyEvery() {
 enum class TargetSkipMiss : std::size_t { None, NoPrevious, Recorder, WriteNote, PassClosed, PreviousWrote, Targets, Dcc, Resident, DepthMemo, Count };
 
 struct TargetSkipCounts {
-    std::atomic<std::uint64_t> eligible{0}, skipped{0}, verified{0}, mismatches{0}, cpuWroteMetadata{0}, keyDrift{0};
+    std::atomic<std::uint64_t> eligible{0}, skipped{0}, verified{0}, mismatches{0}, cpuWroteMetadata{0}, keyDrift{0}, totalEligible{0}, totalSkipped{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TargetSkipMiss::Count)> missed{};
     std::atomic<std::int64_t> reportedAt{0};
 };
@@ -2841,10 +2841,15 @@ void reportTargetSkip() {
     std::string text;
     char item[64];
     for (std::size_t index = 1; index < names.size(); ++index) {
-        std::snprintf(item, sizeof(item), "%s %s %llu", index == 1 ? "" : ",", names[index], static_cast<unsigned long long>(counts.missed[index].load(std::memory_order_relaxed)));
+        std::snprintf(item, sizeof(item), "%s %s %llu", index == 1 ? "" : ",", names[index], static_cast<unsigned long long>(counts.missed[index].exchange(0, std::memory_order_relaxed)));
         text += item;
     }
-    std::fprintf(stderr, "[target-skip] eligible %llu, skipped %llu, verified %llu, mismatches %llu, cpu-wrote-metadata %llu, key-only-diff %llu; not skipped:%s\n", static_cast<unsigned long long>(counts.eligible.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.verified.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.mismatches.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.cpuWroteMetadata.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.keyDrift.load(std::memory_order_relaxed)), text.c_str());
+    const auto eligible = counts.eligible.exchange(0, std::memory_order_relaxed);
+    const auto skipped = counts.skipped.exchange(0, std::memory_order_relaxed);
+    const auto mismatches = counts.mismatches.load(std::memory_order_relaxed);
+    const auto totalEligible = counts.totalEligible.fetch_add(eligible, std::memory_order_relaxed) + eligible;
+    const auto totalSkipped = counts.totalSkipped.fetch_add(skipped, std::memory_order_relaxed) + skipped;
+    std::fprintf(stderr, "[target-skip] 10 s: eligible %llu, skipped %llu, verified %llu, cpu-wrote-metadata %llu, key-only-diff %llu; not skipped:%s | total eligible %llu, skipped %llu, mismatches %llu\n", static_cast<unsigned long long>(eligible), static_cast<unsigned long long>(skipped), static_cast<unsigned long long>(counts.verified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counts.cpuWroteMetadata.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counts.keyDrift.exchange(0, std::memory_order_relaxed)), text.c_str(), static_cast<unsigned long long>(totalEligible), static_cast<unsigned long long>(totalSkipped), static_cast<unsigned long long>(mismatches));
 }
 
 struct TargetSkipState {
