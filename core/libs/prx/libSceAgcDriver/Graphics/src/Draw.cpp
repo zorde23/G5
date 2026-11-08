@@ -2801,6 +2801,151 @@ void rememberShape(const Context& context, std::uint64_t shape, std::span<const 
     choices.insert(choices.begin(), std::move(choice));
 }
 
+bool TargetSkipEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_TARGET_SKIP_CONTINUED");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+std::uint64_t TargetSkipVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* value = std::getenv("APS5_VERIFY_TARGET_SKIP");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+enum class TargetSkipMiss : std::size_t { None, NoPrevious, Recorder, WriteNote, PassClosed, Targets, Dcc, Resident, DepthMemo, Count };
+
+struct TargetSkipCounts {
+    std::atomic<std::uint64_t> eligible{0}, skipped{0}, verified{0}, mismatches{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TargetSkipMiss::Count)> missed{};
+    std::atomic<std::int64_t> reportedAt{0};
+};
+
+TargetSkipCounts& targetSkipCounts() {
+    static TargetSkipCounts counts;
+    return counts;
+}
+
+void reportTargetSkip() {
+    auto& counts = targetSkipCounts();
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (counts.reportedAt.load(std::memory_order_relaxed) == tenSeconds || counts.reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    constexpr std::array<const char*, static_cast<std::size_t>(TargetSkipMiss::Count)> names{"", "no previous draw", "recorder", "write note", "pass closed", "targets or serials", "dcc", "resident gone", "depth memo"};
+    std::string text;
+    char item[64];
+    for (std::size_t index = 1; index < names.size(); ++index) {
+        std::snprintf(item, sizeof(item), "%s %s %llu", index == 1 ? "" : ",", names[index], static_cast<unsigned long long>(counts.missed[index].load(std::memory_order_relaxed)));
+        text += item;
+    }
+    std::fprintf(stderr, "[target-skip] eligible %llu, skipped %llu, verified %llu, mismatches %llu; not skipped:%s\n", static_cast<unsigned long long>(counts.eligible.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.verified.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.mismatches.load(std::memory_order_relaxed)), text.c_str());
+}
+
+struct TargetSkipState {
+    bool valid = false;
+    Recorder* recorder = nullptr;
+    std::uint64_t writeNote = 0;
+    bool hasDepth = false;
+    bool depthWritten = false;
+    std::vector<TargetMemoKey> keys;
+    std::vector<std::weak_ptr<StorageTexture>> residents;
+    std::vector<bool> proxied;
+    std::vector<VkImageView> views;
+};
+
+thread_local TargetSkipState targetSkipState;
+
+TargetSkipMiss targetSkipMiss(const Context& context, const State& state, Recorder* recorder) {
+    const auto& skip = targetSkipState;
+    if (!skip.valid) return TargetSkipMiss::NoPrevious;
+    if (recorder == nullptr || recorder != skip.recorder) return TargetSkipMiss::Recorder;
+    if (recorder->WriteNoteCount() != skip.writeNote) return TargetSkipMiss::WriteNote;
+    if (!recorder->PassOpenWith(DrawRenderPassKey(context, state, skip.views))) return TargetSkipMiss::PassClosed;
+    if (state.colors.size() != skip.keys.size() || state.depth.has_value() != skip.hasDepth || state.depthWrite != skip.depthWritten) return TargetSkipMiss::Targets;
+    for (std::size_t index = 0; index < state.colors.size(); ++index) {
+        const auto& color = state.colors[index];
+        if (color.samples > 1 || color.fmaskAddress != 0 || !(targetMemoKey(context, color) == skip.keys[index])) return TargetSkipMiss::Targets;
+        if (color.dccAddress != 0 && !TargetMemoEnabled()) return TargetSkipMiss::Dcc;
+    }
+    for (const auto& weak : skip.residents) {
+        const auto resident = weak.lock();
+        if (resident == nullptr || !resident->Cached()) return TargetSkipMiss::Resident;
+    }
+    return TargetSkipMiss::None;
+}
+
+TargetSkipMiss reuseTargets(const Context& context, const State& state, PreparedDraw& prepared) {
+    const auto& skip = targetSkipState;
+    std::vector<std::shared_ptr<StorageTexture>> residents;
+    residents.reserve(skip.residents.size());
+    for (const auto& weak : skip.residents) {
+        residents.push_back(weak.lock());
+        if (residents.back() == nullptr || !residents.back()->Cached()) return TargetSkipMiss::Resident;
+    }
+    for (const auto& color : state.colors) {
+        const auto bytes = ColorTargetLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes).Bytes();
+        static_cast<void>(FlushDepthPlanes(color.address, bytes, DepthPlaneScope::Whole));
+        if (!skip.hasDepth) RetireDepthSurfaces(context.device, color.address, bytes);
+    }
+    if (skip.hasDepth && RepeatDepthSurfaceView(context, *state.depth, state.depthWrite) != skip.views.back()) return TargetSkipMiss::DepthMemo;
+    prepared.targets.resize(state.colors.size());
+    for (std::size_t index = 0; index < state.colors.size(); ++index) {
+        auto& binding = prepared.targets[index];
+        binding.color = state.colors[index];
+        binding.gpuTiling = binding.color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr;
+        binding.resident = std::move(residents[index]);
+        binding.proxied = skip.proxied[index];
+    }
+    prepared.targetViews = skip.views;
+    return TargetSkipMiss::None;
+}
+
+void verifyTargetSkip(const Context& context, const PreparedDraw& prepared) {
+    const auto& skip = targetSkipState;
+    targetSkipCounts().verified.fetch_add(1, std::memory_order_relaxed);
+    std::string differences;
+    char item[192];
+    const auto colorViews = skip.views.size() - (skip.hasDepth ? 1u : 0u);
+    if (prepared.targetViews.size() != skip.views.size() || !std::equal(skip.views.begin(), skip.views.begin() + static_cast<std::ptrdiff_t>(colorViews), prepared.targetViews.begin())) differences += " the color attachment views differ;";
+    for (std::size_t index = 0; index < prepared.targets.size() && index < skip.residents.size(); ++index) {
+        const auto remembered = skip.residents[index].lock();
+        const auto& binding = prepared.targets[index];
+        const bool sameKey = targetMemoKey(context, binding.color) == skip.keys[index];
+        if (binding.resident == remembered && binding.proxied == skip.proxied[index] && sameKey) continue;
+        std::snprintf(item, sizeof(item), " color %zu at 0x%llx: resident %p (proxied %d) against %p (proxied %d), memo key %s;", index, static_cast<unsigned long long>(binding.color.address), static_cast<const void*>(binding.resident.get()), binding.proxied ? 1 : 0, static_cast<const void*>(remembered.get()), skip.proxied[index] ? 1 : 0, sameKey ? "same" : "differs");
+        differences += item;
+    }
+    if (differences.empty()) return;
+    targetSkipCounts().mismatches.fetch_add(1, std::memory_order_relaxed);
+    throw std::runtime_error("APS5_VERIFY_TARGET_SKIP: a skipped draw's targets differ from the full lookup:" + differences);
+}
+
+void rememberTargets(const Context& context, const State& state, const PreparedDraw& prepared, Recorder* recorder) {
+    auto& skip = targetSkipState;
+    skip.valid = false;
+    if (recorder == nullptr) return;
+    skip.keys.clear();
+    skip.residents.clear();
+    skip.proxied.clear();
+    for (const auto& binding : prepared.targets) {
+        if (binding.resident == nullptr || binding.multisampled || binding.color.fmaskAddress != 0) return;
+        auto key = targetMemoKey(context, binding.color);
+        if (key.words[16] == 0) return;
+        skip.keys.push_back(key);
+        skip.residents.push_back(binding.resident);
+        skip.proxied.push_back(binding.proxied);
+    }
+    skip.recorder = recorder;
+    skip.writeNote = recorder->WriteNoteCount();
+    skip.hasDepth = state.depth.has_value();
+    skip.depthWritten = state.depthWrite;
+    skip.views = prepared.targetViews;
+    skip.valid = true;
+}
+
 bool prepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, PreparedDraw& prepared) {
     auto*& recipeOut = prepared.recipeOut;
     auto& stencilReferences = prepared.stencilReferences;
@@ -2859,9 +3004,26 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     timing.Mark("index_upload");
     const int dumpLimit = prepared.dumpLimit = DumpTargetLimit();
     auto& targets = prepared.targets;
+    const bool targetSkip = TargetSkipEnabled() && dumpLimit == 0;
+    bool skipped = false;
+    bool skipVerify = false;
+    if (targetSkip) {
+        auto& counts = targetSkipCounts();
+        auto miss = targetSkipMiss(context, state, Recorder::Active());
+        if (miss == TargetSkipMiss::None) {
+            counts.eligible.fetch_add(1, std::memory_order_relaxed);
+            thread_local std::uint64_t eligibleDraws = 0;
+            skipVerify = TargetSkipVerifyEvery() != 0 && ++eligibleDraws % TargetSkipVerifyEvery() == 0;
+            if (!skipVerify) miss = reuseTargets(context, state, prepared);
+            skipped = !skipVerify && miss == TargetSkipMiss::None;
+            if (skipped) counts.skipped.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (miss != TargetSkipMiss::None) counts.missed[static_cast<std::size_t>(miss)].fetch_add(1, std::memory_order_relaxed);
+        reportTargetSkip();
+    }
     targets.resize(state.colors.size());
     auto& targetViews = prepared.targetViews;
-    for (std::size_t index = 0; index < state.colors.size(); ++index) {
+    for (std::size_t index = 0; !skipped && index < state.colors.size(); ++index) {
         auto& binding = targets[index];
         binding.color = state.colors[index];
         const auto& color = binding.color;
@@ -3009,8 +3171,12 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         targetViews.push_back(binding.target->View());
     }
     if (state.depth) {
-        targetViews.push_back(DepthSurfaceView(context, *state.depth, state.depthWrite));
+        if (!skipped) targetViews.push_back(DepthSurfaceView(context, *state.depth, state.depthWrite));
         if (writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
+    }
+    if (targetSkip && !skipped) {
+        if (skipVerify) verifyTargetSkip(context, prepared);
+        rememberTargets(context, state, prepared, Recorder::Active());
     }
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();

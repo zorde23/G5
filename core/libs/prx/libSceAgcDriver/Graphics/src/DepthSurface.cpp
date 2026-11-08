@@ -2437,6 +2437,21 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
     return surface->view;
 }
 
+VkImageView RepeatDepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten) {
+    if (!RuntimeSwitches::Set(RuntimeSwitch::DepthViewMemo)) return VK_NULL_HANDLE;
+    if (target.htileAddress != 0) {
+        auto* recorder = RecorderFor(context);
+        if (recorder != nullptr && recorder->PendingWriteOverlaps(target.htileAddress, static_cast<std::size_t>(HtileMetadataBytes(target.extent)))) return VK_NULL_HANDLE;
+    }
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    std::unique_lock lock(surfacesMutex());
+    auto* surface = depthViewMemoHit(context, target, depthWritten);
+    if (surface == nullptr) return VK_NULL_HANDLE;
+    depthViewMemoRepeat(*surface, target, depthWritten);
+    depthViewMemoHits.fetch_add(1, std::memory_order_relaxed);
+    return surface->view;
+}
+
 std::uint64_t DepthViewMemoHits() {
     return depthViewMemoHits.load(std::memory_order_relaxed);
 }

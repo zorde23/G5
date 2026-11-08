@@ -179,6 +179,7 @@ public:
     std::vector<PendingWrite> PendingWritesOver(std::uint64_t address, std::size_t bytes) const;
     void SetWriteDataHash(std::uint64_t hash) { writeDataHash = hash; }
     std::uint64_t WriteNoteCount() const { return writeNoteCount; }
+    bool PassOpenWith(std::uint64_t key) const { return open != nullptr && open->renderPass.open && open->renderPass.key == key; }
     bool WrittenAfterNote(std::uint64_t address, std::size_t bytes, std::uint64_t note) const;
     bool AfterPendingWrite(std::uint64_t address, std::size_t bytes, std::function<void()> action);
     void PendingWriteRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const;
