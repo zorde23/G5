@@ -1660,7 +1660,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 bool TargetMemoEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_TARGET_MEMO");
-        return value != nullptr && value[0] != ' ' && value[0] != '0';
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
     }();
     return enabled;
 }
