@@ -19,6 +19,7 @@ bool Driver::captureStable(std::span<const ShaderRecompiler::MemoryRegion> captu
     auto& known = ShaderRecompiler::ThreadOwned(knownSlot);
     for (const auto& region : captured) {
         if (!stable) break;
+        if (ShaderMemory::FinisherReadQueued(3, region.guestAddress, region.bytes.size())) ShaderMemory::NoteFinisherRead(region.guestAddress, region.bytes.data(), region.bytes.size());
         known.resize(region.bytes.size());
         const auto policy = validateSkipEnabled() ? classifyPendingWrite(region.guestAddress, region.bytes.size(), reason, pending, known) : Policy::Sync;
         if (policy == Policy::KnownValue || policy == Policy::VerifyKnownValue) {

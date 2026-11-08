@@ -95,6 +95,7 @@ CaptureProfile& CaptureTotals() {
 }
 
 std::atomic<ShaderMemory::WaitedMsProvider> waitedMsProvider{nullptr};
+std::atomic<ShaderMemory::FinisherReadQuery> finisherReadQuery{nullptr};
 
 double WaitedMs() {
     const auto provider = waitedMsProvider.load(std::memory_order_acquire);
@@ -153,6 +154,25 @@ SharedPagePool<TPage>& sharedPagePool() {
 
 void ShaderMemory::SetWaitedMsProvider(WaitedMsProvider provider) {
     waitedMsProvider.store(provider, std::memory_order_release);
+}
+
+void ShaderMemory::SetFinisherReadQuery(FinisherReadQuery query) {
+    finisherReadQuery.store(query, std::memory_order_release);
+}
+
+bool ShaderMemory::FinisherReadQueued(unsigned site, std::uint64_t address, std::size_t bytes) {
+    const auto query = finisherReadQuery.load(std::memory_order_acquire);
+    return query != nullptr && query(site, address, bytes);
+}
+
+void ShaderMemory::NoteFinisherRead(std::uint64_t address, const void* bytes, std::size_t size) {
+    const auto* first = static_cast<const std::byte*>(bytes);
+    FinisherReads().push_back({address, {first, first + size}});
+}
+
+std::vector<ShaderMemory::FinisherRead>& ShaderMemory::FinisherReads() {
+    thread_local std::vector<FinisherRead>* readsSlot = nullptr;
+    return ShaderRecompiler::ThreadOwned(readsSlot);
 }
 
 ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regions, PendingWriteQuery pendingWrite, PendingWriteObserver observe, HookWaitCounter hookWaits, PendingWriteQuery pendingSpan) : pendingWrite(pendingWrite), observe(observe), hookWaits(hookWaits), pendingSpan(pendingSpan != nullptr ? pendingSpan : pendingWrite) {
@@ -296,10 +316,14 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     const auto index = static_cast<std::size_t>((address % PageBytes) / sizeof(*value));
     if (!page.valid.Test(index) && page.lazy) {
         const auto first = index / BlockWords * BlockWords;
-        GuestMemory::CopyGuestBytes(&page.words[first], reinterpret_cast<const void*>((address & ~static_cast<std::uint64_t>(PageBytes - 1)) + first * sizeof(std::uint32_t)), BlockWords * sizeof(std::uint32_t));
+        const auto blockAddress = (address & ~static_cast<std::uint64_t>(PageBytes - 1)) + first * sizeof(std::uint32_t);
+        const bool queued = FinisherReadQueued(1, blockAddress, BlockWords * sizeof(std::uint32_t));
+        GuestMemory::CopyGuestBytes(&page.words[first], reinterpret_cast<const void*>(blockAddress), BlockWords * sizeof(std::uint32_t));
+        if (queued) NoteFinisherRead(blockAddress, &page.words[first], BlockWords * sizeof(std::uint32_t));
         page.valid.SetBlock(index);
     }
     if (!page.valid.Test(index)) {
+        const bool queued = FinisherReadQueued(2, address, sizeof(std::uint32_t));
         std::uint32_t word = 0;
         auto policy = PendingWrite::Sync;
         if (page.wordwise) {
@@ -358,6 +382,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
         if (CaptureProfiled()) CaptureTotals().wordReadNanoseconds += NanosecondsSince(fetchStarted);
         page.words[index] = word;
         page.valid.Set(index);
+        if (queued) NoteFinisherRead(address, &word, sizeof(word));
     }
     page.read.Set(index);
     page.recent.Set(index);
@@ -392,7 +417,9 @@ bool ShaderMemory::readWords(void* context, std::uint64_t address, std::uint32_t
                 }
                 auto last = first + BlockWords;
                 while (last < end && !page->valid.TestBlock(last)) last += BlockWords;
+                const bool queued = FinisherReadQueued(1, base + first * sizeof(std::uint32_t), (last - first) * sizeof(std::uint32_t));
                 GuestMemory::CopyGuestBytes(&page->words[first], reinterpret_cast<const void*>(base + first * sizeof(std::uint32_t)), (last - first) * sizeof(std::uint32_t));
+                if (queued) NoteFinisherRead(base + first * sizeof(std::uint32_t), &page->words[first], (last - first) * sizeof(std::uint32_t));
                 page->valid.SetRun(first, last - first);
                 first = last;
             }
@@ -495,8 +522,14 @@ bool ShaderMemory::place(std::uint64_t address, const std::uint32_t* values, std
                 if (!page.valid.Test(index + word)) page.words[index + word] = values[word];
             }
         }
-        if (headOpen && head < index) GuestMemory::CopyGuestBytes(&page.words[head], reinterpret_cast<const void*>(base + head * sizeof(std::uint32_t)), (index - head) * sizeof(std::uint32_t));
-        if (tailOpen && index + words < tail) GuestMemory::CopyGuestBytes(&page.words[index + words], reinterpret_cast<const void*>(base + (index + words) * sizeof(std::uint32_t)), (tail - index - words) * sizeof(std::uint32_t));
+        const auto lazyFill = [&](std::size_t first, std::size_t count) {
+            const auto fill = base + first * sizeof(std::uint32_t);
+            const bool queued = FinisherReadQueued(1, fill, count * sizeof(std::uint32_t));
+            GuestMemory::CopyGuestBytes(&page.words[first], reinterpret_cast<const void*>(fill), count * sizeof(std::uint32_t));
+            if (queued) NoteFinisherRead(fill, &page.words[first], count * sizeof(std::uint32_t));
+        };
+        if (headOpen && head < index) lazyFill(head, index - head);
+        if (tailOpen && index + words < tail) lazyFill(index + words, tail - index - words);
         page.valid.SetRun(page.lazy ? head : index, page.lazy ? tail - head : words);
         page.read.SetRun(index, words);
         if (recent) page.recent.SetRun(index, words);

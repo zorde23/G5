@@ -54,13 +54,10 @@ bool verifyFinisherReads() {
     return enabled;
 }
 
-struct FinisherRead {
-    std::uint64_t address = 0;
-    std::vector<std::byte> bytes;
-};
-
 struct FinisherReadCounts {
+    std::array<std::atomic<std::uint64_t>, 5> overlaps{};
     std::atomic<std::uint64_t> draws{0};
+    std::atomic<std::uint64_t> recorded{0};
     std::atomic<std::uint64_t> checked{0};
     std::atomic<std::uint64_t> stale{0};
     std::atomic<std::uint64_t> reported{0};
@@ -72,17 +69,13 @@ FinisherReadCounts& finisherReadCounts() {
     return counts;
 }
 
-std::vector<FinisherRead> queuedFinisherReads(std::span<const ShaderRecompiler::MemoryRegion> memory) {
-    std::vector<FinisherRead> flagged;
-    auto& queue = DrawPipeline::Queue0();
-    const auto note = [&](std::uint64_t address, std::span<const std::byte> bytes) {
-        if (!bytes.empty() && queue.Overlaps(address, bytes.size())) flagged.push_back({address, {bytes.begin(), bytes.end()}});
-    };
-    for (const auto& region : memory) note(region.guestAddress, region.bytes);
-    return flagged;
+bool finisherReadQueued(unsigned site, std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || !DrawFinisher::OnFinisherThread() || !DrawPipeline::Queue0().Overlaps(address, bytes)) return false;
+    finisherReadCounts().overlaps[site].fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
-void checkFinisherReads(std::span<const FinisherRead> reads) {
+void checkFinisherReads(std::span<const ShaderMemory::FinisherRead> reads) {
     auto& counts = finisherReadCounts();
     if (!reads.empty()) counts.draws.fetch_add(1, std::memory_order_relaxed);
     counts.checked.fetch_add(reads.size(), std::memory_order_relaxed);
@@ -98,7 +91,10 @@ void checkFinisherReads(std::span<const FinisherRead> reads) {
         return;
     }
     if (nowMs - last < 10000 || !counts.lastReport.compare_exchange_strong(last, nowMs)) return;
-    std::fprintf(stderr, "[finisher-reads] 10 s: draws with reads under queued writes %llu, checked %llu, stale %llu\n", static_cast<unsigned long long>(counts.draws.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counts.checked.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counts.stale.exchange(0, std::memory_order_relaxed)));
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    const auto r1 = take(counts.overlaps[1]), r2 = take(counts.overlaps[2]), r3 = take(counts.overlaps[3]), r4 = take(counts.overlaps[4]);
+    const auto draws = take(counts.draws), recorded = take(counts.recorded), checked = take(counts.checked), stale = take(counts.stale);
+    std::fprintf(stderr, "[finisher-reads] 10 s: overlaps at read R1 %llu, R2 %llu, R3 %llu, R4 %llu; draws with recorded reads %llu, regions recorded %llu, checked %llu, stale %llu\n", r1, r2, r3, r4, draws, recorded, checked, stale);
 }
 
 std::string ExceptionReason(const std::exception_ptr& failure) {
@@ -823,6 +819,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
+    const bool watchFinisherReads = verifyFinisherReads() && DrawFinisher::OnFinisherThread();
+    if (watchFinisherReads) {
+        ShaderMemory::SetFinisherReadQuery(&finisherReadQueued);
+        ShaderMemory::FinisherReads().clear();
+    }
     const bool profile = tail.profile;
     const auto traceToken = tail.traceToken;
     const auto& trace = tail.trace;
@@ -913,7 +914,13 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto& program = programs[i];
         if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
         decodeReads[i].clear();
+        const auto retired = watchFinisherReads ? DrawPipeline::Queue0().Retired() : 0;
         vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i], false, 8u - program.firstUserSgpr);
+        if (watchFinisherReads) {
+            for (const auto& read : decodeReads[i]) {
+                if (ShaderMemory::FinisherReadQueued(4, read.address, read.size) || DrawPipeline::Queue0().Retired() != retired) ShaderMemory::NoteFinisherRead(read.address, read.data.data(), read.size);
+            }
+        }
         if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, tail.reg207, program.tailContinuation.get()) | graphics.layerExports;
     };
     const auto fold = [&](const ShaderRecompiler::RecompileResult& main, Pm4::DrawParameters& parameters) { FoldDrawOffsets(main, programs.front(), parameters); };
@@ -1298,7 +1305,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto commitPacket = tail.packetOpcode;
         const auto epoch = DrawFinisher::OnFinisherThread() ? tail.epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
-        auto finisherReads = verifyFinisherReads() && DrawFinisher::OnFinisherThread() ? queuedFinisherReads(memory) : std::vector<FinisherRead>{};
+        auto finisherReads = watchFinisherReads ? std::move(ShaderMemory::FinisherReads()) : std::vector<ShaderMemory::FinisherRead>{};
+        if (watchFinisherReads) finisherReadCounts().recorded.fetch_add(finisherReads.size(), std::memory_order_relaxed);
         // APS5_FINISHER_DRAW_PREP; captured last, so its pipeline goes before the device.
         std::optional<Graphics::DrawPrep> prep;
         if (recipe == nullptr && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FinisherDrawPrep)) {

@@ -58,6 +58,15 @@ public:
     // by the driver: the [capture] line charges the waits made inside a capture to it.
     using WaitedMsProvider = double (*)();
     static void SetWaitedMsProvider(WaitedMsProvider provider);
+    struct FinisherRead {
+        std::uint64_t address = 0;
+        std::vector<std::byte> bytes;
+    };
+    using FinisherReadQuery = bool (*)(unsigned site, std::uint64_t address, std::size_t bytes);
+    static void SetFinisherReadQuery(FinisherReadQuery query);
+    static bool FinisherReadQueued(unsigned site, std::uint64_t address, std::size_t bytes);
+    static void NoteFinisherRead(std::uint64_t address, const void* bytes, std::size_t size);
+    static std::vector<FinisherRead>& FinisherReads();
     explicit ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> initial, PendingWriteQuery pendingWrite = nullptr, PendingWriteObserver observe = nullptr, HookWaitCounter hookWaits = nullptr, PendingWriteQuery pendingSpan = nullptr);
     ~ShaderMemory();
     ShaderMemory(const ShaderMemory&) = delete;
