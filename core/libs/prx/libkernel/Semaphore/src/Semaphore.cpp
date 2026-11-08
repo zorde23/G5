@@ -81,6 +81,12 @@ int APS5_VABI sceKernelWaitSema(KernelSema sem, int need, KernelUseconds* time) 
  }
 
  std::unique_lock<std::mutex> lock(sem->mutex);
+ if (time != nullptr && *time == 0 && sem->tokenCount < need && !sem->deleted) {
+  const void* caller = __builtin_return_address(0);
+  if (KernelTraceWaitEnabled()) KernelTraceWait_nid_postfix("sema", caller, 0, true);
+  if (TraceSync()) std::fprintf(stderr, "[sema] wait end %p '%s' result=0x%x have=%d caller=%p\n", static_cast<void*>(sem), sem->name.c_str(), SCE_KERNEL_ERROR_ETIMEDOUT, sem->tokenCount, caller);
+  return SCE_KERNEL_ERROR_ETIMEDOUT;
+ }
  const std::uint64_t generation = sem->cancelGeneration;
  ++sem->waiterCount;
  ++sem->cancelableCount;
