@@ -2258,6 +2258,8 @@ bool WriteOnlyPasses() {
     return enabled;
 }
 
+thread_local bool previousDrawWrote = false;
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr) {
     std::uint32_t subdraw = 0;
     auto* recorder = record.recorder;
@@ -2341,6 +2343,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         passWriteOnly = writeOnly;
     }
     const PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
+    previousDrawWrote = passAccess.anyWrites;
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || captured || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
@@ -2817,10 +2820,10 @@ std::uint64_t TargetSkipVerifyEvery() {
     return every;
 }
 
-enum class TargetSkipMiss : std::size_t { None, NoPrevious, Recorder, WriteNote, PassClosed, Targets, Dcc, Resident, DepthMemo, Count };
+enum class TargetSkipMiss : std::size_t { None, NoPrevious, Recorder, WriteNote, PassClosed, PreviousWrote, Targets, Dcc, Resident, DepthMemo, Count };
 
 struct TargetSkipCounts {
-    std::atomic<std::uint64_t> eligible{0}, skipped{0}, verified{0}, mismatches{0};
+    std::atomic<std::uint64_t> eligible{0}, skipped{0}, verified{0}, mismatches{0}, cpuWroteMetadata{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TargetSkipMiss::Count)> missed{};
     std::atomic<std::int64_t> reportedAt{0};
 };
@@ -2834,20 +2837,21 @@ void reportTargetSkip() {
     auto& counts = targetSkipCounts();
     const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
     if (counts.reportedAt.load(std::memory_order_relaxed) == tenSeconds || counts.reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
-    constexpr std::array<const char*, static_cast<std::size_t>(TargetSkipMiss::Count)> names{"", "no previous draw", "recorder", "write note", "pass closed", "targets or serials", "dcc", "resident gone", "depth memo"};
+    constexpr std::array<const char*, static_cast<std::size_t>(TargetSkipMiss::Count)> names{"", "no previous draw", "recorder", "write note", "pass closed", "prev wrote", "targets or serials", "dcc", "resident gone", "depth memo"};
     std::string text;
     char item[64];
     for (std::size_t index = 1; index < names.size(); ++index) {
         std::snprintf(item, sizeof(item), "%s %s %llu", index == 1 ? "" : ",", names[index], static_cast<unsigned long long>(counts.missed[index].load(std::memory_order_relaxed)));
         text += item;
     }
-    std::fprintf(stderr, "[target-skip] eligible %llu, skipped %llu, verified %llu, mismatches %llu; not skipped:%s\n", static_cast<unsigned long long>(counts.eligible.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.verified.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.mismatches.load(std::memory_order_relaxed)), text.c_str());
+    std::fprintf(stderr, "[target-skip] eligible %llu, skipped %llu, verified %llu, mismatches %llu, cpu-wrote-metadata %llu; not skipped:%s\n", static_cast<unsigned long long>(counts.eligible.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.verified.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.mismatches.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.cpuWroteMetadata.load(std::memory_order_relaxed)), text.c_str());
 }
 
 struct TargetSkipState {
     bool valid = false;
     Recorder* recorder = nullptr;
     std::uint64_t writeNote = 0;
+    std::uint64_t writeGeneration = 0;
     bool hasDepth = false;
     bool depthWritten = false;
     std::vector<TargetMemoKey> keys;
@@ -2864,6 +2868,7 @@ TargetSkipMiss targetSkipMiss(const Context& context, const State& state, Record
     if (recorder == nullptr || recorder != skip.recorder) return TargetSkipMiss::Recorder;
     if (recorder->WriteNoteCount() != skip.writeNote) return TargetSkipMiss::WriteNote;
     if (!recorder->PassOpenWith(DrawRenderPassKey(context, state, skip.views))) return TargetSkipMiss::PassClosed;
+    if (previousDrawWrote || recorder->OpenAddressStore()) return TargetSkipMiss::PreviousWrote;
     if (state.colors.size() != skip.keys.size() || state.depth.has_value() != skip.hasDepth || state.depthWrite != skip.depthWritten) return TargetSkipMiss::Targets;
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
         const auto& color = state.colors[index];
@@ -2903,6 +2908,21 @@ TargetSkipMiss reuseTargets(const Context& context, const State& state, Prepared
     return TargetSkipMiss::None;
 }
 
+bool targetMetadataUnchanged(const Context& context, const State& state) {
+    const auto& skip = targetSkipState;
+    const auto unchanged = [&](std::uint64_t address, std::size_t bytes) {
+        if (address == 0 || bytes == 0) return true;
+        GuestMemory::CollectWrites(address, bytes);
+        return GuestMemory::UnchangedSince(address, bytes, skip.writeGeneration);
+    };
+    bool same = !state.depth || DepthMetadataUnchanged(context, *state.depth);
+    for (const auto& color : state.colors) {
+        if (!unchanged(color.dccAddress, color.dccAddress != 0 ? DccKeyBytes(color.bytes) : 0)) same = false;
+        if (!unchanged(color.cmaskAddress, color.cmaskBytes)) same = false;
+    }
+    return same;
+}
+
 void verifyTargetSkip(const Context& context, const PreparedDraw& prepared) {
     const auto& skip = targetSkipState;
     targetSkipCounts().verified.fetch_add(1, std::memory_order_relaxed);
@@ -2940,6 +2960,7 @@ void rememberTargets(const Context& context, const State& state, const PreparedD
     }
     skip.recorder = recorder;
     skip.writeNote = recorder->WriteNoteCount();
+    skip.writeGeneration = GuestMemory::WriteGeneration();
     skip.hasDepth = state.depth.has_value();
     skip.depthWritten = state.depthWrite;
     skip.views = prepared.targetViews;
@@ -3014,6 +3035,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             counts.eligible.fetch_add(1, std::memory_order_relaxed);
             thread_local std::uint64_t eligibleDraws = 0;
             skipVerify = TargetSkipVerifyEvery() != 0 && ++eligibleDraws % TargetSkipVerifyEvery() == 0;
+            if (skipVerify && !targetMetadataUnchanged(context, state)) counts.cpuWroteMetadata.fetch_add(1, std::memory_order_relaxed);
             if (!skipVerify) miss = reuseTargets(context, state, prepared);
             skipped = !skipVerify && miss == TargetSkipMiss::None;
             if (skipped) counts.skipped.fetch_add(1, std::memory_order_relaxed);

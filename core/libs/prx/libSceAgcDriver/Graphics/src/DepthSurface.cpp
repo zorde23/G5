@@ -2452,6 +2452,30 @@ VkImageView RepeatDepthSurfaceView(const Context& context, const DepthTarget& ta
     return surface->view;
 }
 
+bool DepthMetadataUnchanged(const Context& context, const DepthTarget& target) {
+    if (target.htileAddress != 0) {
+        const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
+        auto* recorder = RecorderFor(context);
+        if (GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true) && (recorder == nullptr || !recorder->PendingWriteOverlaps(target.htileAddress, bytes))) {
+            GuestMemory::CollectWrites(target.htileAddress, bytes);
+            std::uint64_t generation = 0;
+            {
+                std::lock_guard lock(htileReadsMutex());
+                const auto found = htileReads().find(target.htileAddress);
+                generation = found == htileReads().end() ? 0 : found->second;
+            }
+            if (generation != 0 && !GuestMemory::UnchangedSince(target.htileAddress, bytes, generation)) return false;
+        }
+    }
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    std::lock_guard lock(surfacesMutex());
+    if (!clearedHtiles().empty()) return false;
+    for (const auto& surface : surfaces()) {
+        if (surface->active->load(std::memory_order_acquire) && surface->context.device == context.device && sameSurface(surface->target, target)) return surface->pendingClear == 0;
+    }
+    return true;
+}
+
 std::uint64_t DepthViewMemoHits() {
     return depthViewMemoHits.load(std::memory_order_relaxed);
 }

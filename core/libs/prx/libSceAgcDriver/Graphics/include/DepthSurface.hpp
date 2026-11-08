@@ -19,6 +19,7 @@ class StorageTexture;
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten = true);
 VkImageView RepeatDepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten);
+bool DepthMetadataUnchanged(const Context& context, const DepthTarget& target);
 // DepthSurfaceView calls APS5_DEPTH_VIEW_MEMO answered from the memo of the previous call.
 std::uint64_t DepthViewMemoHits();
 std::uint64_t HtileStoreBackReads();
