@@ -1691,8 +1691,9 @@ TargetMemoCounts& targetMemoCounts() {
 }
 
 TargetMemo<StorageTexture>& targetMemo() {
-    thread_local TargetMemo<StorageTexture> memo(TargetMemoVerifyEvery());
-    return memo;
+    thread_local TargetMemo<StorageTexture>* slot = nullptr;
+    if (slot == nullptr) ShaderRecompiler::ThreadOwned(slot).VerifyEvery(TargetMemoVerifyEvery());
+    return *slot;
 }
 
 void noteTargetMemoVerify(std::uint64_t address, bool same) {
@@ -2865,10 +2866,13 @@ struct TargetSkipState {
     std::vector<VkImageView> views;
 };
 
-thread_local TargetSkipState targetSkipState;
+TargetSkipState& targetSkipState() {
+    thread_local TargetSkipState* slot = nullptr;
+    return ShaderRecompiler::ThreadOwned(slot);
+}
 
 TargetSkipMiss targetSkipMiss(const Context& context, const State& state, Recorder* recorder) {
-    const auto& skip = targetSkipState;
+    const auto& skip = targetSkipState();
     if (!skip.valid) return TargetSkipMiss::NoPrevious;
     if (recorder == nullptr || recorder != skip.recorder) return TargetSkipMiss::Recorder;
     if (recorder->WriteNoteCount() != skip.writeNote) return TargetSkipMiss::WriteNote;
@@ -2888,7 +2892,7 @@ TargetSkipMiss targetSkipMiss(const Context& context, const State& state, Record
 }
 
 TargetSkipMiss reuseTargets(const Context& context, const State& state, PreparedDraw& prepared) {
-    const auto& skip = targetSkipState;
+    const auto& skip = targetSkipState();
     std::vector<std::shared_ptr<StorageTexture>> residents;
     residents.reserve(skip.residents.size());
     for (const auto& weak : skip.residents) {
@@ -2914,7 +2918,7 @@ TargetSkipMiss reuseTargets(const Context& context, const State& state, Prepared
 }
 
 bool targetMetadataUnchanged(const Context& context, const State& state) {
-    const auto& skip = targetSkipState;
+    const auto& skip = targetSkipState();
     const auto unchanged = [&](std::uint64_t address, std::size_t bytes) {
         if (address == 0 || bytes == 0) return true;
         GuestMemory::CollectWrites(address, bytes);
@@ -2929,7 +2933,7 @@ bool targetMetadataUnchanged(const Context& context, const State& state) {
 }
 
 void verifyTargetSkip(const PreparedDraw& prepared) {
-    const auto& skip = targetSkipState;
+    const auto& skip = targetSkipState();
     targetSkipCounts().verified.fetch_add(1, std::memory_order_relaxed);
     std::string differences;
     char item[192];
@@ -2948,7 +2952,7 @@ void verifyTargetSkip(const PreparedDraw& prepared) {
 }
 
 void rememberTargets(const Context& context, const State& state, const PreparedDraw& prepared, Recorder* recorder) {
-    auto& skip = targetSkipState;
+    auto& skip = targetSkipState();
     skip.valid = false;
     if (recorder == nullptr) return;
     skip.keys.clear();
@@ -3039,7 +3043,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             counts.eligible.fetch_add(1, std::memory_order_relaxed);
             thread_local std::uint64_t eligibleDraws = 0;
             skipVerify = TargetSkipVerifyEvery() != 0 && ++eligibleDraws % TargetSkipVerifyEvery() == 0;
-            if (skipVerify && !std::ranges::equal(state.colors, targetSkipState.keys, [&](const ColorTarget& color, const TargetMemoKey& key) { return targetMemoKey(context, color) == key; })) counts.keyDrift.fetch_add(1, std::memory_order_relaxed);
+            if (skipVerify && !std::ranges::equal(state.colors, targetSkipState().keys, [&](const ColorTarget& color, const TargetMemoKey& key) { return targetMemoKey(context, color) == key; })) counts.keyDrift.fetch_add(1, std::memory_order_relaxed);
             if (skipVerify && !targetMetadataUnchanged(context, state)) counts.cpuWroteMetadata.fetch_add(1, std::memory_order_relaxed);
             if (!skipVerify) miss = reuseTargets(context, state, prepared);
             skipped = !skipVerify && miss == TargetSkipMiss::None;

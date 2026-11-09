@@ -26,6 +26,7 @@ public:
     enum class Lookup : std::uint8_t { Miss, Hit, Verify };
 
     explicit TargetMemo(std::uint64_t verifyEvery = 0) : verifyEvery(verifyEvery) {}
+    void VerifyEvery(std::uint64_t every) { verifyEvery = every; }
 
     Lookup Find(std::uint64_t address, const TargetMemoKey& key, Entry*& found) {
         found = nullptr;
