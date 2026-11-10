@@ -225,6 +225,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
         running = true;
         thread = std::thread([this] {
             finisherThread = true;
+            GuestMemory::MarkFinisherProofThread();
             run();
         });
     }
@@ -377,7 +378,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     ++enqueued;
     heldReadRanges.fetch_add(reads.size(), std::memory_order_relaxed);
     countWrites(writes, true);
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw});
+    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw, GuestMemory::CurrentPacket().opcode});
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
         thread = std::thread([this] {
@@ -480,7 +481,7 @@ void DrawPipeline::run() {
         if (failed) ++commitErrors;
         if (fatal != nullptr && failure == nullptr) failure = fatal;
         outstanding.fetch_sub(1, std::memory_order_release);
-        if ((idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) || (fullWaiters != 0 && (items.size() <= Depth() / 2 || failure != nullptr))) {
+        if (retireWaiters != 0 || (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) || (fullWaiters != 0 && (items.size() <= Depth() / 2 || failure != nullptr))) {
             ++idleNotifies;
             idle.notify_all();
         }
@@ -564,17 +565,9 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
         if (lookup == DrawFinisher::LabelLookup::Value) return held;
         if (lookup == DrawFinisher::LabelLookup::Unknown) return std::nullopt;
     }
-    const auto end = address + bytes;
-    std::lock_guard lock(mutex);
-    for (auto item = items.rbegin(); item != items.rend(); ++item) {
-        const bool overlaps = std::any_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
-        if (!overlaps) continue;
-        if (item->labelBytes.empty() || address < item->labelAddress || end > item->labelAddress + item->labelBytes.size()) return std::nullopt;
-        std::uint64_t value = 0;
-        std::memcpy(&value, item->labelBytes.data() + (address - item->labelAddress), bytes);
-        return value;
-    }
-    return std::nullopt;
+    std::uint64_t value = 0;
+    if (!QueuedBytes(address, std::as_writable_bytes(std::span(&value, 1)).first(bytes))) return std::nullopt;
+    return value;
 }
 
 void DrawPipeline::countWrites(const std::vector<Range>& writes, bool added) {
@@ -588,6 +581,16 @@ void DrawPipeline::countWrites(const std::vector<Range>& writes, bool added) {
             queuedWrites.pop_back();
         }
     }
+    static const bool bounded = FinisherWaitQueue0() || FinisherQueuedBytes() || std::getenv("APS5_VERIFY_FINISHER_READS") != nullptr;
+    if (!bounded) return;
+    auto low = ~std::uint64_t{0};
+    std::uint64_t high = 0;
+    for (const auto& [range, count] : queuedWrites) {
+        low = std::min(low, range.first);
+        high = std::max(high, range.second);
+    }
+    queuedLow.store(low, std::memory_order_release);
+    queuedHigh.store(high, std::memory_order_release);
 }
 
 DrawPipeline::Watch DrawPipeline::WatchWrites() {
@@ -623,6 +626,74 @@ bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uin
         for (const auto& [address, end] : ranges) {
             if (address < range.second && range.first < end) return true;
         }
+    }
+    return false;
+}
+
+bool DrawPipeline::FinisherWaitQueue0() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_FINISHER_WAIT_QUEUE0");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool DrawPipeline::FinisherQueuedBytes() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_FINISHER_QUEUED_BYTES");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+DrawPipeline::QueuedWrite DrawPipeline::FirstQueuedWrite(std::uint64_t address, std::size_t bytes) {
+    const auto end = address + bytes;
+    if (address >= queuedHigh.load(std::memory_order_acquire) || queuedLow.load(std::memory_order_acquire) >= end) return {};
+    std::lock_guard lock(mutex);
+    for (std::size_t index = 0; index < items.size(); ++index) {
+        const auto& item = items[index];
+        for (const auto& range : item.writes) {
+            if (address < range.second && range.first < end) return {true, item.draw, item.opcode, item.labelAddress, retiredItems.load(std::memory_order_relaxed) + index, index, range};
+        }
+    }
+    return {};
+}
+
+bool DrawPipeline::WaitRetired(std::span<const Range> ranges) {
+    if (!DrawFinisher::OnFinisherThread()) throw std::runtime_error("draw pipeline wait for retired writes off the draw finisher");
+    if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline wait for retired writes under the GPU lock");
+    const auto low = queuedLow.load(std::memory_order_acquire), high = queuedHigh.load(std::memory_order_acquire);
+    if (std::none_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.first < high && low < range.second; })) return false;
+    std::unique_lock lock(mutex);
+    if (thread.get_id() == std::this_thread::get_id()) throw std::runtime_error("draw pipeline wait for retired writes on the committer");
+    const auto clear = [&] {
+        return std::none_of(queuedWrites.begin(), queuedWrites.end(), [&](const auto& entry) {
+            return std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.first < entry.first.second && entry.first.first < range.second; });
+        });
+    };
+    if (clear()) return false;
+    ++retireWaiters;
+    idle.wait(lock, clear);
+    --retireWaiters;
+    finisherWaits.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool DrawPipeline::WaitRetired(std::uint64_t address, std::size_t bytes) {
+    const Range range{address, address + bytes};
+    return WaitRetired(std::span(&range, 1));
+}
+
+bool DrawPipeline::QueuedBytes(std::uint64_t address, std::span<std::byte> bytes) {
+    const auto end = address + bytes.size();
+    if (bytes.empty() || (DrawFinisher::OnFinisherThread() && (address >= queuedHigh.load(std::memory_order_acquire) || queuedLow.load(std::memory_order_acquire) >= end))) return false;
+    std::lock_guard lock(mutex);
+    for (auto item = items.rbegin(); item != items.rend(); ++item) {
+        const bool overlaps = std::any_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
+        if (!overlaps) continue;
+        if (item->labelBytes.empty() || address < item->labelAddress || end > item->labelAddress + item->labelBytes.size()) return false;
+        std::memcpy(bytes.data(), item->labelBytes.data() + (address - item->labelAddress), bytes.size());
+        return true;
     }
     return false;
 }

@@ -1745,6 +1745,9 @@ std::uint64_t CollectEpochBumps() {
 namespace {
 std::atomic<std::uint64_t> proofSerial{1};
 thread_local bool proofThread = false;
+thread_local bool finisherProofThread = false;
+const bool countProofBreaks = std::getenv("APS5_VERIFY_FINISHER_READS") != nullptr;
+std::array<std::atomic<std::uint64_t>, 3> proofBreaks{};
 }
 
 std::uint64_t ProofSerial() {
@@ -1753,10 +1756,21 @@ std::uint64_t ProofSerial() {
 
 void BreakProofs() {
     proofSerial.fetch_add(1, std::memory_order_acq_rel);
+    if (!countProofBreaks) return;
+    proofBreaks[0].fetch_add(1, std::memory_order_relaxed);
+    if (finisherProofThread || proofThread) proofBreaks[finisherProofThread ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
 }
 
 void MarkProofThread() {
     proofThread = true;
+}
+
+void MarkFinisherProofThread() {
+    finisherProofThread = true;
+}
+
+ProofBreaks TakeProofBreaks() {
+    return {proofBreaks[0].exchange(0, std::memory_order_relaxed), proofBreaks[1].exchange(0, std::memory_order_relaxed), proofBreaks[2].exchange(0, std::memory_order_relaxed)};
 }
 
 std::uint64_t CollectEpoch() {

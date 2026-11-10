@@ -49,6 +49,72 @@ std::atomic<std::uint64_t>& NextDrawTraceToken() {
     return next;
 }
 
+bool verifyFinisherReads() {
+    static const bool enabled = std::getenv("APS5_VERIFY_FINISHER_READS") != nullptr;
+    return enabled;
+}
+
+const auto driverLoaded = std::chrono::steady_clock::now();
+
+double finisherReadDetailAfterSeconds() {
+    static const double seconds = [] {
+        const char* text = std::getenv("APS5_VERIFY_FINISHER_READS_DETAIL_AFTER_S");
+        return text == nullptr ? 0.0 : std::strtod(text, nullptr);
+    }();
+    return seconds;
+}
+
+struct FinisherReadCounts {
+    std::array<std::atomic<std::uint64_t>, 5> overlaps{};
+    std::atomic<std::uint64_t> draws{0};
+    std::atomic<std::uint64_t> recorded{0};
+    std::atomic<std::uint64_t> checked{0};
+    std::atomic<std::uint64_t> stale{0};
+    std::atomic<std::uint64_t> reported{0};
+    std::atomic<long long> lastReport{0};
+};
+
+FinisherReadCounts& finisherReadCounts() {
+    static FinisherReadCounts counts;
+    return counts;
+}
+
+bool finisherReadQueued(unsigned site, std::uint64_t address, std::size_t bytes, ShaderMemory::FinisherReadOrigin& origin) {
+    if (bytes == 0 || !DrawFinisher::OnFinisherThread()) return false;
+    const auto hit = DrawPipeline::Queue0().FirstQueuedWrite(address, bytes);
+    if (!hit.found) return false;
+    origin = {site, true, hit.draw, hit.opcode, hit.labelAddress, hit.sequence, hit.index, hit.write.first, hit.write.second};
+    finisherReadCounts().overlaps[site].fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void checkFinisherReads(std::span<const ShaderMemory::FinisherRead> reads) {
+    auto& counts = finisherReadCounts();
+    if (!reads.empty()) counts.draws.fetch_add(1, std::memory_order_relaxed);
+    counts.checked.fetch_add(reads.size(), std::memory_order_relaxed);
+    for (const auto& read : reads) {
+        if (GuestMemory::EqualsCommitted(read.address, read.bytes)) continue;
+        counts.stale.fetch_add(1, std::memory_order_relaxed);
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - driverLoaded).count() < finisherReadDetailAfterSeconds() || counts.reported.fetch_add(1, std::memory_order_relaxed) >= 20) continue;
+        const auto& origin = read.origin;
+        std::fprintf(stderr, "[finisher-reads] stale: 0x%llx+0x%zx read by the finisher at R%u differs from the committed bytes before its draw; queued at read: %s item #%llu (index %zu), opcode 0x%x, label 0x%llx, write [0x%llx, 0x%llx)\n", static_cast<unsigned long long>(read.address), read.bytes.size(), origin.site, origin.found ? (origin.draw ? "draw" : "non-draw") : "no", static_cast<unsigned long long>(origin.sequence), origin.index, origin.opcode, static_cast<unsigned long long>(origin.labelAddress), static_cast<unsigned long long>(origin.writeBegin), static_cast<unsigned long long>(origin.writeEnd));
+    }
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counts.lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        counts.lastReport.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 10000 || !counts.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    const auto r1 = take(counts.overlaps[1]), r2 = take(counts.overlaps[2]), r3 = take(counts.overlaps[3]), r4 = take(counts.overlaps[4]);
+    const auto draws = take(counts.draws), recorded = take(counts.recorded), checked = take(counts.checked), stale = take(counts.stale);
+    auto& queue = DrawPipeline::Queue0();
+    const auto waited = static_cast<unsigned long long>(queue.TakeFinisherWaits()), known = static_cast<unsigned long long>(queue.TakeFinisherKnown());
+    const auto breaks = GuestMemory::TakeProofBreaks();
+    std::fprintf(stderr, "[finisher-reads] 10 s: overlaps at read R1 %llu, R2 %llu, R3 %llu, R4 %llu; waited-on-queue %llu, known-from-queue %llu; draws with recorded reads %llu, regions recorded %llu, checked %llu, stale %llu; proof breaks %llu (finisher %llu, committer %llu)\n", r1, r2, r3, r4, waited, known, draws, recorded, checked, stale, static_cast<unsigned long long>(breaks.total), static_cast<unsigned long long>(breaks.finisher), static_cast<unsigned long long>(breaks.committer));
+}
+
 std::string ExceptionReason(const std::exception_ptr& failure) {
     try {
         if (failure != nullptr) std::rethrow_exception(failure);
@@ -771,6 +837,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
+    const bool watchFinisherReads = verifyFinisherReads() && DrawFinisher::OnFinisherThread();
+    if (watchFinisherReads) {
+        ShaderMemory::SetFinisherReadQuery(&finisherReadQueued);
+        ShaderMemory::FinisherReads().clear();
+    }
     const bool profile = tail.profile;
     const auto traceToken = tail.traceToken;
     const auto& trace = tail.trace;
@@ -861,7 +932,22 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto& program = programs[i];
         if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
         decodeReads[i].clear();
+        const auto retired = watchFinisherReads ? DrawPipeline::Queue0().Retired() : 0;
         vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i], false, 8u - program.firstUserSgpr);
+        const auto decodeRanges = [&] {
+            std::vector<DrawPipeline::Range> ranges;
+            for (const auto& read : decodeReads[i]) ranges.emplace_back(read.address, read.address + read.size);
+            return ranges;
+        };
+        while (DrawPipeline::FinisherWaitQueue0() && DrawFinisher::OnFinisherThread() && DrawPipeline::Queue0().WaitRetired(decodeRanges())) {
+            decodeReads[i].clear();
+            vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i], false, 8u - program.firstUserSgpr);
+        }
+        if (watchFinisherReads) {
+            for (const auto& read : decodeReads[i]) {
+                if (ShaderMemory::FinisherReadQueued(4, read.address, read.size) || DrawPipeline::Queue0().Retired() != retired) ShaderMemory::NoteFinisherRead(read.address, read.data.data(), read.size);
+            }
+        }
         if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, tail.reg207, program.tailContinuation.get()) | graphics.layerExports;
     };
     const auto fold = [&](const ShaderRecompiler::RecompileResult& main, Pm4::DrawParameters& parameters) { FoldDrawOffsets(main, programs.front(), parameters); };
@@ -1246,6 +1332,9 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto commitPacket = tail.packetOpcode;
         const auto epoch = DrawFinisher::OnFinisherThread() ? tail.epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
+        auto finisherReads = watchFinisherReads ? std::move(ShaderMemory::FinisherReads()) : std::vector<ShaderMemory::FinisherRead>{};
+        if (watchFinisherReads && shaderMemory != nullptr) shaderMemory->KeepReadWords(finisherReads);
+        if (watchFinisherReads) finisherReadCounts().recorded.fetch_add(finisherReads.size(), std::memory_order_relaxed);
         // APS5_FINISHER_DRAW_PREP; captured last, so its pipeline goes before the device.
         std::optional<Graphics::DrawPrep> prep;
         if (recipe == nullptr && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FinisherDrawPrep)) {
@@ -1254,8 +1343,9 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             prep = Graphics::PrepareDrawPure(localDevice->graphicsContext(), graphics, drawParameters, stages, &skip);
             if (!prep.has_value()) Graphics::NoteDrawPrepSkip(skip);
         }
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), prep = std::move(prep)]() mutable {
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), prep = std::move(prep), finisherReads = std::move(finisherReads)]() mutable {
             DrawPipeline::FollowEpoch(epoch);
+            if (verifyFinisherReads()) checkFinisherReads(finisherReads);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
             commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, trace, shape, prep.has_value() ? &*prep : nullptr);
         };
