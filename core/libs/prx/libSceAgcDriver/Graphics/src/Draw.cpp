@@ -1593,6 +1593,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     fetchOf.assign(attributes.size(), 0);
     auto& zeroed = scratch.zeroed;
     zeroed.assign(attributes.size(), nullptr);
+    struct ReleaseZeroed {
+        std::vector<std::shared_ptr<Buffer>>& buffers;
+        ~ReleaseZeroed() { buffers.clear(); }
+    } releaseZeroed{zeroed};
     const auto& layout = inputs.VertexLayout();
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         const auto& attribute = attributes[i];
@@ -1850,7 +1854,7 @@ void recordDrawCommands(const Context& context, VkCommandBuffer commands, const 
     if (context.recorder != nullptr) context.recorder->NoteSampledDraw(commands);
     const auto recorded = [&](std::uint32_t index) {
         if (trace != nullptr && context.recorder != nullptr) {
-            context.recorder->NoteDrawTraceToken(trace->token);
+            if (CaptureTrace::Enabled()) context.recorder->NoteDrawTraceToken(trace->token);
             CaptureTrace::Log("draw-recorded token=%llu batch=%llu submission=%llu queue=%u offset=%zu target=%llx subdraw=%u", static_cast<unsigned long long>(trace->token), static_cast<unsigned long long>(context.recorder->OpenBatchSerial()), static_cast<unsigned long long>(trace->submission), trace->queue, trace->offset, static_cast<unsigned long long>(trace->target), index);
         }
     };
@@ -2330,12 +2334,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (!gpuIndirect) return false;
         return (begin < args->arguments + args->RangeBytes() && args->arguments < end) || (args->countIndirect && begin < args->countAddress + 4 && args->countAddress < end);
     };
-    if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) {
+    if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(std::cref(touches)))) {
         recorder->FlushKeyStores();
         outcome.keyStoresFlushed = true;
     }
     // A queued label store over such memory likewise (Recorder::RecordStore).
-    if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) {
+    if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(std::cref(touches)))) {
         recorder->FlushStores();
         outcome.storesFlushed = true;
     }
@@ -2354,7 +2358,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     passReads.insert(passReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
     const auto passImages = resources.StorageImages();
-    std::vector<std::pair<VkImage, bool>> passAttachments;
+    static const bool recordScratch = std::getenv("APS5_RECORD_SCRATCH") != nullptr;
+    std::vector<std::pair<VkImage, bool>> ownAttachments;
+    thread_local std::vector<std::pair<VkImage, bool>>* passAttachmentsSlot = nullptr;
+    auto& passAttachments = recordScratch ? ShaderRecompiler::ThreadOwned(passAttachmentsSlot) : ownAttachments;
+    passAttachments.clear();
     passAttachments.reserve(record.targets.size());
     for (const auto& target : record.targets) {
         if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
@@ -3562,6 +3570,8 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         record.framebuffer = framebuffer;
         record.targetViews = targetViews;
         record.targets = owners;
+        static const bool recordScratch = std::getenv("APS5_RECORD_SCRATCH") != nullptr;
+        if (recordScratch) record.targetSlices.reserve(targets.size());
         for (const auto& binding : targets) record.targetSlices.emplace_back(binding.color.arraySlice, binding.color.arrayLastSlice != 0 ? binding.color.layers : 1u);
         for (const auto& binding : targets) {
             if (binding.proxied) record.proxies.push_back(binding.resident);
@@ -3639,9 +3649,9 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     // A queued DCC key store over memory the draw writes or reads in place (unknown for an
     // address-based build), or over its GPU-side records, lands before it, as before a dispatch
     // (VulkanDevice::dispatch).
-    if (recorded && recorder->HasQueuedKeyStores() && (resources->HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
+    if (recorded && recorder->HasQueuedKeyStores() && (resources->HoldsLease() || recorder->AnyQueuedKeyStore(std::cref(touches)))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
-    if (recorded && recorder->HasQueuedStores() && (resources->HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
+    if (recorded && recorder->HasQueuedStores() && (resources->HoldsLease() || recorder->AnyQueuedStore(std::cref(touches)))) recorder->FlushStores();
     const auto commands = recorded ? recorder->Commands() : batch->Handle();
     if (recorded) recorder->PrepareSampleSlot();
     APS5_LOG_CHARS_OUT_DEBUG("CommandBatch created");

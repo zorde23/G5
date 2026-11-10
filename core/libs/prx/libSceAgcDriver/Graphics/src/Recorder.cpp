@@ -3935,7 +3935,7 @@ void Recorder::Submit() {
     // The timeline reaches this batch's serial when it completes (see WaitSerial).
     const std::uint64_t serial = submissions + 1;
     std::string tokensStr = "[";
-    for (std::size_t i = 0; i < batch->drawTraceTokens.size(); ++i) {
+    for (std::size_t i = 0; CaptureTrace::Enabled() && i < batch->drawTraceTokens.size(); ++i) {
         if (i > 0) tokensStr += ",";
         tokensStr += std::to_string(batch->drawTraceTokens[i]);
     }
