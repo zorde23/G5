@@ -4019,6 +4019,42 @@ std::optional<DrawPrep> PrepareDrawPure(const Context& context, const State& sta
     return prep;
 }
 
+namespace {
+
+std::uint32_t touchEvery() {
+    static const std::uint32_t every = [] {
+        const char* text = std::getenv("APS5_TOUCH_AMORTIZED");
+        return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+    }();
+    return every;
+}
+
+void notePrepTouch(bool touched) {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!stats) return;
+    static std::atomic<std::uint64_t> touches{0}, skipped{0};
+    static std::atomic<std::int64_t> reportedAt{0};
+    (touched ? touches : skipped).fetch_add(1, std::memory_order_relaxed);
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    std::fprintf(stderr, "[prep-touch] 10 s: %llu draw preps touched the pipeline store (its mutex), %llu skipped the touch (APS5_TOUCH_AMORTIZED %u)\n", static_cast<unsigned long long>(touches.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(skipped.exchange(0, std::memory_order_relaxed)), touchEvery());
+}
+
+bool prepPipelineCurrent(const Context& context, const DrawPrep& prep) {
+    const auto every = touchEvery();
+    auto& pipeline = *prep.pipeline;
+    if (every > 1 && !pipeline.abandoned.load(std::memory_order_acquire) && (context.bufferPool == nullptr || pipeline.touchedPool.load(std::memory_order_acquire).lock() == context.bufferPool) && pipeline.prepUses.fetch_add(1, std::memory_order_relaxed) % every != 0) {
+        notePrepTouch(false);
+        return true;
+    }
+    notePrepTouch(true);
+    if (TouchCachedPipeline(context, prep.storeHash, prep.pipeline, false) != prep.pipeline) return false;
+    if (every > 1) pipeline.touchedPool.store(std::weak_ptr<void>(context.bufferPool), std::memory_order_release);
+    return true;
+}
+
+}
+
 DrawPrepReject CheckDrawPrep(const Context& context, const DrawPrep& prep, const PipelineSetLayouts& built, bool lean, bool plainTargets) {
     if (prep.device != context.device) return DrawPrepReject::Device;
     if (!lean) return DrawPrepReject::NotLean;
@@ -4026,7 +4062,7 @@ DrawPrepReject CheckDrawPrep(const Context& context, const DrawPrep& prep, const
     const auto& described = prep.layouts;
     if (described.layouts.main != built.main || described.layouts.fragment != built.fragment || described.layouts.split != built.split || !std::ranges::equal(described.mainKey, built.mainKey) || !std::ranges::equal(described.fragmentKey, built.fragmentKey)) return DrawPrepReject::Layouts;
     // A private pipeline (hash collision) is the draw's own; a stored one must still be the entry.
-    if (prep.pipeline == nullptr || (prep.storeHash != 0 && TouchCachedPipeline(context, prep.storeHash, prep.pipeline, false) != prep.pipeline)) return DrawPrepReject::PipelineGone;
+    if (prep.pipeline == nullptr || (prep.storeHash != 0 && !prepPipelineCurrent(context, prep))) return DrawPrepReject::PipelineGone;
     return DrawPrepReject::None;
 }
 

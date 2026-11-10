@@ -4,6 +4,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RecordedDrawState.hpp"
+#include <atomic>
+#include <memory>
 #include <set>
 
 namespace AgcDriver::Graphics {
@@ -66,6 +68,9 @@ public:
     void PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
     // Forgets the Vulkan objects without destroying them: for entries of a device that is already gone.
     void Abandon() noexcept;
+    std::atomic<std::uint32_t> prepUses{0};
+    std::atomic<bool> abandoned{false};
+    std::atomic<std::weak_ptr<void>> touchedPool;
 
 private:
     struct CachedFramebuffer {

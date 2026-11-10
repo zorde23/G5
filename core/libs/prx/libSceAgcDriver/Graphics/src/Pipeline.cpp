@@ -795,6 +795,7 @@ void Pipeline::release() noexcept {
 }
 
 void Pipeline::Abandon() noexcept {
+    abandoned.store(true, std::memory_order_release);
     if (optimized != nullptr) optimized->released.store(true);
     optimized.reset();
     for (auto& entry : framebuffers) entry.framebuffer->Abandon();
@@ -1432,6 +1433,7 @@ void ClearCachedPipelines(VkDevice device) {
             continue;
         }
         store.index.erase(it->hash);
+        it->pipeline->abandoned.store(true, std::memory_order_release);
         it = store.entries.erase(it);
     }
     if (store.entries.empty() && !store.fixedCapacity) {
