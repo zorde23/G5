@@ -1322,6 +1322,24 @@ std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, std::size_t byt
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed; with `prep` they are the draw finisher's (PrepareDrawPure).
+struct VertexScratch {
+    std::vector<VertexFetch> fetches;
+    std::vector<std::size_t> fetchValid;
+    std::vector<std::size_t> fetchOf;
+    std::vector<std::shared_ptr<Buffer>> zeroed;
+    std::vector<bool> isSolo;
+    std::vector<VertexFetch> plannedFetches;
+    std::vector<std::size_t> plannedOf;
+    std::vector<VkBuffer> rangeHandles;
+    std::vector<VkDeviceSize> rangeOffsets;
+    std::vector<VkBuffer> soloHandles;
+};
+
+bool vertexScratchReused() {
+    static const bool reused = std::getenv("APS5_VERTEX_SCRATCH") != nullptr;
+    return reused;
+}
+
 DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, const DrawPrep* prep = nullptr) {
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
@@ -1562,12 +1580,19 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - inputs.maxIndex, "indexed draw vertex range overflow");
         inputs.maxIndex += draw.firstVertex;
     }
-    std::vector<VertexFetch> fetches;
-    std::vector<std::size_t> fetchValid;
+    VertexScratch own;
+    thread_local VertexScratch* reusedSlot = nullptr;
+    auto& scratch = vertexScratchReused() ? ShaderRecompiler::ThreadOwned(reusedSlot) : own;
+    auto& fetches = scratch.fetches;
+    auto& fetchValid = scratch.fetchValid;
+    fetches.clear();
+    fetchValid.clear();
     fetches.reserve(attributes.size());
     fetchValid.reserve(attributes.size());
-    std::vector<std::size_t> fetchOf(attributes.size(), 0);
-    std::vector<std::shared_ptr<Buffer>> zeroed(attributes.size());
+    auto& fetchOf = scratch.fetchOf;
+    fetchOf.assign(attributes.size(), 0);
+    auto& zeroed = scratch.zeroed;
+    zeroed.assign(attributes.size(), nullptr);
     const auto& layout = inputs.VertexLayout();
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         const auto& attribute = attributes[i];
@@ -1592,19 +1617,24 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         fetchValid.push_back(args == nullptr && stride != 0 ? static_cast<std::size_t>(std::min(recordBytes, static_cast<std::uint64_t>(bytes))) : bytes);
     }
     const auto soloFetches = SoloZeroPaddedFetchIndices(fetches, fetchValid);
-    std::vector<bool> isSolo(fetches.size(), false);
+    auto& isSolo = scratch.isSolo;
+    isSolo.assign(fetches.size(), false);
     for (const auto f : soloFetches) isSolo[f] = true;
-    std::vector<VertexFetch> plannedFetches;
+    auto& plannedFetches = scratch.plannedFetches;
+    plannedFetches.clear();
     plannedFetches.reserve(fetches.size());
-    std::vector<std::size_t> plannedOf(fetches.size(), 0);
+    auto& plannedOf = scratch.plannedOf;
+    plannedOf.assign(fetches.size(), 0);
     for (std::size_t f = 0; f < fetches.size(); ++f) {
         if (isSolo[f]) continue;
         plannedOf[f] = plannedFetches.size();
         plannedFetches.push_back(fetches[f]);
     }
     const auto plan = PlanVertexCopies(plannedFetches);
-    std::vector<VkBuffer> rangeHandles;
-    std::vector<VkDeviceSize> rangeOffsets;
+    auto& rangeHandles = scratch.rangeHandles;
+    auto& rangeOffsets = scratch.rangeOffsets;
+    rangeHandles.clear();
+    rangeOffsets.clear();
     rangeHandles.reserve(plan.copies.size());
     rangeOffsets.reserve(plan.copies.size());
     for (std::size_t range = 0; range < plan.copies.size(); ++range) {
@@ -1624,7 +1654,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         rangeOffsets.push_back(0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
-    std::vector<VkBuffer> soloHandles(fetches.size(), VK_NULL_HANDLE);
+    auto& soloHandles = scratch.soloHandles;
+    soloHandles.assign(fetches.size(), VK_NULL_HANDLE);
     for (const auto f : soloFetches) {
         const auto begin = fetches[f].begin;
         const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
