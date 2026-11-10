@@ -2037,20 +2037,35 @@ struct Kept {
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
 void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::pair<std::uint32_t, std::uint32_t>> slices, VkRect2D scissor, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
-    auto kept = std::make_shared<Kept>();
-    kept->resources = resources;
-    kept->pipeline = std::move(pipeline);
-    kept->framebuffer = std::move(framebuffer);
-    kept->indices = std::move(inputs.indices);
-    kept->vertexBuffers = std::move(inputs.vertexBuffers);
-    kept->scratch = std::move(scratch);
-    kept->targets = std::move(targets);
-    const auto& residents = kept->targets;
+    static const bool flat = std::getenv("APS5_KEEP_FLAT") != nullptr;
+    std::shared_ptr<Kept> kept;
+    if (flat) {
+        if (scratch != nullptr) recorder.Keep(std::shared_ptr<DeviceBuffer>(std::move(scratch)));
+        for (const auto& target : targets) {
+            if (target != nullptr) recorder.Keep(target);
+        }
+        for (auto& buffer : inputs.vertexBuffers) recorder.Keep(std::move(buffer));
+        inputs.vertexBuffers.clear();
+        if (inputs.indices != nullptr) recorder.Keep(std::move(inputs.indices));
+        if (framebuffer != nullptr) recorder.Keep(std::move(framebuffer));
+        if (pipeline != nullptr) recorder.Keep(std::move(pipeline));
+        recorder.Keep(resources);
+    } else {
+        kept = std::make_shared<Kept>();
+        kept->resources = resources;
+        kept->pipeline = std::move(pipeline);
+        kept->framebuffer = std::move(framebuffer);
+        kept->indices = std::move(inputs.indices);
+        kept->vertexBuffers = std::move(inputs.vertexBuffers);
+        kept->scratch = std::move(scratch);
+        kept->targets = std::move(targets);
+    }
+    const auto& residents = flat ? targets : kept->targets;
     resources->KeepStorageImageBytes(recorder);
     for (const auto& target : residents) {
         if (target != nullptr && !target->Cached()) recorder.KeepBytes(target.get(), static_cast<std::size_t>(target->BudgetBytes()));
     }
-    recorder.Keep(kept);
+    if (!flat) recorder.Keep(kept);
     if (resources != nullptr) recorder.KeepBytes(resources.get(), resources->CopiedBytes());
     if (checkRecords) recorder.OnComplete(std::move(checkRecords));
     // Counted for the [address-sync] line: a lease released by the completion (the pin waiter
