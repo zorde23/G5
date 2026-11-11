@@ -320,6 +320,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/KeyboardOverlay.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Screenshot.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Draw.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/RInline.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DepthSurface.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MultisampleTarget.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/FirstSampleCopy.cpp

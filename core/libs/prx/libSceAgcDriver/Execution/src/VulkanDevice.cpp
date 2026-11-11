@@ -1183,7 +1183,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->window = window->context;
         APS5_LOG_OUT("Vulkan surface created surface=%p window=%p", reinterpret_cast<void*>(state->surface), state->window);
     }
-    state->deviceProc = state->InstanceFunction<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");
+    state->deviceProc = Graphics::InlineDeviceProc(state->InstanceFunction<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr"));
     const auto enumerate = state->InstanceFunction<PFN_vkEnumeratePhysicalDevices>("vkEnumeratePhysicalDevices");
     std::uint32_t count = 0;
     check(enumerate(state->instance, &count, nullptr), "vkEnumeratePhysicalDevices");

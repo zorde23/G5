@@ -2497,10 +2497,15 @@ bool GpuMutexType::try_lock() {
 
 namespace {
 std::atomic<void (*)()> gpuUnlockHook{nullptr};
+std::atomic<void (*)()> gpuReleaseHook{nullptr};
 }
 
 void SetGpuUnlockHook(void (*hook)()) {
     gpuUnlockHook.store(hook, std::memory_order_release);
+}
+
+void SetGpuReleaseHook(void (*hook)()) {
+    gpuReleaseHook.store(hook, std::memory_order_release);
 }
 
 std::uint64_t GpuHoldSerial() {
@@ -2508,6 +2513,9 @@ std::uint64_t GpuHoldSerial() {
 }
 
 void GpuMutexType::unlock() {
+    if (depth == 1) {
+        if (auto* hook = gpuReleaseHook.load(std::memory_order_acquire); hook != nullptr) hook();
+    }
     const bool outermost = --depth == 0;
     if (outermost) {
         owner.store(nullptr, std::memory_order_relaxed);

@@ -143,6 +143,8 @@ struct DeviceFunctions {
     PFN_vkGetFenceStatus getFenceStatus = nullptr;
 };
 
+PFN_vkGetDeviceProcAddr InlineDeviceProc(PFN_vkGetDeviceProcAddr real);
+
 // Per-thread count of vkGetDeviceProcAddr lookups made through Context::Function (the [vk] line).
 inline std::uint64_t& DeviceProcLookups() {
     thread_local std::uint64_t count = 0;
