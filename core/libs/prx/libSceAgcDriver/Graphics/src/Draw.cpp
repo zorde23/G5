@@ -1322,6 +1322,8 @@ std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, std::size_t byt
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed; with `prep` they are the draw finisher's (PrepareDrawPure).
+namespace {
+
 struct VertexScratch {
     std::vector<VertexFetch> fetches;
     std::vector<std::size_t> fetchValid;
@@ -1338,6 +1340,8 @@ struct VertexScratch {
 bool vertexScratchReused() {
     static const bool reused = std::getenv("APS5_VERTEX_SCRATCH") != nullptr;
     return reused;
+}
+
 }
 
 DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, const DrawPrep* prep = nullptr) {

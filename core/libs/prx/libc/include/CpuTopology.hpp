@@ -184,6 +184,10 @@ inline std::uint64_t ReservedCore() {
     static const std::uint64_t reserved = [] {
 #ifdef _WIN32
         if (std::getenv("APS5_COMMITTER_CORE") == nullptr) return std::uint64_t{0};
+        if (const auto groups = GetActiveProcessorGroupCount(); groups > 1) {
+            std::fprintf(stderr, "[affinity] committer core: off (%u processor groups, only one is supported)\n", static_cast<unsigned>(groups));
+            return std::uint64_t{0};
+        }
         const auto& layout = Get();
         const auto core = ReservedCoreFrom(layout);
         if (core == 0) {
