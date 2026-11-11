@@ -68,7 +68,7 @@ struct Stats {
 };
 
 Stats stats;
-std::atomic<std::uint64_t> unguardedCommands{0}, unguardedOther{0}, presents{0}, replayNs{0}, notifies{0}, notifyNs{0}, spinUs{100}, failures{0}, verified{0}, mismatches{0};
+std::atomic<std::uint64_t> unguardedCommands{0}, unguardedOther{0}, unguardedUpdates{0}, presents{0}, replayNs{0}, notifies{0}, notifyNs{0}, spinUs{100}, failures{0}, verified{0}, mismatches{0};
 std::array<std::atomic<std::uint64_t>, WaitReasons> waitCommitterNs{}, waitCommitterCount{}, waitOtherNs{}, waitOtherCount{};
 std::uint32_t emitTick = 0;
 PFN_vkGetDeviceProcAddr realDeviceProc = nullptr;
@@ -155,7 +155,7 @@ void report() {
     for (const auto& [name, count] : stats.syncs) syncs += " " + name + " " + std::to_string(count) + ";";
     const auto byOp = topOps();
     const auto frames = presents.exchange(0, std::memory_order_relaxed);
-    std::fprintf(stderr, "[r-inline] 10 s (%s): %llu entries (%.1f per draw/dispatch), %llu bytes (%.0f per draw/dispatch), %llu draws/dispatches; emit %.1f ms (1-of-64 x64, less one clock read of %llu ns each), replay %.1f ms, %llu flushes or publishes, %llu presents, %zu chunks; calls from threads without the GPU lock while entries were pending: %llu command buffer calls (the run is invalid if not 0), %llu others; replayed calls that failed %llu; syncs:%s; top ops by bytes:%s\n", mode == Mode::Thread ? "thread" : "inline", static_cast<unsigned long long>(stats.entries), static_cast<double>(stats.entries) / draws, static_cast<unsigned long long>(stats.bytes), static_cast<double>(stats.bytes) / draws, static_cast<unsigned long long>(stats.draws), static_cast<double>(stats.emitNs) * 64.0 / 1e6, static_cast<unsigned long long>(clockNs), static_cast<double>(replayNs.exchange(0, std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(stats.flushes), static_cast<unsigned long long>(frames), chunkCount(), static_cast<unsigned long long>(unguardedCommands.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(unguardedOther.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(failures.exchange(0, std::memory_order_relaxed)), syncs.c_str(), byOp.c_str());
+    std::fprintf(stderr, "[r-inline] 10 s (%s): %llu entries (%.1f per draw/dispatch), %llu bytes (%.0f per draw/dispatch), %llu draws/dispatches; emit %.1f ms (1-of-64 x64, less one clock read of %llu ns each), replay %.1f ms, %llu flushes or publishes, %llu presents, %zu chunks; calls from threads without the GPU lock: %llu command buffer, pool or submit calls (with the R thread taken under the lock, in order), %llu destroys, %llu other calls while entries were pending; replayed calls that failed %llu; syncs:%s; top ops by bytes:%s\n", mode == Mode::Thread ? "thread" : "inline", static_cast<unsigned long long>(stats.entries), static_cast<double>(stats.entries) / draws, static_cast<unsigned long long>(stats.bytes), static_cast<double>(stats.bytes) / draws, static_cast<unsigned long long>(stats.draws), static_cast<double>(stats.emitNs) * 64.0 / 1e6, static_cast<unsigned long long>(clockNs), static_cast<double>(replayNs.exchange(0, std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(stats.flushes), static_cast<unsigned long long>(frames), chunkCount(), static_cast<unsigned long long>(unguardedCommands.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(unguardedOther.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(unguardedUpdates.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(failures.exchange(0, std::memory_order_relaxed)), syncs.c_str(), byOp.c_str());
     if (mode == Mode::Thread) {
         std::string waits;
         double committerTotal = 0;
@@ -374,7 +374,7 @@ void syncFor(const char* name, WaitReason reason) {
         return;
     }
     const bool command = std::strncmp(name, "vkCmd", 5) == 0 || std::strstr(name, "CommandBuffer") != nullptr || std::strstr(name, "CommandPool") != nullptr || std::strncmp(name, "vkQueueSubmit", 13) == 0;
-    (command ? unguardedCommands : unguardedOther).fetch_add(1, std::memory_order_relaxed);
+    (command ? unguardedCommands : std::strncmp(name, "vkDestroy", 9) == 0 ? unguardedOther : unguardedUpdates).fetch_add(1, std::memory_order_relaxed);
 }
 
 void releaseHook() {
@@ -697,12 +697,13 @@ struct Deferred<Slot, R(VKAPI_PTR*)(A...), Kind> {
     static constexpr bool submit = std::is_same_v<Args, std::tuple<VkQueue, std::uint32_t, const VkSubmitInfo*, VkFence>>;
     static constexpr bool begin = std::is_same_v<Args, std::tuple<VkCommandBuffer, const VkCommandBufferBeginInfo*>>;
     static constexpr bool freeBuffers = std::is_same_v<Args, std::tuple<VkDevice, VkCommandPool, std::uint32_t, const VkCommandBuffer*>>;
-    static inline R(VKAPI_PTR* real)(A...) = nullptr;
+    static inline std::atomic<R(VKAPI_PTR*)(A...)> real{nullptr};
     static inline const char* name = nullptr;
     static inline std::string refused;
     static inline WaitReason reason = WaitOther;
     static inline bool draw = false;
     static inline bool poolCall = false;
+    static inline bool destroyCall = false;
     static inline std::uint64_t opEntries = 0;
     static inline std::uint64_t opBytes = 0;
 
@@ -712,7 +713,7 @@ struct Deferred<Slot, R(VKAPI_PTR*)(A...), Kind> {
             VkResult result;
             {
                 std::lock_guard lock(queueMutex);
-                result = std::apply(real, args);
+                result = std::apply(real.load(std::memory_order_relaxed), args);
             }
             if (result != VK_SUCCESS) markLost(name, static_cast<int>(result));
             if (const auto fence = std::get<3>(args); fence != VK_NULL_HANDLE) {
@@ -720,9 +721,9 @@ struct Deferred<Slot, R(VKAPI_PTR*)(A...), Kind> {
                 if (const auto found = pendingFences.find(fence); found != pendingFences.end() && --found->second == 0) pendingFences.erase(found);
             }
         } else if constexpr (std::is_same_v<R, void>) {
-            std::apply(real, args);
+            std::apply(real.load(std::memory_order_relaxed), args);
         } else {
-            const auto result = std::apply(real, args);
+            const auto result = std::apply(real.load(std::memory_order_relaxed), args);
             if constexpr (std::is_same_v<R, VkResult>) {
                 if (result != VK_SUCCESS) markLost(name, static_cast<int>(result));
             }
@@ -733,14 +734,20 @@ struct Deferred<Slot, R(VKAPI_PTR*)(A...), Kind> {
         if constexpr (sizeof...(A) != 0 && std::is_same_v<std::tuple_element_t<0, Args>, VkQueue>) {
             std::unique_lock lock(queueMutex, std::defer_lock);
             if (mode == Mode::Thread || queueOfR(std::get<0>(std::forward_as_tuple(arguments...)))) lock.lock();
-            return real(arguments...);
+            return real.load(std::memory_order_relaxed)(arguments...);
         } else {
-            return real(arguments...);
+            return real.load(std::memory_order_relaxed)(arguments...);
         }
     }
 
     static R VKAPI_CALL Call(A... arguments) {
         if constexpr (std::is_same_v<Copier, Sync>) {
+            if (mode == Mode::Thread && poolCall && !holder()) {
+                unguardedCommands.fetch_add(1, std::memory_order_relaxed);
+                std::unique_lock gpu(GuestMemory::GpuMutex());
+                syncFor(name, reason);
+                return direct(arguments...);
+            }
             syncFor(name, reason);
             return direct(arguments...);
         } else {
@@ -753,7 +760,7 @@ struct Deferred<Slot, R(VKAPI_PTR*)(A...), Kind> {
                 if (mode != Mode::Thread) {
                     syncFor(name, reason);
                 } else if (played.load(std::memory_order_acquire) != emitted.load(std::memory_order_relaxed)) {
-                    unguardedOther.fetch_add(1, std::memory_order_relaxed);
+                    (destroyCall ? unguardedOther : unguardedUpdates).fetch_add(1, std::memory_order_relaxed);
                 }
                 return direct(arguments...);
             }
@@ -814,25 +821,26 @@ struct Deferred<Slot, R(VKAPI_PTR*)(A...), Kind> {
 template<std::size_t Slot, typename F, typename Kind>
 PFN_vkVoidFunction wrap(PFN_vkVoidFunction real, const char* name) {
     using Wrapper = Deferred<Slot, F, Kind>;
-    Wrapper::real = reinterpret_cast<F>(real);
-    Wrapper::name = name;
-    Wrapper::reason = reasonOf(name);
-    if (Wrapper::refused.empty()) Wrapper::refused = std::string("refused:") + name;
-    Wrapper::draw = std::strncmp(name, "vkCmdDraw", 9) == 0 || std::strncmp(name, "vkCmdDispatch", 13) == 0;
-    Wrapper::poolCall = std::strstr(name, "CommandBuffer") != nullptr || std::strstr(name, "CommandPool") != nullptr;
+    Wrapper::real.store(reinterpret_cast<F>(real), std::memory_order_relaxed);
     static std::once_flag registered;
     std::call_once(registered, [name] {
+        Wrapper::name = name;
+        Wrapper::reason = reasonOf(name);
+        Wrapper::refused = std::string("refused:") + name;
+        Wrapper::draw = std::strncmp(name, "vkCmdDraw", 9) == 0 || std::strncmp(name, "vkCmdDispatch", 13) == 0;
+        Wrapper::poolCall = std::strstr(name, "CommandBuffer") != nullptr || std::strstr(name, "CommandPool") != nullptr;
+        Wrapper::destroyCall = std::strncmp(name, "vkDestroy", 9) == 0;
         std::lock_guard lock(opsMutex);
         ops.push_back({name, &Wrapper::opEntries, &Wrapper::opBytes});
     });
     return reinterpret_cast<PFN_vkVoidFunction>(&Wrapper::Call);
 }
 
-PFN_vkGetFenceStatus realFenceStatus = nullptr;
-PFN_vkWaitForFences realWaitForFences = nullptr;
-PFN_vkQueuePresentKHR realPresent = nullptr;
-PFN_vkQueueWaitIdle realQueueWaitIdle = nullptr;
-PFN_vkDeviceWaitIdle realDeviceWaitIdle = nullptr;
+std::atomic<PFN_vkGetFenceStatus> realFenceStatus{nullptr};
+std::atomic<PFN_vkWaitForFences> realWaitForFences{nullptr};
+std::atomic<PFN_vkQueuePresentKHR> realPresent{nullptr};
+std::atomic<PFN_vkQueueWaitIdle> realQueueWaitIdle{nullptr};
+std::atomic<PFN_vkDeviceWaitIdle> realDeviceWaitIdle{nullptr};
 
 bool fencePending(VkFence fence) {
     std::lock_guard lock(fencesMutex);
@@ -849,7 +857,7 @@ VkResult VKAPI_CALL fenceStatus(VkDevice device, VkFence fence) {
     } else {
         syncFor("vkGetFenceStatus", WaitFence);
     }
-    return realFenceStatus(device, fence);
+    return realFenceStatus.load(std::memory_order_relaxed)(device, fence);
 }
 
 VkResult VKAPI_CALL waitForFences(VkDevice device, std::uint32_t count, const VkFence* fences, VkBool32 all, std::uint64_t timeout) {
@@ -869,7 +877,7 @@ VkResult VKAPI_CALL waitForFences(VkDevice device, std::uint32_t count, const Vk
             if (unsubmitted() && !lost.load(std::memory_order_acquire)) {
                 drainWaiters.fetch_add(1, std::memory_order_seq_cst);
                 std::unique_lock lock(wakeMutex);
-                while (unsubmitted() && !lost.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) drained.wait_for(lock, std::chrono::milliseconds(1));
+                while (unsubmitted() && !lost.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) drained.wait_until(lock, std::min(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(1)));
                 drainWaiters.fetch_sub(1, std::memory_order_seq_cst);
             }
             noteWait(WaitFence, elapsed(start));
@@ -881,7 +889,7 @@ VkResult VKAPI_CALL waitForFences(VkDevice device, std::uint32_t count, const Vk
     } else {
         syncFor("vkWaitForFences", WaitFence);
     }
-    return realWaitForFences(device, count, fences, all, timeout);
+    return realWaitForFences.load(std::memory_order_relaxed)(device, count, fences, all, timeout);
 }
 
 VkResult VKAPI_CALL present(VkQueue queue, const VkPresentInfoKHR* info) {
@@ -891,7 +899,7 @@ VkResult VKAPI_CALL present(VkQueue queue, const VkPresentInfoKHR* info) {
     if (lost.load(std::memory_order_acquire)) return VK_ERROR_DEVICE_LOST;
     std::unique_lock lock(queueMutex, std::defer_lock);
     if (mode == Mode::Thread || queueOfR(queue)) lock.lock();
-    return realPresent(queue, info);
+    return realPresent.load(std::memory_order_relaxed)(queue, info);
 }
 
 VkResult VKAPI_CALL queueWaitIdle(VkQueue queue) {
@@ -899,19 +907,19 @@ VkResult VKAPI_CALL queueWaitIdle(VkQueue queue) {
     else syncFor("vkQueueWaitIdle", WaitSync);
     std::unique_lock lock(queueMutex, std::defer_lock);
     if (mode == Mode::Thread || queueOfR(queue)) lock.lock();
-    return realQueueWaitIdle(queue);
+    return realQueueWaitIdle.load(std::memory_order_relaxed)(queue);
 }
 
 VkResult VKAPI_CALL deviceWaitIdle(VkDevice device) {
     if (mode == Mode::Thread) drainWait(WaitSync, "vkDeviceWaitIdle");
     else syncFor("vkDeviceWaitIdle", WaitSync);
     std::lock_guard lock(queueMutex);
-    return realDeviceWaitIdle(device);
+    return realDeviceWaitIdle.load(std::memory_order_relaxed)(device);
 }
 
 template<typename F>
-PFN_vkVoidFunction special(PFN_vkVoidFunction real, F& target, F wrapper) {
-    target = reinterpret_cast<F>(real);
+PFN_vkVoidFunction special(PFN_vkVoidFunction real, std::atomic<F>& target, F wrapper) {
+    target.store(reinterpret_cast<F>(real), std::memory_order_relaxed);
     return reinterpret_cast<PFN_vkVoidFunction>(wrapper);
 }
 
@@ -1016,6 +1024,10 @@ PFN_vkVoidFunction VKAPI_CALL inlineDeviceProc(VkDevice device, const char* name
     X(vkGetSemaphoreCounterValue, Sync)
     X(vkSignalSemaphoreKHR, Sync)
     X(vkSignalSemaphore, Sync)
+    X(vkAcquireNextImageKHR, Sync)
+    X(vkAcquireNextImage2KHR, Sync)
+    X(vkResetQueryPool, Sync)
+    X(vkResetQueryPoolEXT, Sync)
     X(vkResetDescriptorPool, Sync)
     X(vkFreeDescriptorSets, Sync)
     X(vkDestroyDescriptorPool, Sync)
@@ -1029,10 +1041,14 @@ PFN_vkVoidFunction VKAPI_CALL inlineDeviceProc(VkDevice device, const char* name
     if (std::strcmp(name, "vkQueuePresentKHR") == 0) return special(real, realPresent, &present);
     if (std::strcmp(name, "vkQueueWaitIdle") == 0) return special(real, realQueueWaitIdle, &queueWaitIdle);
     if (std::strcmp(name, "vkDeviceWaitIdle") == 0) return special(real, realDeviceWaitIdle, &deviceWaitIdle);
-    if (std::strncmp(name, "vkCmd", 5) == 0 || std::strncmp(name, "vkQueue", 7) == 0) throw std::runtime_error(std::string("AGC graphics: ") + name + " is not in the stream of APS5_R_INLINE/APS5_R_THREAD; called directly it would run ahead of the deferred calls");
+    if (std::strncmp(name, "vkCmd", 5) == 0 || std::strncmp(name, "vkQueue", 7) == 0 || std::strncmp(name, "vkTrimCommandPool", 17) == 0 || std::strncmp(name, "vkUpdateDescriptorSetWithTemplate", 33) == 0) throw std::runtime_error(std::string("AGC graphics: ") + name + " is not in the stream of APS5_R_INLINE/APS5_R_THREAD; called directly it would run ahead of the deferred calls");
     return real;
 }
 
+}
+
+void PublishInlineStream() {
+    if (mode == Mode::Thread && holder()) publish();
 }
 
 PFN_vkGetDeviceProcAddr InlineDeviceProc(PFN_vkGetDeviceProcAddr real) {

@@ -1219,6 +1219,7 @@ Recorder::~Recorder() {
     // other threads (an unlock hook that found the queue stopping or full) are waited for before
     // the caller destroys the device. The count is global: a newer recorder's batches (device
     // replacement) are waited for too, which only prolongs the spin.
+    PublishInlineStream();
     if (!DeferredBatches().empty()) DestroyDeferred(TakeDeferred(), false);
     JoinReleaseThread();
     while (deferredPending.load(std::memory_order_acquire) != 0) std::this_thread::yield();

@@ -144,6 +144,7 @@ struct DeviceFunctions {
 };
 
 PFN_vkGetDeviceProcAddr InlineDeviceProc(PFN_vkGetDeviceProcAddr real);
+void PublishInlineStream();
 
 // Per-thread count of vkGetDeviceProcAddr lookups made through Context::Function (the [vk] line).
 inline std::uint64_t& DeviceProcLookups() {
