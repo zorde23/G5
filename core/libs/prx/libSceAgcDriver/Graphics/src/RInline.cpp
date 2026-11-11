@@ -66,7 +66,7 @@ struct Stats {
 };
 
 Stats stats;
-std::atomic<std::uint64_t> unguardedCommands{0}, unguardedOther{0}, presents{0}, replayNs{0}, notifies{0}, failures{0}, verified{0}, mismatches{0};
+std::atomic<std::uint64_t> unguardedCommands{0}, unguardedOther{0}, presents{0}, replayNs{0}, notifies{0}, notifyNs{0}, spinUs{100}, failures{0}, verified{0}, mismatches{0};
 std::array<std::atomic<std::uint64_t>, WaitReasons> waitCommitterNs{}, waitCommitterCount{}, waitOtherNs{}, waitOtherCount{};
 std::uint32_t emitTick = 0;
 PFN_vkGetDeviceProcAddr realDeviceProc = nullptr;
@@ -169,7 +169,8 @@ void report() {
             waits += part;
         }
         const double perFrame = frames != 0 ? committerTotal / static_cast<double>(frames) : 0.0;
-        std::fprintf(stderr, "[r-wait] 10 s: committer waits for R %.1f ms (%.2f ms per frame over %llu presents), %llu real notifies (%.1f per frame);%s sequence checks %llu, mismatches %llu\n", committerTotal, perFrame, static_cast<unsigned long long>(frames), static_cast<unsigned long long>(notifies.load(std::memory_order_relaxed)), frames != 0 ? static_cast<double>(notifies.exchange(0, std::memory_order_relaxed)) / static_cast<double>(frames) : 0.0, waits.c_str(), static_cast<unsigned long long>(verified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(mismatches.exchange(0, std::memory_order_relaxed)));
+        const auto notified = notifies.exchange(0, std::memory_order_relaxed);
+        std::fprintf(stderr, "[r-wait] 10 s: committer waits for R %.1f ms (%.2f ms per frame over %llu presents), %llu real notifies (%.1f per frame, %.1f ms on the notifying threads; R spins %llu us before it sleeps);%s sequence checks %llu, mismatches %llu\n", committerTotal, perFrame, static_cast<unsigned long long>(frames), static_cast<unsigned long long>(notified), frames != 0 ? static_cast<double>(notified) / static_cast<double>(frames) : 0.0, static_cast<double>(notifyNs.exchange(0, std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(spinUs.load(std::memory_order_relaxed)), waits.c_str(), static_cast<unsigned long long>(verified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(mismatches.exchange(0, std::memory_order_relaxed)));
     }
     const auto reportedAt = stats.reportedAt;
     stats = {};
@@ -230,12 +231,14 @@ void returnChunk(Chunk* chunk) {
 
 void wakeConsumer() {
     if (mode != Mode::Thread || !rSleeping.load(std::memory_order_seq_cst)) return;
+    const auto start = std::chrono::steady_clock::now();
     {
         std::lock_guard lock(wakeMutex);
         rWake = true;
     }
-    notifies.fetch_add(1, std::memory_order_relaxed);
     wakeR.notify_one();
+    notifies.fetch_add(1, std::memory_order_relaxed);
+    notifyNs.fetch_add(elapsed(start), std::memory_order_relaxed);
 }
 
 void publish() {
@@ -392,7 +395,7 @@ void runR() {
         if (consume()) continue;
         bool found = false;
         const auto spinStart = std::chrono::steady_clock::now();
-        while (!found && std::chrono::steady_clock::now() - spinStart < std::chrono::microseconds(4)) {
+        while (!found && std::chrono::steady_clock::now() - spinStart < std::chrono::microseconds(spinUs.load(std::memory_order_relaxed))) {
             found = played.load(std::memory_order_relaxed) < publishedTicket.load(std::memory_order_acquire);
         }
         if (found) continue;
@@ -748,7 +751,7 @@ struct Deferred<Slot, R(VKAPI_PTR*)(A...), Kind> {
                 }
                 return direct(arguments...);
             }
-            const bool sampled = (emitTick++ & 63u) == 0;
+            const bool sampled = (emitTick++ & 63u) == 32u;
             const auto start = sampled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             const auto more = Copier::Size(std::forward_as_tuple(arguments...));
             std::byte* at = more == Cannot ? nullptr : reserve(&Play, padded(sizeof(Args)) + more);
@@ -1004,6 +1007,7 @@ PFN_vkGetDeviceProcAddr InlineDeviceProc(PFN_vkGetDeviceProcAddr real) {
     lost.store(false, std::memory_order_release);
     realDeviceProc = real;
     if (const char* every = std::getenv("APS5_R_VERIFY"); every != nullptr) verifyEvery = std::strtoull(every, nullptr, 10);
+    if (const char* spin = std::getenv("APS5_R_SPIN_US"); spin != nullptr) spinUs.store(std::strtoull(spin, nullptr, 10), std::memory_order_relaxed);
     constexpr int reads = 4096;
     const auto first = std::chrono::steady_clock::now();
     auto last = first;
