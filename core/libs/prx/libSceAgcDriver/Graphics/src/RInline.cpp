@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -9,7 +10,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <algorithm>
 #include <map>
+#include <mutex>
 #include <memory>
 #include <new>
 #include <string>
@@ -99,6 +102,28 @@ std::atomic<bool> pending{false};
 std::atomic<std::uint64_t> unguardedCommands{0}, unguardedOther{0}, presents{0};
 std::uint32_t emitTick = 0;
 PFN_vkGetDeviceProcAddr realDeviceProc = nullptr;
+const void* emitHolder = nullptr;
+std::uint64_t clockNs = 0;
+bool emitHolderCommitter = false;
+
+struct OpCounts {
+    const char* name;
+    std::uint64_t* entries;
+    std::uint64_t* bytes;
+};
+
+std::mutex opsMutex;
+std::vector<OpCounts> ops;
+
+std::string topOps() {
+    std::lock_guard lock(opsMutex);
+    std::vector<OpCounts> sorted = ops;
+    std::sort(sorted.begin(), sorted.end(), [](const OpCounts& left, const OpCounts& right) { return *left.bytes > *right.bytes; });
+    std::string line;
+    for (std::size_t index = 0; index < sorted.size() && index < 8 && *sorted[index].bytes != 0; ++index) line += " " + std::string(sorted[index].name) + " " + std::to_string(*sorted[index].entries) + " entries " + std::to_string(*sorted[index].bytes) + " B;";
+    for (auto& op : ops) *op.entries = *op.bytes = 0;
+    return line;
+}
 
 void report() {
     const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
@@ -109,14 +134,21 @@ void report() {
     const double draws = stats.draws != 0 ? static_cast<double>(stats.draws) : 1.0;
     std::string syncs;
     for (const auto& [name, count] : stats.syncs) syncs += " " + name + " " + std::to_string(count) + ";";
-    std::fprintf(stderr, "[r-inline] 10 s: %llu entries (%.1f per draw/dispatch), %llu bytes (%.0f per draw/dispatch), %llu draws/dispatches; emit %.1f ms (1-of-64 x64), replay %.1f ms, %llu flushes, %llu presents, %llu chunks; calls from threads without the GPU lock while entries were pending: %llu command buffer calls (the run is invalid if not 0), %llu others; syncs that flushed:%s\n", static_cast<unsigned long long>(stats.entries), static_cast<double>(stats.entries) / draws, static_cast<unsigned long long>(stats.bytes), static_cast<double>(stats.bytes) / draws, static_cast<unsigned long long>(stats.draws), static_cast<double>(stats.emitNs) * 64.0 / 1e6, static_cast<double>(stats.replayNs) / 1e6, static_cast<unsigned long long>(stats.flushes), static_cast<unsigned long long>(presents.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(stream.Chunks()), static_cast<unsigned long long>(unguardedCommands.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(unguardedOther.exchange(0, std::memory_order_relaxed)), syncs.c_str());
+    const auto byOp = topOps();
+    std::fprintf(stderr, "[r-inline] 10 s: %llu entries (%.1f per draw/dispatch), %llu bytes (%.0f per draw/dispatch), %llu draws/dispatches; emit %.1f ms (1-of-64 x64, less one clock read of %llu ns each), replay %.1f ms, %llu flushes, %llu presents, %llu chunks; calls from threads without the GPU lock while entries were pending: %llu command buffer calls (the run is invalid if not 0), %llu others; syncs that flushed:%s; top ops by bytes:%s\n", static_cast<unsigned long long>(stats.entries), static_cast<double>(stats.entries) / draws, static_cast<unsigned long long>(stats.bytes), static_cast<double>(stats.bytes) / draws, static_cast<unsigned long long>(stats.draws), static_cast<double>(stats.emitNs) * 64.0 / 1e6, static_cast<unsigned long long>(clockNs), static_cast<double>(stats.replayNs) / 1e6, static_cast<unsigned long long>(stats.flushes), static_cast<unsigned long long>(presents.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(stream.Chunks()), static_cast<unsigned long long>(unguardedCommands.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(unguardedOther.exchange(0, std::memory_order_relaxed)), syncs.c_str(), byOp.c_str());
     const auto reportedAt = stats.reportedAt;
     stats = {};
     stats.reportedAt = reportedAt;
 }
 
 bool emitting() {
-    return Recorder::OnCommitter() && GuestMemory::GpuMutex().HeldByThisThread();
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) return false;
+    const auto token = CurrentThreadToken();
+    if (token != emitHolder) {
+        emitHolder = token;
+        emitHolderCommitter = Recorder::OnCommitter();
+    }
+    return emitHolderCommitter;
 }
 
 void flush(const char* reason) {
@@ -141,6 +173,7 @@ void syncFor(const char* name) {
 }
 
 void flushBeforeRelease() {
+    emitHolder = nullptr;
     flush("GPU lock release");
 }
 
@@ -318,6 +351,8 @@ struct Deferred<Slot, void(VKAPI_PTR*)(A...), Copier> {
     static inline const char* name = nullptr;
     static inline std::string refused;
     static inline bool draw = false;
+    static inline std::uint64_t opEntries = 0;
+    static inline std::uint64_t opBytes = 0;
 
     static void Play(const std::byte* payload) {
         std::apply(real, *reinterpret_cast<const Args*>(payload));
@@ -334,22 +369,25 @@ struct Deferred<Slot, void(VKAPI_PTR*)(A...), Copier> {
             }
             const bool sampled = (emitTick++ & 63u) == 0;
             const auto start = sampled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            Args args{arguments...};
-            const auto more = Copier::Size(args);
+            const auto more = Copier::Size(std::forward_as_tuple(arguments...));
             std::byte* at = more == Cannot ? nullptr : stream.Reserve(&Play, padded(sizeof(Args)) + more);
             if (at == nullptr) {
                 flush(refused.c_str());
                 return real(arguments...);
             }
             pending.store(true, std::memory_order_release);
-            auto* stored = new (at) Args(args);
+            auto* stored = new (at) Args(arguments...);
             Writer<Args> writer{at + padded(sizeof(Args))};
             Copier::Copy(*stored, writer);
+            const auto bytes = sizeof(Header) + padded(sizeof(Args)) + more;
             ++stats.entries;
-            stats.bytes += sizeof(Header) + padded(sizeof(Args)) + more;
+            stats.bytes += bytes;
+            ++opEntries;
+            opBytes += bytes;
             if (draw) ++stats.draws;
             if (sampled) {
-                stats.emitNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+                const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+                stats.emitNs += ns > clockNs ? ns - clockNs : 0;
                 ++stats.emitSampled;
             }
         }
@@ -377,6 +415,13 @@ PFN_vkVoidFunction wrap(PFN_vkVoidFunction real, const char* name) {
         if (Wrapper::refused.empty()) Wrapper::refused = std::string("refused:") + name;
     }
     Wrapper::draw = std::strncmp(name, "vkCmdDraw", 9) == 0 || std::strncmp(name, "vkCmdDispatch", 13) == 0;
+    if constexpr (requires { Wrapper::opBytes; }) {
+        static std::once_flag registered;
+        std::call_once(registered, [name] {
+            std::lock_guard lock(opsMutex);
+            ops.push_back({name, &Wrapper::opEntries, &Wrapper::opBytes});
+        });
+    }
     return reinterpret_cast<PFN_vkVoidFunction>(&Wrapper::Call);
 }
 
@@ -490,6 +535,11 @@ PFN_vkVoidFunction VKAPI_CALL inlineDeviceProc(VkDevice device, const char* name
 PFN_vkGetDeviceProcAddr InlineDeviceProc(PFN_vkGetDeviceProcAddr real) {
     if (std::getenv("APS5_R_INLINE") == nullptr) return real;
     realDeviceProc = real;
+    constexpr int reads = 4096;
+    const auto first = std::chrono::steady_clock::now();
+    auto last = first;
+    for (int read = 0; read < reads; ++read) last = std::chrono::steady_clock::now();
+    clockNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(last - first).count()) / reads;
     GuestMemory::SetGpuReleaseHook(&flushBeforeRelease);
     std::fprintf(stderr, "[r-inline] on: the committer's Vulkan calls under the GPU lock go into a stream that it replays at the next sync point\n");
     return &inlineDeviceProc;
