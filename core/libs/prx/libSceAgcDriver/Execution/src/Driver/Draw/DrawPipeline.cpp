@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -226,6 +227,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
         thread = std::thread([this] {
             finisherThread = true;
             GuestMemory::MarkFinisherProofThread();
+            PinFinisherThread();
             run();
         });
     }
@@ -436,6 +438,7 @@ void DrawPipeline::run() {
         ~Unbind() { Graphics::Recorder::UnbindCommitter(); }
     } unbind;
     PerformanceTrace::BindThread("draw committer");
+    const bool reservedCore = PinCommitterThread();
     StartCommitterSampler();
     for (;;) {
         Commit* commit = nullptr;
@@ -451,6 +454,7 @@ void DrawPipeline::run() {
             isDraw = items.front().draw;
         }
         const auto start = std::chrono::steady_clock::now();
+        if (reservedCore) NoteCommitterCore(start);
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;

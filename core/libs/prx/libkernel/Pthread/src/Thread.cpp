@@ -861,7 +861,8 @@ static std::uint64_t JobWorkerMask() {
 
 static void ApplyJobAffinity(PthreadPrivate& thread, void* handle) {
     if (thread.name.compare(0, std::strlen(JOB_WORKER_PREFIX), JOB_WORKER_PREFIX) != 0) return;
-    const auto mask = JobWorkerMask();
+    auto mask = JobWorkerMask();
+    if (mask == 0 && CpuTopology::ReservedCore() != 0) mask = CpuTopology::Get().process;
     if (mask == 0) return;
     static std::once_flag summary;
     std::call_once(summary, [mask] {

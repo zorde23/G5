@@ -26,6 +26,8 @@ struct Layout {
     std::uint64_t efficient = 0;
     std::uint64_t performant = 0;
     bool hybrid = false;
+    std::vector<std::uint64_t> cores;
+    std::vector<unsigned> coreClasses;
 };
 
 #ifdef __linux__
@@ -93,6 +95,8 @@ inline const Layout& Get() {
                 const unsigned cls = entry->Processor.EfficiencyClass;
                 byClass[cls] |= static_cast<std::uint64_t>(entry->Processor.GroupMask[0].Mask);
                 seen[cls] = true;
+                result.cores.push_back(static_cast<std::uint64_t>(entry->Processor.GroupMask[0].Mask));
+                result.coreClasses.push_back(cls);
             }
             offset += entry->Size;
         }
@@ -139,12 +143,73 @@ inline unsigned long ThreadId(void* handle) {
 #endif
 }
 
+inline std::uint64_t ReservedCoreFrom(const Layout& layout) {
+    std::uint64_t chosen = 0;
+    unsigned best = 0;
+    std::size_t usable = 0;
+    for (std::size_t core = 0; core < layout.cores.size() && core < layout.coreClasses.size(); ++core) {
+        const auto mask = layout.cores[core];
+        if (mask == 0 || (layout.process != 0 && (mask & ~layout.process) != 0)) continue;
+        ++usable;
+        if (chosen == 0 || layout.coreClasses[core] >= best) {
+            chosen = mask;
+            best = layout.coreClasses[core];
+        }
+    }
+    return usable >= 6 ? chosen : 0;
+}
+
+#ifdef _WIN32
+inline std::vector<ULONG> CpuSetIds(std::uint64_t mask, bool inside) {
+    std::vector<ULONG> ids;
+    using GetInformation = BOOL(WINAPI*)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
+    static const auto get = reinterpret_cast<GetInformation>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetSystemCpuSetInformation")));
+    if (get == nullptr) return ids;
+    ULONG length = 0;
+    get(nullptr, 0, &length, GetCurrentProcess(), 0);
+    if (length == 0) return ids;
+    std::vector<unsigned char> buffer(length);
+    if (!get(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()), length, &length, GetCurrentProcess(), 0)) return ids;
+    for (ULONG offset = 0; offset + 8 <= length;) {
+        const auto* entry = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + offset);
+        if (entry->Size == 0 || offset + entry->Size > length) break;
+        if (entry->Type == CpuSetInformation && entry->CpuSet.Group == 0 && entry->CpuSet.LogicalProcessorIndex < 64 && (((mask >> entry->CpuSet.LogicalProcessorIndex) & 1u) != 0) == inside) ids.push_back(entry->CpuSet.Id);
+        offset += entry->Size;
+    }
+    return ids;
+}
+#endif
+
+inline std::uint64_t ReservedCore() {
+    static const std::uint64_t reserved = [] {
+#ifdef _WIN32
+        if (std::getenv("APS5_COMMITTER_CORE") == nullptr) return std::uint64_t{0};
+        const auto& layout = Get();
+        const auto core = ReservedCoreFrom(layout);
+        if (core == 0) {
+            std::fprintf(stderr, "[affinity] committer core: off (%zu physical cores, it needs 6 inside the process)\n", layout.cores.size());
+            return std::uint64_t{0};
+        }
+        const auto others = CpuSetIds(core, false);
+        using SetDefault = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
+        const auto setDefault = reinterpret_cast<SetDefault>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessDefaultCpuSets")));
+        const bool defaulted = setDefault != nullptr && !others.empty() && setDefault(GetCurrentProcess(), others.data(), static_cast<ULONG>(others.size())) != 0;
+        std::fprintf(stderr, "[affinity] committer core -> 0x%llx (%d logical of %zu physical cores, hybrid=%d process=0x%llx); other threads: pinned masks leave it out, process default CPU sets %s (%zu ids)\n", static_cast<unsigned long long>(core), __builtin_popcountll(core), layout.cores.size(), layout.hybrid ? 1 : 0, static_cast<unsigned long long>(layout.process), defaulted ? "set" : "NOT set", others.size());
+        return core;
+#else
+        return std::uint64_t{0};
+#endif
+    }();
+    return reserved;
+}
+
 // Restricts the thread (`nullptr` is the calling thread) to `mask` clipped to the process affinity;
 // returns the mask applied, 0 when nothing was.
 inline std::uint64_t Pin(void* handle, std::uint64_t mask) {
 #ifdef _WIN32
     const auto& layout = Get();
     if (layout.process != 0) mask &= layout.process;
+    mask &= ~ReservedCore();
     if (mask == 0) return 0;
     HANDLE thread = handle != nullptr ? static_cast<HANDLE>(handle) : GetCurrentThread();
     return SetThreadAffinityMask(thread, static_cast<DWORD_PTR>(mask)) != 0 ? mask : 0;
@@ -167,8 +232,25 @@ inline std::uint64_t Pin(void* handle, std::uint64_t mask) {
 // Pin plus the APS5_TRACE_AFFINITY=1 line naming the thread.
 inline std::uint64_t PinTraced(const char* role, void* handle, std::uint64_t mask) {
     const auto applied = Pin(handle, mask);
-    if (Trace()) std::fprintf(stderr, "[affinity] %s tid=%lu mask=0x%llx%s\n", role, ThreadId(handle), static_cast<unsigned long long>(mask), applied != 0 ? "" : " (not applied)");
+    if (Trace() || ReservedCore() != 0) std::fprintf(stderr, "[affinity] %s tid=%lu mask=0x%llx applied=0x%llx%s\n", role, ThreadId(handle), static_cast<unsigned long long>(mask), static_cast<unsigned long long>(applied), applied != 0 ? "" : " (not applied)");
     return applied;
+}
+
+inline std::uint64_t PinToReservedCore(const char* role) {
+#ifdef _WIN32
+    const auto core = ReservedCore();
+    if (core == 0) return 0;
+    const auto ids = CpuSetIds(core, true);
+    using SetSelected = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
+    static const auto setSelected = reinterpret_cast<SetSelected>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadSelectedCpuSets")));
+    const bool selected = setSelected != nullptr && !ids.empty() && setSelected(GetCurrentThread(), ids.data(), static_cast<ULONG>(ids.size())) != 0;
+    const bool pinned = SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(core)) != 0;
+    std::fprintf(stderr, "[affinity] %s tid=%lu mask=0x%llx: affinity %s, CPU sets %s\n", role, ThreadId(nullptr), static_cast<unsigned long long>(core), pinned ? "applied" : "NOT applied", selected ? "selected" : "NOT selected");
+    return pinned ? core : 0;
+#else
+    (void)role;
+    return 0;
+#endif
 }
 
 // Helper threads (deferred release, mirror refresh) are pinned only when APS5_HELPER_AFFINITY_MASK
