@@ -467,6 +467,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_TRACE_CONTEXT_STATE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Pm4.cpp` |  | logs context-state operations and the context registers written |
 | `APS5_TRACE_COPY_HLE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Memory/BufferCopy.cpp` |  | traces the CPU copy HLE's refusals |
 | `APS5_TRACE_DCC_KEYS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/DisplayBuffer.cpp` |  | traces stores of uncompressed DCC keys |
+| `APS5_TRACE_DEPTH_COPY` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` |  | prints every 10 s how many depth copies an epoch gate hit in ShaderResources::Revalidate refreshed because their depth source was rendered again (`[gate-depth]`) |
 | `APS5_TRACE_DIR` | string | `core/libs/prx/libSceAgcDriver/Execution/src/PerformanceTrace.cpp` | . | directory for the trace and summary files |
 | `APS5_TRACE_DISPATCH_CACHE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Dispatch/Dispatch.cpp` |  | reports dispatch-cache entries whose key changed |
 | `APS5_TRACE_DISPATCH_IO` | string | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Dispatch/Dispatch.cpp` |  | prints every dispatch's resources; `2` also lists the small-buffer words |

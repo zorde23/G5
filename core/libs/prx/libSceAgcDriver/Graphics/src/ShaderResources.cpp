@@ -3501,6 +3501,19 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         const auto proof = GuestMemory::ProofSerial();
         const auto pending = StorageTexture::PendingSerial();
         if (epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending) {
+            if (depthCopies) {
+                static const bool traceDepth = std::getenv("APS5_TRACE_DEPTH_COPY") != nullptr;
+                static std::atomic<std::uint64_t> refreshed{0}, checked{0};
+                static std::atomic<std::int64_t> reportedAt{0};
+                for (const auto& texture : textures) {
+                    if (texture != nullptr && texture->RefreshDepthCopy() && traceDepth) refreshed.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (traceDepth) {
+                    checked.fetch_add(1, std::memory_order_relaxed);
+                    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+                    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) != tenSeconds) std::fprintf(stderr, "[gate-depth] 10 s: depth copies refreshed at an epoch gate hit %llu (of %llu hits over objects with depth copies)\n", static_cast<unsigned long long>(refreshed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(checked.exchange(0, std::memory_order_relaxed)));
+                }
+            }
             static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
             thread_local std::uint64_t reuses = 0;
             if (verify && ++reuses % 64u == 0u) {
@@ -3764,8 +3777,12 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         }
     }
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
+    depthCopies = false;
     for (const auto& texture : textures) {
-        if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
+        if (texture != nullptr && texture->IsDepthCopy()) {
+            depthCopies = true;
+            texture->RefreshDepthCopy();
+        }
     }
     return finish(fast, true);
 }
