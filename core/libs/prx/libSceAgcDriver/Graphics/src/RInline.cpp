@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libc/include/CpuTopology.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -391,6 +392,7 @@ void markLost(const char* name, int result) {
 }
 
 void runR() {
+    if (CpuTopology::ReservedCore() != 0) CpuTopology::PinTraced("draw recorder R", nullptr, CpuTopology::Get().process);
     for (;;) {
         if (consume()) continue;
         bool found = false;
