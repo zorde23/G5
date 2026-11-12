@@ -144,6 +144,42 @@ std::string topOps() {
 
 std::size_t chunkCount();
 
+struct UnlockedSite {
+    const char* name;
+    const void* site;
+    std::uint64_t ordered;
+    std::uint64_t unordered;
+};
+std::mutex unlockedMutex;
+std::vector<UnlockedSite> unlockedSites;
+std::atomic<std::uint64_t> unguardedUnordered{0};
+
+void noteUnlocked(const char* name, const void* site, bool ordered) {
+    (ordered ? unguardedCommands : unguardedUnordered).fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard lock(unlockedMutex);
+    auto found = std::find_if(unlockedSites.begin(), unlockedSites.end(), [&](const UnlockedSite& entry) { return entry.name == name && entry.site == site; });
+    if (found == unlockedSites.end()) {
+        if (unlockedSites.size() >= 16) return;
+        found = unlockedSites.insert(unlockedSites.end(), UnlockedSite{name, site, 0, 0});
+    }
+    ++(ordered ? found->ordered : found->unordered);
+}
+
+std::string unlockedReport() {
+    std::vector<UnlockedSite> sites;
+    {
+        std::lock_guard lock(unlockedMutex);
+        sites = unlockedSites;
+    }
+    std::string text;
+    for (const auto& entry : sites) {
+        char item[160];
+        std::snprintf(item, sizeof(item), " %s@+0x%llx %llu/%llu", entry.name, GuestMemory::CodeOffset(entry.site), static_cast<unsigned long long>(entry.ordered), static_cast<unsigned long long>(entry.unordered));
+        text += item;
+    }
+    return text;
+}
+
 void report() {
     const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
     if (stats.reportedAt == tenSeconds) return;
@@ -155,7 +191,9 @@ void report() {
     for (const auto& [name, count] : stats.syncs) syncs += " " + name + " " + std::to_string(count) + ";";
     const auto byOp = topOps();
     const auto frames = presents.exchange(0, std::memory_order_relaxed);
-    std::fprintf(stderr, "[r-inline] 10 s (%s): %llu entries (%.1f per draw/dispatch), %llu bytes (%.0f per draw/dispatch), %llu draws/dispatches; emit %.1f ms (1-of-64 x64, less one clock read of %llu ns each), replay %.1f ms, %llu flushes or publishes, %llu presents, %zu chunks; calls from threads without the GPU lock: %llu command buffer, pool or submit calls (with the R thread taken under the lock, in order), %llu destroys, %llu other calls while entries were pending; replayed calls that failed %llu; syncs:%s; top ops by bytes:%s\n", mode == Mode::Thread ? "thread" : "inline", static_cast<unsigned long long>(stats.entries), static_cast<double>(stats.entries) / draws, static_cast<unsigned long long>(stats.bytes), static_cast<double>(stats.bytes) / draws, static_cast<unsigned long long>(stats.draws), static_cast<double>(stats.emitNs) * 64.0 / 1e6, static_cast<unsigned long long>(clockNs), static_cast<double>(replayNs.exchange(0, std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(stats.flushes), static_cast<unsigned long long>(frames), chunkCount(), static_cast<unsigned long long>(unguardedCommands.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(unguardedOther.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(unguardedUpdates.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(failures.exchange(0, std::memory_order_relaxed)), syncs.c_str(), byOp.c_str());
+    const auto ordered = unguardedCommands.exchange(0, std::memory_order_relaxed);
+    const auto unordered = unguardedUnordered.exchange(0, std::memory_order_relaxed);
+    std::fprintf(stderr, "[r-inline] 10 s (%s): %llu entries (%.1f per draw/dispatch), %llu bytes (%.0f per draw/dispatch), %llu draws/dispatches; emit %.1f ms (1-of-64 x64, less one clock read of %llu ns each), replay %.1f ms, %llu flushes or publishes, %llu presents, %zu chunks; calls from threads without the GPU lock: %llu command buffer, pool or submit calls (with the R thread: %llu taken under a free lock, in order, %llu beside the replay with the lock busy), %llu destroys, %llu other calls while entries were pending; unlocked sites (name@offset ordered/beside):%s; replayed calls that failed %llu; syncs:%s; top ops by bytes:%s\n", mode == Mode::Thread ? "thread" : "inline", static_cast<unsigned long long>(stats.entries), static_cast<double>(stats.entries) / draws, static_cast<unsigned long long>(stats.bytes), static_cast<double>(stats.bytes) / draws, static_cast<unsigned long long>(stats.draws), static_cast<double>(stats.emitNs) * 64.0 / 1e6, static_cast<unsigned long long>(clockNs), static_cast<double>(replayNs.exchange(0, std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(stats.flushes), static_cast<unsigned long long>(frames), chunkCount(), static_cast<unsigned long long>(ordered + unordered), static_cast<unsigned long long>(ordered), static_cast<unsigned long long>(unordered), static_cast<unsigned long long>(unguardedOther.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(unguardedUpdates.exchange(0, std::memory_order_relaxed)), unlockedReport().c_str(), static_cast<unsigned long long>(failures.exchange(0, std::memory_order_relaxed)), syncs.c_str(), byOp.c_str());
     if (mode == Mode::Thread) {
         std::string waits;
         double committerTotal = 0;
@@ -743,8 +781,8 @@ struct Deferred<Slot, R(VKAPI_PTR*)(A...), Kind> {
     static R VKAPI_CALL Call(A... arguments) {
         if constexpr (std::is_same_v<Copier, Sync>) {
             if (mode == Mode::Thread && poolCall && !holder()) {
-                unguardedCommands.fetch_add(1, std::memory_order_relaxed);
-                std::unique_lock gpu(GuestMemory::GpuMutex());
+                std::unique_lock gpu(GuestMemory::GpuMutex(), std::try_to_lock);
+                noteUnlocked(name, __builtin_return_address(0), gpu.owns_lock());
                 syncFor(name, reason);
                 return direct(arguments...);
             }
@@ -753,9 +791,11 @@ struct Deferred<Slot, R(VKAPI_PTR*)(A...), Kind> {
         } else {
             if ((threadOnly && mode != Mode::Thread) || !emitting()) {
                 if (mode == Mode::Thread && !holder() && (poolCall || submit || streamBuffer(commandBufferOf(std::forward_as_tuple(arguments...))))) {
-                    unguardedCommands.fetch_add(1, std::memory_order_relaxed);
-                    std::unique_lock gpu(GuestMemory::GpuMutex());
-                    return Call(arguments...);
+                    std::unique_lock gpu(GuestMemory::GpuMutex(), std::try_to_lock);
+                    noteUnlocked(name, __builtin_return_address(0), gpu.owns_lock());
+                    if (gpu.owns_lock()) return Call(arguments...);
+                    drainWait(WaitCommandBuffer, name);
+                    return direct(arguments...);
                 }
                 if (mode != Mode::Thread) {
                     syncFor(name, reason);
