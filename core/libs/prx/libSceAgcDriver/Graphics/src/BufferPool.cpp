@@ -212,6 +212,12 @@ void BufferPool::PutImageMemory(VkDeviceMemory memory, VkDeviceSize bytes, std::
     for (const auto& gone : evicted) destroy(gone);
 }
 
+std::string BufferPool::MemoryText() {
+    std::unique_lock lock(mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return "buffer pool ?";
+    return "buffer pool retained MiB small " + std::to_string(smallTier.retainedBytes >> 20u) + ", large " + std::to_string(largeTier.retainedBytes >> 20u) + ", device " + std::to_string(deviceTier.retainedBytes >> 20u) + ", images " + std::to_string(imageBytes >> 20u) + " in " + std::to_string(imageSlots);
+}
+
 std::size_t BufferPool::RetainedImages() {
     std::lock_guard lock(mutex);
     return imageSlots;

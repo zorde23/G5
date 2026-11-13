@@ -96,6 +96,7 @@ struct HostImportCounts {
 
 const char* ImportRequesterName(ImportRequester requester);
 HostImportCounts HostImportCounters();
+std::string HostImportsMemoryText();
 std::string FormatHostImportCounts(const HostImportCounts& counts);
 void ReportHostImports();
 

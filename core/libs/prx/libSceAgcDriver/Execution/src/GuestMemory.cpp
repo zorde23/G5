@@ -2737,6 +2737,13 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> HostOnlySpans(std::uint64_t
     return merged;
 }
 
+std::string WriteTrackerMemoryText() {
+    auto& tracker = Tracker();
+    std::unique_lock lock(tracker.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return "write tracker cpu pages ?, walk pages ?, refused ?";
+    return "write tracker cpu pages " + std::to_string(tracker.cpuPages.size()) + ", walk pages " + std::to_string(tracker.walkPages.size()) + ", refused " + std::to_string(tracker.refused.size());
+}
+
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
     if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
 }

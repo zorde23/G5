@@ -1418,6 +1418,12 @@ PipelineStoreCounters PipelineStoreTotals() {
     return totals;
 }
 
+std::string PipelineStoreMemoryText() {
+    auto& store = Pipelines();
+    std::unique_lock lock(store.mutex, std::try_to_lock);
+    return "graphics pipelines " + (lock.owns_lock() ? std::to_string(store.entries.size()) : std::string("?"));
+}
+
 bool PipelineStoreCanGrow() {
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);

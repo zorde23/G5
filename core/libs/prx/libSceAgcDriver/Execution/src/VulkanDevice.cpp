@@ -4118,6 +4118,17 @@ bool VulkanDevice::GraphicsPipelineLibraries() const {
     return state->graphicsPipelineLibrary;
 }
 
+std::string VulkanDevice::MemoryCachesText() const {
+    std::string text;
+    {
+        std::unique_lock lock(state->computePipelinesMutex, std::try_to_lock);
+        text = "compute pipelines " + (lock.owns_lock() ? std::to_string(state->computePipelines.size()) : std::string("?"));
+    }
+    if (state->descriptorCache != nullptr) text += ", " + state->descriptorCache->MemoryText();
+    if (state->bufferPool != nullptr) text += ", " + state->bufferPool->MemoryText();
+    return text;
+}
+
 Graphics::Context VulkanDevice::graphicsContext() const {
     static const bool noCache = std::getenv("APS5_NO_CONTEXT_CACHE") != nullptr;
     if (state->contextReady && !noCache) return state->context;

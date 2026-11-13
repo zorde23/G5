@@ -531,6 +531,10 @@ void GuestArenaComparedPages_nid_no_patch(std::uintptr_t address, std::size_t by
     WindowsMappings::Get().ComparedPages(address, bytes, pages, count, false);
 }
 
+std::uint64_t GuestArenaSavedCommittedBytes_nid_no_patch() {
+    return WindowsMappings::SavedCommittedBytes();
+}
+
 void GuestArenaTakeUnreportedPages_nid_no_patch(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count) {
     WindowsMappings::Get().ComparedPages(address, bytes, pages, count, true);
 }

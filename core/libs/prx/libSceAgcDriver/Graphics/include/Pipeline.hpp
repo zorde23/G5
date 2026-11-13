@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RecordedDrawState.hpp"
+#include <string>
 #include <atomic>
 #include <memory>
 #include <set>
@@ -134,6 +135,7 @@ struct PipelineStoreCounters {
     std::uint64_t bound = 0;
 };
 PipelineStoreCounters PipelineStoreTotals();
+std::string PipelineStoreMemoryText();
 // Whether the store may still raise its bound (not fixed by APS5_PIPELINE_STORE_ENTRIES, below 4096).
 bool PipelineStoreCanGrow();
 // The pipeline store's key of a configuration (empty when the configuration gets a private pipeline).

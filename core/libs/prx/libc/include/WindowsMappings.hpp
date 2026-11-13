@@ -2,12 +2,11 @@
 #define CORE_LIBS_PRX_LIBC_INCLUDE_WINDOWSMAPPINGS_HPP
 
 #ifdef _WIN32
+#include <bit>
 #include <windows.h>
 #include <algorithm>
 #include <array>
-#ifdef APS5_COUNT_MAPPING_QUERIES
 #include <atomic>
-#endif
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +24,7 @@ namespace GuestArena {
 
 class WindowsMappings {
 public:
+    static std::uint64_t SavedCommittedBytes() { return Saved::committedBytes.load(std::memory_order_relaxed); }
     enum class Collection { All, Armed, Fresh };
 
     static WindowsMappings& Get() {
@@ -696,13 +696,19 @@ private:
         unsigned char* bytes = nullptr;
         std::size_t length;
         std::array<std::uint64_t, chunkBytes / pageBytes / 64> committed{};
+        static inline std::atomic<std::uint64_t> committedBytes{0};
         explicit Saved(std::size_t length) : length(length) {
             bytes = static_cast<unsigned char*>(VirtualAlloc(nullptr, length, MEM_RESERVE, PAGE_READWRITE));
             if (bytes == nullptr) fail("reserve unmapped direct memory");
         }
         Saved(const Saved&) = delete;
         Saved& operator=(const Saved&) = delete;
-        ~Saved() { VirtualFree(bytes, 0, MEM_RELEASE); }
+        ~Saved() {
+            std::uint64_t pages = 0;
+            for (const auto word : committed) pages += static_cast<std::uint64_t>(std::popcount(word));
+            committedBytes.fetch_sub(pages * pageBytes, std::memory_order_relaxed);
+            VirtualFree(bytes, 0, MEM_RELEASE);
+        }
 
         void Commit(std::size_t offset) {
             const auto page = offset / pageBytes;
@@ -710,6 +716,7 @@ private:
             if ((committed[page >> 6] & bit) != 0) return;
             if (!VirtualAlloc(bytes + offset, pageBytes, MEM_COMMIT, PAGE_READWRITE)) fail("keep unmapped direct memory");
             committed[page >> 6] |= bit;
+            committedBytes.fetch_add(pageBytes, std::memory_order_relaxed);
         }
     };
     struct Physical {

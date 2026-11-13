@@ -47,6 +47,7 @@ struct TextureCacheUse {
     std::uint64_t storageBytes = 0;
 };
 TextureCacheUse TextureCacheUsage();
+std::string TextureCachesMemoryText();
 void OverrideCacheBudgetForTest(std::uint64_t bytes);
 std::uint64_t SampledTextureCacheBudget(const Context& context);
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D);
@@ -121,6 +122,7 @@ public:
         std::uint64_t reusedSets = 0;
     };
     Stats Counters() const;
+    std::string MemoryText() const;
 
 private:
     Context context;
@@ -722,6 +724,7 @@ public:
     void Clear();
     std::size_t Size() const;
     std::size_t Capacity() const;
+    std::optional<std::size_t> TrySize() const;
     void SetBase(std::size_t entries, std::size_t shrinkWindow);
     std::uint64_t TableElements() const;
     static std::uint64_t TableElementBudget();

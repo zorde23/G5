@@ -273,6 +273,14 @@ VkImageViewType ViewTypeFor(TextureDimension dimension, [[maybe_unused]] std::ui
 
 namespace {
 
+std::atomic<std::uint64_t> hostCopyBytes{0};
+
+void resizeHostCopy(std::vector<std::byte>& copy, std::size_t bytes) {
+    const auto before = copy.capacity();
+    copy.resize(bytes);
+    hostCopyBytes.fetch_add(copy.capacity() - before, std::memory_order_relaxed);
+}
+
 void ChainMinLod(const Context& context, const GuestTextureResource& descriptor, VkImageViewCreateInfo& viewInfo, VkImageViewMinLodCreateInfoEXT& minLod) {
     const auto clamp = EffectiveMinLod(descriptor);
     if (clamp == 0.0f) return;
@@ -2516,6 +2524,10 @@ void StorageTexture::verifySingleKeysUpload(std::uint64_t upload) {
     std::fprintf(stderr, "[gpu-single-keys] upload %llu of image 0x%llx (format %u) differs from the CPU expansion at byte %zu; APS5_GPU_SINGLE_KEYS is off from here on\n", static_cast<unsigned long long>(upload), static_cast<unsigned long long>(descriptor.baseAddress), descriptor.format, static_cast<std::size_t>(differs.first - expected.begin()));
 }
 
+std::uint64_t StorageTexture::SnapshotHostBytes() {
+    return hostCopyBytes.load(std::memory_order_relaxed);
+}
+
 std::uint64_t StorageTexture::SingleKeyGpuUploads() {
     return singleKeyGpuUploads.load(std::memory_order_relaxed);
 }
@@ -2606,7 +2618,7 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 }
 
 void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
-    original.resize(static_cast<std::size_t>(guestBytes));
+    resizeHostCopy(original, static_cast<std::size_t>(guestBytes));
     comparedRanges = {};
     std::vector<bool> selected(trackedLayers, true);
     if (layers != nullptr) selected = *layers;
@@ -2732,7 +2744,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         const bool whole = !selectedOnly || layers == nullptr;
         if (singleKeysOnGpu || guestBytes > GenerationBaselineBytes || !guestBytesSettled()) generationBaseline.clear();
         else if (whole) {
-            generationBaseline.resize(static_cast<std::size_t>(guestBytes));
+            resizeHostCopy(generationBaseline, static_cast<std::size_t>(guestBytes));
             GuestMemory::ReadCommitted(descriptor.baseAddress, generationBaseline);
         }
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
@@ -2955,7 +2967,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         cancelStoredSaves();
         forgetBorrowed(0, trackedLayers);
         stampLayers(false);
-        original.resize(static_cast<std::size_t>(guestBytes));
+        resizeHostCopy(original, static_cast<std::size_t>(guestBytes));
         GuestMemory::ReadCommitted(descriptor.baseAddress, original);
     }
     {
@@ -4607,7 +4619,7 @@ void StorageTexture::saveBeforeUnwatch() {
     for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) units[unit] = layerPending[unit] && !layerOriginal[unit];
     const auto runs = unitRuns(units);
     if (runs.empty()) return;
-    original.resize(static_cast<std::size_t>(guestBytes));
+    resizeHostCopy(original, static_cast<std::size_t>(guestBytes));
     comparedRanges = {};
     for (const auto& [begin, end] : runs) GuestMemory::ReadCommittedUnsynced(descriptor.baseAddress + begin, std::span(original).subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin)));
     for (const auto& [begin, end] : runs) GuestMemory::CollectWritesUncached(descriptor.baseAddress + begin, static_cast<std::size_t>(end - begin));
@@ -4669,7 +4681,7 @@ void StorageTexture::applyStoredSave(std::uint64_t ticket, const std::vector<std
     const auto stored = savedBytes->Bytes();
     for (const auto unit : units) {
         if (savedTicket[unit] != ticket) continue;
-        if (original.size() != guestBytes) original.resize(static_cast<std::size_t>(guestBytes));
+        if (original.size() != guestBytes) resizeHostCopy(original, static_cast<std::size_t>(guestBytes));
         comparedRanges = {};
         const auto offset = static_cast<std::size_t>(layerBegin(unit) - descriptor.baseAddress);
         std::memcpy(original.data() + offset, stored.data() + offset, static_cast<std::size_t>(layerBytes(unit)));
@@ -6561,7 +6573,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         }
         return;
     }
-    original.resize(static_cast<std::size_t>(guestBytes));
+    resizeHostCopy(original, static_cast<std::size_t>(guestBytes));
     // The store below compares against the guest bytes, read now when `original` does not hold
     // them (a GPU clear, a dropped or kept unit). Reading them says nothing about the image: a
     // stale unit (dropped, or kept for the CPU) still differs from them, so `original` vouches for
@@ -6679,6 +6691,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
 }
 
 StorageTexture::~StorageTexture() {
+    hostCopyBytes.fetch_sub(original.capacity() + generationBaseline.capacity(), std::memory_order_relaxed);
     {
         auto& live = Live();
         std::lock_guard lock(live.mutex);

@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include <string>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -12,6 +13,8 @@
 #include <vector>
 
 namespace AgcDriver::GuestMemory {
+
+std::string WriteTrackerMemoryText();
 
 void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable = false);
 // CheckRange without throwing: whether the whole range is mapped with the requested access.

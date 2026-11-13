@@ -425,6 +425,7 @@ public:
     std::uint64_t GuestBytes() const;
     std::uint64_t BudgetBytes() const;
     std::size_t OriginalSnapshotBytes() const { return original.capacity(); }
+    static std::uint64_t SnapshotHostBytes();
     static std::uint64_t SingleKeyGpuUploads();
     static std::uint64_t SingleKeyGpuVerified();
     VkDeviceSize AllocationBytes() const { return memoryBytes; }

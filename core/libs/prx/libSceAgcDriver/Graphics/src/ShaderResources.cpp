@@ -1353,6 +1353,30 @@ TextureCacheUse TextureCacheUsage() {
     return use;
 }
 
+std::string TextureCachesMemoryText() {
+    std::string text;
+    {
+        auto& sampled = Textures();
+        std::unique_lock lock(sampled.mutex, std::try_to_lock);
+        if (lock.owns_lock()) {
+            std::uint64_t hostBytes = 0;
+            for (const auto& entry : sampled.entries) hostBytes += entry.bytes.capacity();
+            for (const auto& [bytes, generation] : sampled.spare) hostBytes += bytes.capacity();
+            text = "sampled textures " + std::to_string(sampled.entries.size()) + " (" + std::to_string(sampled.bytes >> 20u) + " MiB GPU, " + std::to_string(hostBytes >> 20u) + " MiB host snapshots with " + std::to_string(sampled.spare.size()) + " spare)";
+        } else {
+            text = "sampled textures ?";
+        }
+    }
+    {
+        auto& storage = StorageTextures();
+        std::unique_lock lock(storage.mutex, std::try_to_lock);
+        text += ", storage textures " + (lock.owns_lock() ? std::to_string(storage.entries.size()) : std::string("?")) + " (" + std::to_string(storageCacheBytes() >> 20u) + " MiB GPU, " + std::to_string(StorageTexture::SnapshotHostBytes() >> 20u) + " MiB host originals and baselines of all storage textures)";
+    }
+    const auto resources = SharedResourceCache().TrySize();
+    text += ", shared resource templates " + (resources ? std::to_string(*resources) : std::string("?"));
+    return text;
+}
+
 std::uint64_t SampledTextureCacheBudget(const Context& context) {
     auto& cache = Textures();
     std::lock_guard lock(cache.mutex);
@@ -4194,6 +4218,12 @@ std::size_t ResourceCache::Size() const {
     return entries.size();
 }
 
+std::optional<std::size_t> ResourceCache::TrySize() const {
+    std::unique_lock lock(mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return std::nullopt;
+    return entries.size();
+}
+
 std::size_t ResourceCache::Capacity() const {
     std::lock_guard lock(mutex);
     return capacity == 0 ? baseEntries : capacity;
@@ -4429,6 +4459,14 @@ void DescriptorCache::Free(const SetAllocation& allocation, std::shared_ptr<cons
     if (--pool.liveSets != 0) return;
     if (resetPool(context.device, pool.handle, 0) != VK_SUCCESS) std::terminate();
     pool.exhausted = false;
+}
+
+std::string DescriptorCache::MemoryText() const {
+    std::unique_lock lock(mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return "descriptor layouts ?, recycled sets ?";
+    std::size_t sets = 0;
+    for (const auto& [layout, allocations] : recycled) sets += allocations.size();
+    return "descriptor layouts " + std::to_string(layouts.size()) + ", recycled sets " + std::to_string(sets) + ", kept sets " + std::to_string(kept.size());
 }
 
 DescriptorCache::Stats DescriptorCache::Counters() const {

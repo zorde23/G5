@@ -112,6 +112,7 @@ public:
     std::shared_ptr<const ShaderRegistry> RegisteredShaders();
 
 private:
+    void reportMemoryCaches();
     friend class SampledReadScope;
     friend struct PendingView;
     friend struct PacketTimer;

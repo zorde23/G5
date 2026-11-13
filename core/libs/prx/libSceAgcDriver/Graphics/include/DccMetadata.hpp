@@ -4,6 +4,7 @@
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
 #endif
+#include <string>
 #include <vulkan/vulkan.h>
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include <cstddef>
@@ -12,6 +13,8 @@
 #include <span>
 
 namespace AgcDriver::Graphics {
+
+std::string DccSpeculationsMemoryText();
 
 struct Context;
 

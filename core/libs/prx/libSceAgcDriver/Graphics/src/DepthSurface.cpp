@@ -2757,6 +2757,12 @@ void CompleteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes) {
     }
 }
 
+std::string DepthSurfacesMemoryText() {
+    std::unique_lock lock(surfacesMutex(), std::try_to_lock);
+    if (!lock.owns_lock()) return "depth surfaces ?, layered depth storages ?";
+    return "depth surfaces " + std::to_string(surfaces().size()) + ", layered depth storages " + std::to_string(layeredStorages().size());
+}
+
 void ClearDepthSurfaces(VkDevice device) {
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());

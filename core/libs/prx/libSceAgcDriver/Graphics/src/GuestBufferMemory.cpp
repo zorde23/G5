@@ -4089,6 +4089,13 @@ HostImportCounts HostImportCounters() {
     return {state.imports.size(), state.liveBytes, state.counts};
 }
 
+std::string HostImportsMemoryText() {
+    auto& state = Imports();
+    std::unique_lock lock(state.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return "host imports ?";
+    return "host imports " + std::to_string(state.imports.size()) + " (" + std::to_string(state.liveBytes >> 20u) + " MiB live)";
+}
+
 std::string FormatHostImportCounts(const HostImportCounts& counts) {
     HostImportRequesterCounts total;
     std::string requesters;

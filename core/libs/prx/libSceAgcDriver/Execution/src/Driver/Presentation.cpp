@@ -4,9 +4,24 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include <algorithm>
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include <cstdlib>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#endif
 
 namespace AgcDriver::DriverDetail {
 
@@ -70,10 +85,45 @@ void Driver::AttachWindow(const PresentationWindow& window) {
     device = std::make_shared<VulkanDevice>(&window);
 }
 
+void Driver::reportMemoryCaches() {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!stats) return;
+    static std::atomic<std::int64_t> reportedAt{0};
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    std::string text = "[mem-caches]";
+#ifdef _WIN32
+    static std::uint64_t previousFaults = 0;
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters)) != 0) {
+        text += " process working set " + std::to_string(counters.WorkingSetSize >> 20u) + " MiB, private " + std::to_string(counters.PrivateUsage >> 20u) + " MiB, page faults " + std::to_string(counters.PageFaultCount - previousFaults) + " in 10 s;";
+        previousFaults = counters.PageFaultCount;
+    }
+    text += " libc saved direct pages " + std::to_string(GuestArena::GuestArenaSavedCommittedBytes_nid_no_patch() >> 20u) + " MiB committed;";
+#endif
+    {
+        std::unique_lock lock(drawCacheMutex, std::try_to_lock);
+        text += lock.owns_lock() ? " draw cache " + std::to_string(drawCache.size()) + " (" + std::to_string(drawCacheVariantBytes >> 20u) + " MiB variants), relocations " + std::to_string(drawRelocations.size()) + ", relocation trials " + std::to_string(drawRelocationTrials.size()) : std::string(" draw cache ?, relocations ?, relocation trials ?");
+    }
+    {
+        std::unique_lock lock(dispatchCacheMutex, std::try_to_lock);
+        text += lock.owns_lock() ? ", dispatch cache " + std::to_string(dispatchCache.size()) + " (" + std::to_string(dispatchCacheVariantBytes >> 20u) + " MiB variants)" : std::string(", dispatch cache ?");
+    }
+    {
+        std::unique_lock lock(labelStoresMutex, std::try_to_lock);
+        text += ", label stores " + (lock.owns_lock() ? std::to_string(labelStores.size()) : std::string("?"));
+    }
+    if (const auto current = device.Load()) text += ", " + current->MemoryCachesText();
+    text += ", " + Graphics::PipelineStoreMemoryText() + ", " + Graphics::DepthSurfacesMemoryText() + ", " + Graphics::DccSpeculationsMemoryText() + ", " + GuestMemory::WriteTrackerMemoryText() + ", " + Graphics::TextureCachesMemoryText() + ", " + Graphics::HostImportsMemoryText();
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", text.c_str());
+}
+
 void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buffer, const DisplayBuffer* plane, bool opaque, void (*gpuReady)(void*), void* context) {
     if (PerformanceTrace::Configured()) PerformanceTrace::Present(window.width, window.height, device.Load().get());
     PerformanceContext timingContext(window.timing.get());
     PerformanceTimer timing("Driver.Present");
+    reportMemoryCaches();
     static thread_local bool pinned = false;
     if (!pinned) {
         pinned = true;

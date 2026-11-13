@@ -980,4 +980,11 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
     return std::nullopt;
 }
 
+std::string DccSpeculationsMemoryText() {
+    auto& speculations = Speculations();
+    std::unique_lock lock(speculations.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return "DCC key writers ?, last writers ?";
+    return "DCC key writers " + std::to_string(speculations.writers.size()) + ", last writers " + std::to_string(speculations.lastWriter.size());
+}
+
 }
