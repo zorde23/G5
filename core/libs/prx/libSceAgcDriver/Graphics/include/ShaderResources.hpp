@@ -569,6 +569,7 @@ private:
     std::unique_ptr<BdaResources> bda;
     std::vector<BdaResources::SrtGuardFaults> srtGuardFaults;
     bool usesBda = false;
+    double bdaTableUs = 0;
     bool bdaReadOnly = true;
     std::vector<std::uint64_t> multisampleSources;
     bool usesFaultBuffer = false;

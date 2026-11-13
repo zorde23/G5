@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "Recompiler.hpp"
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <utility>
@@ -12,6 +13,11 @@ namespace AgcDriver::Graphics {
 
 bool LoopGuardTripped();
 
+inline bool AddressBuildStats() {
+    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_BDA_STATS") != nullptr;
+    return enabled;
+}
+
 class BdaResources {
 public:
     explicit BdaResources(const Context& context);
@@ -19,6 +25,8 @@ public:
     VkDescriptorBufferInfo Table() const;
     VkDescriptorBufferInfo Fault() const;
     void CheckFault() const;
+    std::size_t Ranges() const { return tableBytes > sizeof(ShaderRecompiler::BdaAbi::Header) ? (tableBytes - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range) : 0; }
+    const void* TableId() const { return table.get(); }
     struct ImageTableFaults {
         std::uint32_t stage = 0;
         std::uint64_t shader = 0;
@@ -50,6 +58,8 @@ public:
         std::uint64_t firstDiffersHeap = 0;
         std::uint64_t firstSameHash = 0;
         std::uint64_t firstEmpty = 0;
+        std::uint64_t missRanges = 0;
+        std::uint64_t missChanged = 0;
     };
     static TableCacheStats TableCacheCounters();
 

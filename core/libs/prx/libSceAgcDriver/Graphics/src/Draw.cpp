@@ -1169,6 +1169,14 @@ struct DrawTimer {
         recordUs[part] += std::chrono::duration<double, std::micro>(now - (part == 0 ? phaseStart : recordLap)).count();
         recordLap = now;
     }
+    std::array<double, 8> vertexUs{};
+    std::chrono::steady_clock::time_point vertexLap;
+    void vertexPart(std::size_t part) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        vertexUs[part] += std::chrono::duration<double, std::micro>(now - (vertexLap == std::chrono::steady_clock::time_point{} ? phaseStart : vertexLap)).count();
+        vertexLap = now;
+    }
 };
 
 bool MemoCStats() {
@@ -1258,12 +1266,33 @@ void reportRecordParts(const DrawTimer& timer) {
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
 }
 
+void reportVertexParts(const DrawTimer& timer) {
+    static constexpr std::array<const char*, 8> names{"indices", "input layout", "attribute decode", "copy plan", "in-place ranges", "copied ranges", "zero-padded copies", "handles"};
+    static std::array<std::atomic<std::uint64_t>, 8> totalNs{};
+    static std::atomic<std::uint64_t> draws{0};
+    static std::atomic<std::int64_t> reportedAt{0};
+    for (std::size_t part = 0; part < names.size(); ++part) totalNs[part].fetch_add(static_cast<std::uint64_t>(timer.vertexUs[part] * 1000.0), std::memory_order_relaxed);
+    draws.fetch_add(1, std::memory_order_relaxed);
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    const auto sampled = draws.exchange(0, std::memory_order_relaxed);
+    if (sampled == 0) return;
+    std::string line = "[vertex-parts] 10 s, " + std::to_string(sampled) + " sampled draws, us per draw:";
+    for (std::size_t part = 0; part < names.size(); ++part) {
+        char text[64];
+        std::snprintf(text, sizeof(text), " %s %.2f;", names[part], static_cast<double>(totalNs[part].exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(sampled));
+        line += text;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
+}
+
 // One line per draw with the phases that took time (APS5_TRACE_DRAWS), and the 10 s totals.
 // `waitedBefore` is the thread's GPU waits at the draw's start and `ownWaitedMs` the draw's own
 // syncs (see DrawOutcome::hookWaitUs).
 void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResources::BuildTiming* built, DrawOutcome& outcome, double waitedBefore, double ownWaitedMs, const char* suffix) {
     if (!timer.profile) return;
     if (timer.recordLap != std::chrono::steady_clock::time_point{}) reportRecordParts(timer);
+    if (timer.vertexLap != std::chrono::steady_clock::time_point{}) reportVertexParts(timer);
     static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     outcome.hookWaitUs = std::max(0.0, Recorder::ThreadWaitedMs() - waitedBefore - ownWaitedMs) * 1000.0;
     outcome.ownSyncUs = ownWaitedMs * 1000.0;
@@ -1662,6 +1691,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         }
     }
     APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
+    timer.vertexPart(0);
     const auto& attributes = shaders.front().program->vertexAttributes;
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
     if (recipe != nullptr) {
@@ -1673,6 +1703,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (context.vertexInputs != nullptr) inputs.retainedVertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
         if (inputs.retainedVertexInput == nullptr) inputs.vertexInput = BuildVertexInputLayout(context, attributes);
     }
+    timer.vertexPart(1);
     inputs.vertexOffsets.assign(attributes.size(), 0);
     inputs.vertexHandles.reserve(attributes.size());
     // An indexed draw's vertex offset moves every fetch: the copy must reach the last one.
@@ -1720,6 +1751,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto recordBytes = static_cast<std::uint64_t>(fields[2]) * stride;
         fetchValid.push_back(args == nullptr && stride != 0 ? static_cast<std::size_t>(std::min(recordBytes, static_cast<std::uint64_t>(bytes))) : bytes);
     }
+    timer.vertexPart(2);
     const auto soloFetches = SoloZeroPaddedFetchIndices(fetches, fetchValid);
     auto& isSolo = scratch.isSolo;
     isSolo.assign(fetches.size(), false);
@@ -1741,6 +1773,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     rangeOffsets.clear();
     rangeHandles.reserve(plan.copies.size());
     rangeOffsets.reserve(plan.copies.size());
+    timer.vertexPart(3);
     for (std::size_t range = 0; range < plan.copies.size(); ++range) {
         const auto [begin, end] = plan.copies[range];
         const auto bytes = static_cast<std::size_t>(end - begin);
@@ -1750,6 +1783,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             rangeHandles.push_back(import->buffer);
             rangeOffsets.push_back(HostImportOffset(*import, begin));
             inputs.inPlaceReads.emplace_back(begin, end);
+            timer.vertexPart(4);
             continue;
         }
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
@@ -1757,6 +1791,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         rangeHandles.push_back(copy.buffer->Handle());
         rangeOffsets.push_back(0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
+        timer.vertexPart(5);
     }
     auto& soloHandles = scratch.soloHandles;
     soloHandles.assign(fetches.size(), VK_NULL_HANDLE);
@@ -1767,6 +1802,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         soloHandles[f] = copy.buffer->Handle();
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
+    timer.vertexPart(6);
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         if (zeroed[i] != nullptr) {
             inputs.vertexHandles.push_back(zeroed[i]->Handle());
@@ -1784,6 +1820,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         inputs.vertexHandles.push_back(rangeHandles[plan.copyOf[j]]);
         inputs.vertexOffsets[i] = rangeOffsets[plan.copyOf[j]] + plan.offsets[j];
     }
+    timer.vertexPart(7);
     timer.phase(PhaseVertex);
     return inputs;
 }

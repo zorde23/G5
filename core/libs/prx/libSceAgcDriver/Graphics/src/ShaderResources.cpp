@@ -1666,10 +1666,54 @@ void ShaderResources::KeepStorageImageBytes(Recorder& recorder) const {
     }
 }
 
+namespace {
+
+struct AddressDrawBuilds {
+    AgcDriver::Mutex mutex;
+    std::uint64_t builds = 0, sameTable = 0, ranges = 0;
+    double acquireUs = 0, prepareUs = 0, completeUs = 0, tableUs = 0;
+    const void* lastTable = nullptr;
+    std::int64_t reportedAt = 0;
+};
+
+void NoteAddressDrawBuild(std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point acquired, std::chrono::steady_clock::time_point prepared, double tableUs, const BdaResources& bda) {
+    static AddressDrawBuilds totals;
+    const auto now = std::chrono::steady_clock::now();
+    const auto us = [](auto from, auto to) { return std::chrono::duration<double, std::micro>(to - from).count(); };
+    std::lock_guard lock(totals.mutex);
+    ++totals.builds;
+    totals.acquireUs += us(start, acquired);
+    totals.prepareUs += us(acquired, prepared);
+    totals.completeUs += us(prepared, now);
+    totals.tableUs += tableUs;
+    totals.ranges += bda.Ranges();
+    if (bda.TableId() == totals.lastTable) ++totals.sameTable;
+    totals.lastTable = bda.TableId();
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count() / 10;
+    if (totals.reportedAt == tenSeconds) return;
+    totals.reportedAt = tenSeconds;
+    const auto per = [&](double value) { return value / static_cast<double>(totals.builds); };
+    AgcDriver::ProfilePrint_nid_no_patch("[bda-draw-builds] 10 s: %llu address-based draw builds, us per build: acquire and snapshots %.0f, prepare %.0f, complete %.0f (of it the table %.0f); %.0f ranges per table; %llu bound the same table as the previous build\n", static_cast<unsigned long long>(totals.builds), per(totals.acquireUs), per(totals.prepareUs), per(totals.completeUs), per(totals.tableUs), per(static_cast<double>(totals.ranges)), static_cast<unsigned long long>(totals.sameTable));
+    totals.builds = totals.sameTable = totals.ranges = 0;
+    totals.acquireUs = totals.prepareUs = totals.completeUs = totals.tableUs = 0;
+}
+
+}
+
 ShaderResources::ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots) : context(context), guestMemory(context) {
     drawBuild = true;
+    const bool stats = AddressBuildStats();
+    const auto start = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     prepareAddressBindings(shaders, snapshots);
-    build(shaders, &target, colorAttachments, indexAddress, indexBytes);
+    if (!stats || !usesBda) {
+        build(shaders, &target, colorAttachments, indexAddress, indexBytes);
+        return;
+    }
+    const auto acquired = std::chrono::steady_clock::now();
+    buildPrepare(shaders, &target, colorAttachments, indexAddress, indexBytes);
+    const auto prepared = std::chrono::steady_clock::now();
+    buildComplete();
+    NoteAddressDrawBuild(start, acquired, prepared, bdaTableUs, *bda);
 }
 
 ShaderResources::ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots) : ShaderResources(context, compute, snapshots, false) {}
@@ -2475,7 +2519,11 @@ void ShaderResources::buildComplete() {
         timing.bindingsMs += phase(BuildPhase::Images);
         guestMemory.UploadFinish(usesBda);
         timing.uploadMs += phase(BuildPhase::Upload);
-        if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
+        if (usesBda && drawBuild && AddressBuildStats()) {
+            const auto tableStart = std::chrono::steady_clock::now();
+            bda = std::make_unique<BdaResources>(context, guestMemory);
+            bdaTableUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - tableStart).count();
+        } else if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
         if (bda) bda->SetSrtGuards(std::move(srtGuardFaults));
         finishImageTables();

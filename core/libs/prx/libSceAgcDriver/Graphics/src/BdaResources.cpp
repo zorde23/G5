@@ -57,8 +57,7 @@ bool sameRanges(const std::vector<ShaderRecompiler::BdaAbi::Range>& left, const 
 // APS5_PROFILE_DRAW: why the most recently used entry did not serve this build (see
 // TableCacheStats). Under the cache mutex.
 void classifyFirstEntry(TableCache& cache, std::uint64_t hash, const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges) {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!profile) return;
+    if (!AddressBuildStats()) return;
     auto& classes = cache.classes;
     if (cache.entries.empty()) {
         ++classes.firstEmpty;
@@ -75,6 +74,9 @@ void classifyFirstEntry(TableCache& cache, std::uint64_t hash, const std::vector
         return;
     }
     const auto common = std::min(first.ranges.size(), ranges.size());
+    classes.missRanges += ranges.size();
+    classes.missChanged += std::max(first.ranges.size(), ranges.size()) - common;
+    for (std::size_t i = 0; i < common; ++i) classes.missChanged += std::memcmp(&first.ranges[i], &ranges[i], sizeof(ranges[i])) != 0 ? 1u : 0u;
     std::size_t at = 0;
     while (at < common && std::memcmp(&first.ranges[at], &ranges[at], sizeof(ranges[at])) == 0) ++at;
     const auto begin = at < ranges.size() ? ranges[at].begin : at < first.ranges.size() ? first.ranges[at].begin : 0;

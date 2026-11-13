@@ -1376,26 +1376,79 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     return drawn();
 }
 
+namespace {
+
+struct CommitTimer {
+    static constexpr std::array<const char*, 5> names{"GpuMutex wait", "labels and writers", "device draw", "recipe attach", "submit due"};
+    bool sampled;
+    std::chrono::steady_clock::time_point lapped = sampled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::array<std::uint64_t, 5> ns{};
+    static bool Sample() {
+        static const std::uint64_t every = [] {
+            const char* value = std::getenv("APS5_TMP_DRAW_PHASES");
+            return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+        }();
+        thread_local std::uint64_t seen = 0;
+        return every != 0 && seen++ % every == 0;
+    }
+    void lap(std::size_t part) {
+        if (!sampled) return;
+        const auto now = std::chrono::steady_clock::now();
+        ns[part] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - lapped).count());
+        lapped = now;
+    }
+    ~CommitTimer() {
+        if (!sampled) return;
+        static std::array<std::atomic<std::uint64_t>, 5> totalNs{};
+        static std::atomic<std::uint64_t> commits{0};
+        static std::atomic<std::int64_t> reportedAt{0};
+        for (std::size_t part = 0; part < ns.size(); ++part) totalNs[part].fetch_add(ns[part], std::memory_order_relaxed);
+        commits.fetch_add(1, std::memory_order_relaxed);
+        const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+        if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+        const auto sampledCommits = commits.exchange(0, std::memory_order_relaxed);
+        if (sampledCommits == 0) return;
+        std::string line = "[commit-parts] 10 s, " + std::to_string(sampledCommits) + " sampled draw commits, us per commit:";
+        for (std::size_t part = 0; part < names.size(); ++part) {
+            char text[64];
+            std::snprintf(text, sizeof(text), " %s %.2f;", names[part], static_cast<double>(totalNs[part].exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(sampledCommits));
+            line += text;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
+    }
+};
+
+}
+
 void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace, std::uint64_t shape, const Graphics::DrawPrep* prep) {
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+    CommitTimer timer{CommitTimer::Sample()};
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
+    timer.lap(0);
     struct SubmitDue {
         Driver& driver;
         const std::shared_ptr<VulkanDevice>& device;
+        CommitTimer& timer;
         ~SubmitDue() noexcept(false) {
+            timer.lap(3);
             if (std::uncaught_exceptions() == 0) driver.submitDueAfterCommit(device.get());
+            timer.lap(4);
         }
-    } submitDue{*this, localDevice};
+    } submitDue{*this, localDevice, timer};
     recordLabelsForPacket(localDevice.get(), queue);
     noteDrawWriters(stages, queue);
+    timer.lap(1);
     if (recipe != nullptr) {
-        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr) == RecipeOutcome::Recorded) return;
+        const auto outcome = localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr);
+        timer.lap(2);
+        if (outcome == RecipeOutcome::Recorded) return;
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, prep);
+    timer.lap(2);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
 }
 
