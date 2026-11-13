@@ -3120,14 +3120,15 @@ void noteFastCopies(bool behind) {
     AgcDriver::ProfilePrint_nid_no_patch("[fast-copies] 10 s: %llu fast proofs, %llu of them with a depth, block, repack or sRGB copy behind its source before the refresh at the end of the proof\n", static_cast<unsigned long long>(proofs.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(behindProofs.exchange(0, std::memory_order_relaxed)));
 }
 
-void NoteFastVerify(bool divergent) {
-    static std::atomic<std::uint64_t> verified{0}, diverged{0};
+void NoteFastVerify(bool divergent, bool equivalent) {
+    static std::atomic<std::uint64_t> verified{0}, diverged{0}, equivalents{0};
     static std::atomic<std::int64_t> reportedAt{0};
     verified.fetch_add(1, std::memory_order_relaxed);
     if (divergent) diverged.fetch_add(1, std::memory_order_relaxed);
+    if (equivalent) equivalents.fetch_add(1, std::memory_order_relaxed);
     const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
     if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
-    AgcDriver::ProfilePrint_nid_no_patch("[verify-fast] 10 s: %llu fast proofs checked against the full walk, %llu divergent\n", static_cast<unsigned long long>(verified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(diverged.exchange(0, std::memory_order_relaxed)));
+    AgcDriver::ProfilePrint_nid_no_patch("[verify-fast] 10 s: %llu fast proofs checked against the full walk, %llu divergent, %llu equivalent through another storage image of the same memory\n", static_cast<unsigned long long>(verified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(diverged.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(equivalents.exchange(0, std::memory_order_relaxed)));
 }
 
 // Whether a sampled surface's keys are the very keys of the image the view follows (the same
@@ -4006,7 +4007,9 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             traceScope.trace = {true};
             const bool same = walkAgrees(movedAt);
             const auto seen = traceScope.trace;
-            if (!same) {
+            const auto* missedSource = walkMiss.texture < validatedTextures.size() ? validatedTextures[walkMiss.texture].source : nullptr;
+            const bool equivalent = !same && movedAt == SIZE_MAX && walkMiss.point == 1 && missedSource != nullptr && missedSource->Cached() && seen.pending == nullptr && seen.entryFound && seen.sourceDiffers && seen.chosen != nullptr && seen.chosen != missedSource && !seen.stagedFlushed && !seen.keysEndView && !seen.keysNotServed && serialAtProof == StorageTexture::PendingSerial();
+            if (!same && !equivalent) {
                 static constexpr std::array<const char*, 8> points{"none", "a sampled element's lookup found another object", "an image table element's lookup found another object", "a reused image table holds other objects", "the element counts differ", "a storage element differs", "a stage has no program", "an image table's shape differs"};
                 const auto point = walkMiss.point >= 0 && static_cast<std::size_t>(walkMiss.point) < points.size() ? points[static_cast<std::size_t>(walkMiss.point)] : "?";
                 if (movedAt != SIZE_MAX) std::fprintf(stderr, "[verify-fast] the fast proof disagrees with the full walk: element %zu's content version moved (%zu textures, %zu storage images)\n", movedAt, textures.size(), storageTextures.size());
@@ -4017,7 +4020,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
                     std::fprintf(stderr, "[verify-fast] lookup detail: old texture released %d, old source %p cached %d; pending in the walk %s; chosen source %s; cache entry %s (its source %s, staged flushed %d, source differs %d, keys end the view %d, keys not served %d, snapshot stale %d), admitted uncached %d; pending serial at the proof %llu, now %llu; previous proof accepted %d\n", missed != nullptr && missed->Released() ? 1 : 0, static_cast<const void*>(oldSource), oldSource != nullptr && oldSource->Cached() ? 1 : 0, seen.pending == nullptr ? "none" : seen.pending == oldSource ? "the old source" : "another image", seen.chosen == nullptr ? "none" : seen.chosen == oldSource ? "the old source" : seen.chosen == seen.pending ? "the pending image" : "another image (storage cache)", seen.entryFound ? "found" : "missing", seen.entrySource == nullptr ? "none" : seen.entrySource == oldSource ? "the old source" : "another image", seen.stagedFlushed ? 1 : 0, seen.sourceDiffers ? 1 : 0, seen.keysEndView ? 1 : 0, seen.keysNotServed ? 1 : 0, seen.snapshotStale ? 1 : 0, seen.admittedUncached ? 1 : 0, static_cast<unsigned long long>(serialAtProof), static_cast<unsigned long long>(StorageTexture::PendingSerial()), wasAccepted ? 1 : 0);
                 }
             }
-            NoteFastVerify(!same);
+            NoteFastVerify(!same && !equivalent, equivalent);
             if (!same && movedAt == SIZE_MAX) return finish(false, false);
         }
     }
