@@ -308,6 +308,15 @@ public:
         bool gate = false;
         FastFail walkReason = FastFail::Count;
     };
+    struct ProofLaps;
+    struct ProofLapsScope {
+        explicit ProofLapsScope(ShaderResources& owner);
+        ~ProofLapsScope();
+        ShaderResources& owner;
+        std::unique_ptr<ProofLaps> laps;
+        bool fastPath = false;
+        bool passed = false;
+    };
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
     static bool EpochProofs();
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
@@ -544,6 +553,7 @@ private:
         bool viewUncompressed;
         bool sourceEligible = false;
     };
+    ProofLaps* proofLaps = nullptr;
     // `serialBefore` is StorageTexture::PendingSerial() loaded before any check of this Revalidate;
     // `refreshed` the surfaces refreshOwnObjects resolved earlier in the same Revalidate (empty on
     // the first run): a foreign image still pending over one of them (the own image's alias, an

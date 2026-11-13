@@ -3187,6 +3187,36 @@ std::size_t ShaderResources::LookupLogCapacity() {
     return lookupLog().capacity();
 }
 
+struct ShaderResources::ProofLaps {
+    static constexpr std::size_t count = 9;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    std::array<std::uint64_t, count> ns{};
+    std::uint64_t queries = 0, pending = 0;
+};
+
+namespace {
+
+void lapProof(ShaderResources::ProofLaps* laps, std::size_t part) {
+    if (laps == nullptr) return;
+    const auto now = std::chrono::steady_clock::now();
+    laps->ns[part] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - laps->last).count());
+    laps->last = now;
+}
+
+void countProofQueries(ShaderResources::ProofLaps& laps, std::size_t queries, std::size_t pending) {
+    laps.queries += queries;
+    laps.pending += pending;
+}
+
+struct ProofLapTotals {
+    AgcDriver::Mutex mutex;
+    std::uint64_t proofs = 0, textures = 0, storage = 0, regions = 0, ranges = 0, queries = 0, pending = 0;
+    std::array<std::uint64_t, ShaderResources::ProofLaps::count> ns{};
+    std::int64_t reportedAt = 0;
+};
+
+}
+
 // Proves every texture and storage image still current without repeating its lookup: exactly the
 // "unchanged" branches of cachedTexture and StorageTexture::Refresh, evaluated from write stamps,
 // the pending-results registry and the DCC keys. Per element: collect first (stamps come only from
@@ -3231,6 +3261,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     owners.clear();
     images.clear();
     scannedKeys.assign(textures.size(), DccKeys::Uncompressed);
+    lapProof(proofLaps, 1);
     const auto query = [&](std::uint64_t begin, std::uint64_t end, const StorageTexture* except, const StorageTexture* identity, PendingOverlap owner) {
         pending.push_back({begin, end, except, identity, false});
         owners.push_back(owner);
@@ -3291,6 +3322,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             queries.push_back({address, bytes, surface.generation});
         }
     }
+    lapProof(proofLaps, 2);
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
         if (storageTextures[i] != nullptr && (i >= storageKeys.size() || !StorageImageServesKeys(*storageTextures[i], storageKeys[i]))) return fail(FastFail::StorageKeys);
         if (i != 0 && storageTextures[i] == storageTextures[i - 1]) continue;
@@ -3316,6 +3348,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         queries.push_back({address, bytes, image->GenerationFor(address, bytes)});
         images.push_back(image);
     }
+    lapProof(proofLaps, 3);
     if (!pending.empty()) {
         if (!StorageTexture::ScanPending(pending)) return fail(FastFail::ClearedView);
         // A foreign image over a view under uncompressed keys is no failure while FindPending
@@ -3350,7 +3383,10 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     } else if (unchanged && BuildProfiled()) {
         Revalidations().serialSkips.fetch_add(1, std::memory_order_relaxed);
     }
+    lapProof(proofLaps, 4);
+    if (proofLaps != nullptr) countProofQueries(*proofLaps, queries.size(), pending.size());
     if (!GuestMemory::UnchangedSinceAll(queries)) return fail(FastFail::Changed);
+    lapProof(proofLaps, 5);
     if (!StorageImagesCached(context, images)) return fail(FastFail::Evicted);
     for (const auto* image : images) image->NoteProved();
     for (std::size_t i = 0; i < validatedTextures.size(); ++i) {
@@ -3358,6 +3394,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (surface.source == nullptr) surface.generation = surface.collected;
         surface.keys = scannedKeys[i];
     }
+    lapProof(proofLaps, 6);
     return true;
 }
 
@@ -3611,9 +3648,53 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     return revalidateFull(shaders, report);
 }
 
+ShaderResources::ProofLapsScope::ProofLapsScope(ShaderResources& owner) : owner(owner) {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    thread_local std::uint64_t proofs = 0;
+    if (stats && proofs++ % 64 == 0) {
+        laps = std::make_unique<ProofLaps>();
+        owner.proofLaps = laps.get();
+    }
+}
+
+ShaderResources::ProofLapsScope::~ProofLapsScope() {
+    if (laps == nullptr) return;
+    owner.proofLaps = nullptr;
+    if (!fastPath || !passed) return;
+    lapProof(laps.get(), 8);
+    static ProofLapTotals totals;
+    std::lock_guard lock(totals.mutex);
+    ++totals.proofs;
+    totals.textures += owner.textures.size();
+    totals.storage += owner.storageTextures.size();
+    totals.regions += owner.directRegions.size();
+    totals.ranges += owner.describedRanges.size();
+    totals.queries += laps->queries;
+    totals.pending += laps->pending;
+    for (std::size_t part = 0; part < laps->ns.size(); ++part) totals.ns[part] += laps->ns[part];
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (totals.reportedAt == tenSeconds) return;
+    totals.reportedAt = tenSeconds;
+    static constexpr std::array<const char*, ProofLaps::count> names{"prefix", "setup", "textures", "storage images", "pending scan", "unchanged since", "close", "T1 and audit", "imports, staging and depth copies"};
+    const auto per = [&](std::uint64_t value) { return static_cast<double>(value) / static_cast<double>(totals.proofs); };
+    std::string line = "[fast-proof] 10 s, " + std::to_string(totals.proofs) + " fast proofs (1 in 64 revalidations past the epoch gate, on the proving thread), us each:";
+    for (std::size_t part = 0; part < names.size(); ++part) {
+        char text[80];
+        std::snprintf(text, sizeof(text), " %s %.2f;", names[part], per(totals.ns[part]) / 1000.0);
+        line += text;
+    }
+    char counts[256];
+    std::snprintf(counts, sizeof(counts), " per proof: textures %.1f, storage images %.1f, direct regions %.1f, described ranges %.1f, unchanged queries %.1f, pending queries %.1f", per(totals.textures), per(totals.storage), per(totals.regions), per(totals.ranges), per(totals.queries), per(totals.pending));
+    line += counts;
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
+    totals.proofs = totals.textures = totals.storage = totals.regions = totals.ranges = totals.queries = totals.pending = 0;
+    totals.ns = {};
+}
+
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
+    ProofLapsScope lapsScope(*this);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (const auto& region : directRegions) {
@@ -3629,6 +3710,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
         if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
     }
+    lapProof(proofLaps, 0);
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
@@ -3756,6 +3838,8 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         reason = FastFail::Audit;
     }
     if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
+    lapProof(proofLaps, 7);
+    lapsScope.fastPath = fast && !ownRefreshed;
     if (!fast) {
         countFullWalk(reason);
         if (report != nullptr) report->walkReason = reason;
@@ -3857,6 +3941,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             texture->RefreshDepthCopy();
         }
     }
+    lapsScope.passed = true;
     return finish(fast, true);
 }
 
