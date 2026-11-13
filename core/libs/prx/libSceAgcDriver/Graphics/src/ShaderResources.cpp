@@ -3066,6 +3066,29 @@ bool VerifyProofs() {
     return enabled;
 }
 
+std::uint64_t VerifyFastEvery() {
+    static const std::uint64_t every = [] {
+        const char* value = std::getenv("APS5_VERIFY_FAST_PROOF");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+bool AuditBeforeFast() {
+    static const bool enabled = std::getenv("APS5_AUDIT_BEFORE_FAST") != nullptr;
+    return enabled;
+}
+
+void NoteFastVerify(bool divergent) {
+    static std::atomic<std::uint64_t> verified{0}, diverged{0};
+    static std::atomic<std::int64_t> reportedAt{0};
+    verified.fetch_add(1, std::memory_order_relaxed);
+    if (divergent) diverged.fetch_add(1, std::memory_order_relaxed);
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[verify-fast] 10 s: %llu fast proofs checked against the full walk, %llu divergent\n", static_cast<unsigned long long>(verified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(diverged.exchange(0, std::memory_order_relaxed)));
+}
+
 // Whether a sampled surface's keys are the very keys of the image the view follows (the same
 // metadata, extent, format and alpha placement: the same scan), so the image's proof serves it.
 bool SameKeySurface(const StorageTexture* source, const GuestTextureResource& resource, std::uint64_t guestBytes) {
@@ -3811,14 +3834,16 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     refreshed.clear();
     FastFail reason = FastFail::Count;
     bool accepted = false;
-    bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+    const bool auditFirst = AuditBeforeFast() && !noFast && TemplateAuditDue(lastFullWalk);
+    if (auditFirst) reason = FastFail::Audit;
+    bool fast = !noFast && !auditFirst && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
     // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
     // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
     // them) and the fast proof run again, which is then authoritative (it accepts what stays
     // pending over the refreshed surfaces, see fastRevalidate); a fallback, or a second failure,
     // takes the full walk as before.
     bool ownRefreshed = false;
-    if (!fast && !overlapping.empty()) {
+    if (!fast && !auditFirst && !overlapping.empty()) {
         auto fallback = OwnRefreshFallback::Count;
         if (!OwnImageRefreshEnabled()) fallback = OwnRefreshFallback::Disabled;
         else {
@@ -3837,6 +3862,21 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         ownRefreshed = false;
         reason = FastFail::Audit;
     }
+    const auto walkAgrees = [&](std::size_t& movedAt) {
+        struct VersionsTag {};
+        auto& versions = ThreadScratch<std::vector<std::pair<const StorageTexture*, std::uint64_t>>, VersionsTag>();
+        versions.clear();
+        for (const auto& surface : validatedTextures) {
+            if (surface.source != nullptr) versions.emplace_back(surface.source, surface.source->Version());
+        }
+        for (const auto& image : storageTextures) versions.emplace_back(image.get(), image->Version());
+        movedAt = SIZE_MAX;
+        if (!fullWalk()) return false;
+        const auto moved = std::find_if(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
+        if (moved == versions.end()) return true;
+        movedAt = static_cast<std::size_t>(moved - versions.begin());
+        return false;
+    };
     if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
     lapProof(proofLaps, 7);
     lapsScope.fastPath = fast && !ownRefreshed;
@@ -3861,21 +3901,23 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             // The walk after the refresh, or beside a proof that accepted a foreign overlap, must
             // find every object in place and current: another object, or an upload (a moved
             // content version), is a decision the proof got wrong.
-            struct VersionsTag {};
-            auto& versions = ThreadScratch<std::vector<std::pair<const StorageTexture*, std::uint64_t>>, VersionsTag>();
-            versions.clear();
-            for (const auto& surface : validatedTextures) {
-                if (surface.source != nullptr) versions.emplace_back(surface.source, surface.source->Version());
-            }
-            for (const auto& image : storageTextures) versions.emplace_back(image.get(), image->Version());
-            const bool same = fullWalk();
-            const auto moved = std::find_if(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
-            if (!same || moved != versions.end()) {
-                std::fprintf(stderr, "[rescache] APS5_VERIFY_PROOFS: the T1 proof (%s) disagrees with the full walk (%s)\n", ownRefreshed ? "own-object refresh" : "accepted overlap", !same ? "another object" : "an upload");
+            std::size_t movedAt = 0;
+            const bool same = walkAgrees(movedAt);
+            if (!same) {
+                std::fprintf(stderr, "[rescache] APS5_VERIFY_PROOFS: the T1 proof (%s) disagrees with the full walk (%s)\n", ownRefreshed ? "own-object refresh" : "accepted overlap", movedAt == SIZE_MAX ? "another object" : "an upload");
                 std::fflush(stderr);
                 std::abort();
             }
             if (profile) Revalidations().proofsVerified.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else if (const auto every = VerifyFastEvery(); every != 0) {
+        thread_local std::uint64_t fastProofs = 0;
+        if (fastProofs++ % every == 0) {
+            std::size_t movedAt = 0;
+            const bool same = walkAgrees(movedAt);
+            if (!same) std::fprintf(stderr, "[verify-fast] the fast proof disagrees with the full walk: %s (%zu textures, %zu storage images)\n", movedAt == SIZE_MAX ? "the walk failed or found another object" : ("element " + std::to_string(movedAt) + "'s content version moved").c_str(), textures.size(), storageTextures.size());
+            NoteFastVerify(!same);
+            if (!same && movedAt == SIZE_MAX) return finish(false, false);
         }
     }
     // (2) The imported buffers the set reads in place: results of storage images pending in them go
