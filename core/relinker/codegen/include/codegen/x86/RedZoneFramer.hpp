@@ -62,7 +62,9 @@ std::vector<TrampolineSite> FrameRedZoneFunctions(
     const std::vector<TrampolineSite>& existing,
     RedZoneFrameReport& report,
     std::vector<RedZoneDisplacement>& displacements,
-    bool shrinkWrapped = false
+    bool shrinkWrapped = false,
+    bool countFramePointerAllocation = false,
+    bool suspectFramePointerLeaves = false
 );
 
 }

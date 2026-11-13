@@ -124,6 +124,90 @@ void extensionBits(const std::uint8_t* code, const Insn& insn, bool& r, bool& x,
     }
 }
 
+enum class Analysis : std::uint8_t { Understood, Unknown, FrameHazard };
+
+Analysis analyzeForFrame(const std::uint8_t* code, const Insn& insn, const bool rspBaseAllowed) {
+    const auto& info = insn.Info;
+    const auto at = info.OpcodeOffset;
+    const auto lead = code[at];
+    const auto frameRegister = [](const unsigned reg) { return reg == kRegRsp || reg == kRegRbp; };
+    if (lead == 0xc8 || lead == 0xc9) return Analysis::FrameHazard;
+    if (info.AddressSize32 || info.TruncatesBranchTarget) return Analysis::Unknown;
+    bool r = false;
+    bool x = false;
+    bool b = false;
+    extensionBits(code, insn, r, x, b);
+    const auto modrm = info.ModRmByte;
+    const auto digit = static_cast<std::uint8_t>((modrm >> 3) & 7);
+    enum class Form : std::uint8_t { None, General, Digit, Vector };
+    std::optional<Form> form;
+    std::optional<unsigned> vexRegister;
+    const bool vex = info.RexPrefix == 0 && (lead == 0xc4 || lead == 0xc5 || lead == 0x62 || xopPrefixed(code, insn));
+    const auto op = info.Opcode;
+    if (vex) {
+        if (lead != 0xc4 || at + 3 >= insn.Length) return Analysis::Unknown;
+        const auto map = code[at + 1] & 0x1fu;
+        const auto vexOp = code[at + 3];
+        const auto vvvv = (~code[at + 2] >> 3) & 0xfu;
+        const bool vvvvUsed = map == 2 && (vexOp == 0xf2 || vexOp == 0xf3 || vexOp == 0xf5 || vexOp == 0xf6 || vexOp == 0xf7);
+        if (map == 2 && (vexOp == 0xf2 || vexOp == 0xf5 || vexOp == 0xf6 || vexOp == 0xf7)) form = Form::General;
+        else if (map == 2 && vexOp == 0xf3 && digit >= 1 && digit <= 3) form = Form::Digit;
+        else if (map == 3 && vexOp == 0xf0) form = Form::General;
+        else return Analysis::Unknown;
+        if (vvvvUsed) vexRegister = vvvv;
+    } else if (!info.IsTwoByteOpcode) {
+        if (op <= 0x3d && (op & 7) <= 3) form = Form::General;
+        else if (op <= 0x3d && ((op & 7) == 4 || (op & 7) == 5)) form = Form::None;
+        else if (op == 0x63 || op == 0x69 || op == 0x6b || (op >= 0x84 && op <= 0x8b) || op == 0x8d) form = Form::General;
+        else if (op == 0x80 || op == 0x81 || op == 0x83 || op == 0xc0 || op == 0xc1 || (op >= 0xd0 && op <= 0xd3) || op == 0xf6 || op == 0xf7) form = Form::Digit;
+        else if ((op == 0xc6 || op == 0xc7) && digit == 0) form = Form::Digit;
+        else if ((op == 0xfe || op == 0xff) && digit <= 1) form = Form::Digit;
+        else if ((op >= 0x70 && op <= 0x7f) || op == 0xeb || op == 0xe9 || op == 0x90 || op == 0x98 || op == 0x99 || op == 0xa8 || op == 0xa9) form = Form::None;
+        else if (op >= 0xb0 && op <= 0xbf) return frameRegister((op & 7u) | (b ? 8u : 0u)) ? Analysis::FrameHazard : Analysis::Understood;
+        else if (op >= 0x91 && op <= 0x97) return frameRegister((op & 7u) | (b ? 8u : 0u)) ? Analysis::FrameHazard : Analysis::Unknown;
+        else if (op >= 0x50 && op <= 0x5f) return frameRegister((op & 7u) | (b ? 8u : 0u)) ? Analysis::FrameHazard : Analysis::Unknown;
+    } else {
+        if ((op >= 0x40 && op <= 0x4f) || op == 0xaf || op == 0xb6 || op == 0xb7 || op == 0xbe || op == 0xbf) form = Form::General;
+        else if ((op >= 0x90 && op <= 0x9f) || (op == 0x1f && digit == 0)) form = Form::Digit;
+        else if (op >= 0x80 && op <= 0x8f) form = Form::None;
+        else if ((op >= 0x10 && op <= 0x17) || op == 0x28 || op == 0x29 || op == 0x2e || op == 0x2f || (op >= 0x51 && op <= 0x6d) || op == 0x6f || op == 0x70 || (op >= 0x74 && op <= 0x76) || op == 0x7f ||
+                 op == 0xc2 || op == 0xc6 || op == 0xd4 || op == 0xd6 || op == 0xdb || op == 0xdf || op == 0xe6 || op == 0xeb || op == 0xef || op == 0xf4 || (op >= 0xfa && op <= 0xfe)) form = Form::Vector;
+    }
+    if (!form) return Analysis::Unknown;
+    if (*form == Form::None) return !info.HasModRm && (info.FlowKind == ControlFlowKind::Sequential || info.HasBranchTarget) ? Analysis::Understood : Analysis::Unknown;
+    if (!info.HasModRm || info.ModRmOffset == 0 || info.ModRmOffset >= insn.Length) return Analysis::Unknown;
+    const auto mod = static_cast<std::uint8_t>(modrm >> 6);
+    const auto rm = static_cast<std::uint8_t>(modrm & 7);
+    if (*form == Form::General && frameRegister(digit | (r ? 8u : 0u))) return Analysis::FrameHazard;
+    if (vexRegister && frameRegister(*vexRegister)) return Analysis::FrameHazard;
+    if (mod == 3) return *form == Form::Vector || !frameRegister(rm | (b ? 8u : 0u)) ? Analysis::Understood : Analysis::FrameHazard;
+    if (rm == 5 && mod == 0) return Analysis::Understood;
+    unsigned base = rm | (b ? 8u : 0u);
+    bool indexed = false;
+    if (rm == 4) {
+        const auto sibAt = info.ModRmOffset + 1;
+        if (sibAt >= insn.Length) return Analysis::Unknown;
+        const auto sib = code[sibAt];
+        const auto index = ((sib >> 3) & 7u) | (x ? 8u : 0u);
+        if (index != kRegRsp) {
+            if (frameRegister(index)) return Analysis::FrameHazard;
+            indexed = true;
+        }
+        base = (sib & 7u) | (b ? 8u : 0u);
+        if (mod == 0 && (sib & 7u) == 5) return Analysis::Understood;
+    }
+    const bool takesAddress = !vex && !info.IsTwoByteOpcode && op == 0x8d;
+    if (base == kRegRsp) return rspBaseAllowed && !indexed && !takesAddress ? Analysis::Understood : Analysis::FrameHazard;
+    if (base == kRegRbp && (indexed || takesAddress)) return Analysis::FrameHazard;
+    return Analysis::Understood;
+}
+
+bool analyzedForAllocation(const std::uint8_t* code, const Insn& insn, const bool rspBaseAllowed = false) {
+    const auto at = insn.Info.OpcodeOffset;
+    if (insn.Length == 2 && at == 0 && code[0] == 0xcd && (code[1] == 0x41 || code[1] == 0x29)) return true;
+    return analyzeForFrame(code, insn, rspBaseAllowed) == Analysis::Understood;
+}
+
 bool twoByteRegisterIsGeneral(const std::uint8_t op) {
     return (op >= 0x40 && op <= 0x4f) || op == 0xa3 || op == 0xa4 || op == 0xa5 || op == 0xab || op == 0xac || op == 0xad || op == 0xaf || op == 0xb0 || op == 0xb1 || op == 0xb3 || op == 0xb6 || op == 0xb7 || op == 0xb8 || (op >= 0xbb && op <= 0xbf) || op == 0xc0 || op == 0xc1 || op == 0xc3;
 }
@@ -199,6 +283,8 @@ MemoryUse memoryUse(const std::uint8_t* code, const Insn& insn) {
     if (base == kRegRbp && !baseExtended && mod != 0) {
         use.RbpBased = true;
         use.RbpDisp = disp;
+        use.Indexed = indexed;
+        use.Address = !vex && !info.IsTwoByteOpcode && info.Opcode == 0x8d;
     }
     return use;
 }
@@ -278,7 +364,9 @@ void frameSegment(
     std::vector<TrampolineSite>& sites,
     std::vector<RedZoneDisplacement>& displacements,
     RedZoneFrameReport& report,
-    const bool shrinkWrapped
+    const bool shrinkWrapped,
+    const bool countFramePointerAllocation,
+    const bool suspectFramePointerLeaves
 ) {
     const auto segOffset = static_cast<std::size_t>(ph.Offset);
     const auto segSize = static_cast<std::size_t>(ph.FileSize);
@@ -485,6 +573,9 @@ void frameSegment(
             if (code[match.Offset] == 0xcc && match.Length == 1) break;
             body.push_back({start + static_cast<std::size_t>(match.Offset), match.Length, decoder.DecodeInstruction(code.data() + match.Offset, match.Length)});
         }
+        bool contiguous = !body.empty() && body.front().Offset == start;
+        for (std::size_t k = 1; k < body.size() && contiguous; ++k) contiguous = body[k - 1].Offset + body[k - 1].Length == body[k].Offset;
+        if (contiguous) contiguous = std::all_of(code.begin() + static_cast<std::ptrdiff_t>(body.back().Offset + body.back().Length - start), code.end(), [](std::uint8_t byte) { return byte == 0xcc; });
         if (body.size() < 3) continue;
         const auto at = [&](const std::size_t k) { return seg.data() + body[k].Offset; };
         const bool rbpPrologue = body[0].Length == 1 && at(0)[0] == 0x55 && body[1].Length == 3 && std::memcmp(at(1), "\x48\x89\xe5", 3) == 0;
@@ -510,6 +601,46 @@ void frameSegment(
             for (std::size_t k = p; k < body.size(); ++k)
                 if (body[k].Info.FlowKind == ControlFlowKind::Return)
                     if (const auto q = popsBefore(k); q && *q > p && rspAdjustment(at(*q - 1), body[*q - 1]) == allocation) frees.insert(*q - 1);
+        std::set<std::size_t> bodyStarts;
+        const bool allocatesAtP = p < body.size() && body[p].Length >= 4 && at(p)[2] == 0xec && rspAdjustment(at(p), body[p]).value_or(0) < 0;
+        for (std::size_t k = allocatesAtP ? p + 1 : p; k < body.size(); ++k) bodyStarts.insert(body[k].Offset);
+        const auto branchStaysInBody = [&](const std::size_t k) {
+            const auto& insn = body[k];
+            if (!insn.Info.HasBranchTarget) return true;
+            const auto target = static_cast<std::int64_t>(insn.Offset + insn.Length) + insn.Info.BranchDisp;
+            return !insn.Info.HasRipRelativeDisp && target >= 0 && bodyStarts.contains(static_cast<std::size_t>(target));
+        };
+        const auto endsWithoutFallThrough = !body.empty() && (body.back().Info.FlowKind == ControlFlowKind::Return || body.back().Info.FlowKind == ControlFlowKind::UnconditionalJump);
+        std::int64_t framePointerAllocation = 0;
+        if (countFramePointerAllocation && rbpPrologue && p < body.size() && body[p].Length >= 4 && at(p)[2] == 0xec)
+            if (const auto adjustment = rspAdjustment(at(p), body[p]); adjustment && *adjustment < 0) {
+                const auto allocated = -*adjustment;
+                const auto pushedBytes = static_cast<std::int64_t>(8 * pushed.size());
+                std::set<std::size_t> epilogue;
+                bool clean = true;
+                std::size_t returns = 0;
+                for (std::size_t k = p + 1; k < body.size() && clean; ++k) {
+                    if (body[k].Info.FlowKind != ControlFlowKind::Return) continue;
+                    ++returns;
+                    const auto q = popsBefore(k);
+                    if (!q || *q <= p + 1 || body[k].Length != 1 || at(k)[0] != 0xc3) { clean = false; break; }
+                    const auto* freeing = at(*q - 1);
+                    const auto& freeInsn = body[*q - 1];
+                    const bool added = freeInsn.Length >= 4 && freeing[2] == 0xc4 && rspAdjustment(freeing, freeInsn) == allocated;
+                    const bool restored = freeInsn.Length == 4 && std::memcmp(freeing, "\x48\x8d\x65", 3) == 0 && static_cast<std::int8_t>(freeing[3]) == -pushedBytes;
+                    if ((!added && !restored) || targetInside(freeInsn.Offset, body[k].Offset + body[k].Length)) clean = false;
+                    for (auto j = *q - 1; j <= k; ++j) epilogue.insert(j);
+                }
+                if (returns == 0 || !endsWithoutFallThrough || !contiguous) clean = false;
+                for (std::size_t k = p + 1; k < body.size() && clean; ++k) {
+                    if (epilogue.contains(k)) continue;
+                    const auto& insn = body[k];
+                    const auto use = memoryUse(at(k), insn);
+                    if (!analyzedForAllocation(at(k), insn) || use.UsesRsp || pushesOrPops(at(k), insn) || (use.RbpBased && (use.Indexed || use.Address))) clean = false;
+                    if (!branchStaysInBody(k)) clean = false;
+                }
+                if (clean) framePointerAllocation = allocated;
+            }
 
         bool leaf = true;
         bool redZone = false;
@@ -535,7 +666,7 @@ void frameSegment(
             if (flow == ControlFlowKind::Call || flow == ControlFlowKind::IndirectCall) { leaf = false; break; }
             if (frees.contains(k)) continue;
             const auto use = memoryUse(code, insn);
-            if (use.RbpBased && rbpPrologue && use.RbpDisp < -static_cast<std::int64_t>(8 * pushed.size())) redZone = true;
+            if (use.RbpBased && rbpPrologue && use.RbpDisp < -static_cast<std::int64_t>(8 * pushed.size()) - framePointerAllocation) redZone = true;
             if (use.RspBased && use.RspDisp < 0) redZone = true;
             if (reason != nullptr) continue;
             if (code[insn.Info.OpcodeOffset] == 0xc9 || code[insn.Info.OpcodeOffset] == 0xc8) { reason = "leave or enter"; continue; }
@@ -582,6 +713,44 @@ void frameSegment(
                 if (exit.End - exit.Begin < kJumpBytes) { reason = "exit shorter than a jump"; continue; }
                 if (targetInside(exit.Begin, exit.End)) { reason = exit.First == exit.Tail ? "branch into an exit" : "branch into the instructions before a short exit"; continue; }
                 exits.push_back(std::move(exit));
+            }
+        }
+        if (suspectFramePointerLeaves && leaf && !redZone && rbpPrologue) {
+            const auto allocated = allocatesAtP ? -rspAdjustment(at(p), body[p]).value_or(0) : 0;
+            const auto pushedBytes = static_cast<std::int64_t>(8 * pushed.size());
+            std::set<std::size_t> epilogue;
+            for (std::size_t k = p + 1; k < body.size(); ++k) {
+                if (body[k].Info.FlowKind != ControlFlowKind::Return || body[k].Length != 1 || at(k)[0] != 0xc3) continue;
+                std::optional<std::size_t> first;
+                if (pushed.empty() && body[k - 1].Length == 1 && at(k - 1)[0] == 0xc9) first = k - 1;
+                else if (const auto q = popsBefore(k)) {
+                    first = *q;
+                    if (*q > p + 1) {
+                        const auto* freeing = at(*q - 1);
+                        const auto& freeInsn = body[*q - 1];
+                        const bool added = allocatesAtP && freeInsn.Length >= 4 && freeing[2] == 0xc4 && rspAdjustment(freeing, freeInsn) == allocated;
+                        const bool restored = freeInsn.Length == 4 && std::memcmp(freeing, "\x48\x8d\x65", 3) == 0 && static_cast<std::int8_t>(freeing[3]) == -pushedBytes;
+                        if (added || restored) first = *q - 1;
+                        else if (allocatesAtP) first.reset();
+                    } else if (allocatesAtP) {
+                        first.reset();
+                    }
+                }
+                if (!first || targetInside(body[*first].Offset, body[k].Offset + body[k].Length)) continue;
+                for (auto j = *first; j <= k; ++j) epilogue.insert(j);
+            }
+            if (allocatesAtP && !epilogue.empty()) epilogue.insert(p);
+            for (std::size_t k = p; k < body.size(); ++k) {
+                if (epilogue.contains(k)) continue;
+                bool hazard = body[k].Info.FlowKind == ControlFlowKind::Return || analyzeForFrame(at(k), body[k], true) != Analysis::Understood;
+                if (!hazard && body[k].Info.HasBranchTarget && !branchStaysInBody(k)) {
+                    const auto target = static_cast<std::int64_t>(body[k].Offset + body[k].Length) + body[k].Info.BranchDisp;
+                    hazard = target >= static_cast<std::int64_t>(start) && target < static_cast<std::int64_t>(limit);
+                }
+                if (!hazard) continue;
+                redZone = true;
+                reason = "frame-pointer leaf with an instruction the framer does not prove safe";
+                break;
             }
         }
         if (!leaf || !redZone) continue;
@@ -828,10 +997,12 @@ std::vector<TrampolineSite> FrameRedZoneFunctions(
     const std::vector<TrampolineSite>& existing,
     RedZoneFrameReport& report,
     std::vector<RedZoneDisplacement>& displacements,
-    const bool shrinkWrapped
+    const bool shrinkWrapped,
+    const bool countFramePointerAllocation,
+    const bool suspectFramePointerLeaves
 ) {
     std::vector<TrampolineSite> sites;
-    for (const auto& ph : codeSegments) frameSegment(fileBytes, ph, functions, existing, sites, displacements, report, shrinkWrapped);
+    for (const auto& ph : codeSegments) frameSegment(fileBytes, ph, functions, existing, sites, displacements, report, shrinkWrapped, countFramePointerAllocation, suspectFramePointerLeaves);
     return sites;
 }
 

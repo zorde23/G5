@@ -914,6 +914,204 @@ void listsEachRedZoneLeafWithWhyItWasNotFramed() {
     require(report.Leaves[1].Begin == input.functions[1].Begin && report.Leaves[1].End == input.functions[1].End && report.Leaves[1].Reason == "push or pop in a leaf without pushes", "the skipped leaf was not listed by its bounds with its reason");
 }
 
+const std::vector<std::uint8_t> AllocatingPrologue{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x53, 0x48, 0x83, 0xec, 0x18};
+const std::vector<std::uint8_t> FreeingExit{0x48, 0x83, 0xc4, 0x18, 0x5b, 0x41, 0x5f, 0x5d, 0xc3};
+const std::vector<std::uint8_t> RestoringExit{0x48, 0x8d, 0x65, 0xf0, 0x5b, 0x41, 0x5f, 0x5d, 0xc3};
+
+std::vector<std::uint8_t> allocatingLeaf(const std::vector<std::uint8_t>& body, const std::vector<std::uint8_t>& exit) {
+    std::vector<std::uint8_t> bytes = AllocatingPrologue;
+    append(bytes, body);
+    append(bytes, exit);
+    return bytes;
+}
+
+Codegen::RedZoneFrameReport allocationReport(const std::vector<std::uint8_t>& function, const bool count) {
+    const auto input = image({function});
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements, false, count);
+    return report;
+}
+
+void countsAFramePointerLeafsAllocationOnlyWhenAsked() {
+    const std::vector<std::uint8_t> insideAllocation{0x48, 0x89, 0x7d, 0xe0, 0x8b, 0x45, 0xdc};
+    for (const auto& exit : {FreeingExit, RestoringExit}) {
+        const auto leaf = allocatingLeaf(insideAllocation, exit);
+        const auto counted = allocationReport(leaf, true);
+        require(counted.RedZoneFunctions == 0 && counted.Leaves.empty(), "a frame-pointer leaf whose slots sit inside its allocation stayed a red-zone leaf");
+        const auto uncounted = allocationReport(leaf, false);
+        require(uncounted.RedZoneFunctions == 1 && uncounted.Leaves.size() == 1 && uncounted.Leaves[0].Reason == "other use of rsp", "without --frame-pointer-allocation a frame-pointer leaf that allocates is no longer listed as before");
+    }
+    const auto below = allocationReport(allocatingLeaf({0x48, 0x89, 0x7d, 0xd0}, FreeingExit), true);
+    require(below.RedZoneFunctions == 1 && below.Leaves.size() == 1, "a slot below the allocation left the table");
+    std::vector<std::uint8_t> moving = insideAllocation;
+    append(moving, {0x48, 0x83, 0xec, 0x08});
+    const auto moved = allocationReport(allocatingLeaf(moving, FreeingExit), true);
+    require(moved.RedZoneFunctions == 1 && moved.Leaves.size() == 1, "a leaf that writes rsp again after its allocation left the table");
+    const auto keeps = [&](const std::vector<std::uint8_t>& extra, const char* what) {
+        std::vector<std::uint8_t> body = insideAllocation;
+        append(body, extra);
+        const auto report = allocationReport(allocatingLeaf(body, FreeingExit), true);
+        require(report.RedZoneFunctions == 1 && report.Leaves.size() == 1, what);
+    };
+    keeps({0x48, 0x8b, 0x44, 0x24, 0x08}, "a leaf with an rsp operand left the table");
+    keeps({0x48, 0x8d, 0x45, 0xe0}, "a leaf that takes the address of a slot inside its allocation left the table");
+    keeps({0x51, 0x59}, "a leaf that pushes and pops in its body left the table");
+    keeps({0x48, 0x83, 0xed, 0x40, 0x48, 0x89, 0x45, 0xf8}, "a leaf that moves rbp and then stores through it left the table");
+    keeps({0x48, 0x89, 0xe8}, "a leaf that copies rbp to another register left the table");
+    keeps({0x48, 0x89, 0x04, 0x29}, "a leaf that uses rbp as a SIB index left the table");
+    keeps({0x48, 0x89, 0x44, 0x29, 0xf0}, "a leaf that uses rbp as a SIB index with a displacement left the table");
+    keeps({0xc9}, "a leaf with leave in its body left the table");
+    keeps({0xc8, 0x10, 0x00, 0x00}, "a leaf with enter in its body left the table");
+    keeps({0x48, 0x94}, "a leaf that exchanges rsp left the table");
+    keeps({0x67, 0x48, 0x89, 0x45, 0xe0}, "a leaf with a 32-bit address in its body left the table");
+    keeps({0x48, 0x0f, 0xa3, 0x45, 0xe0}, "a leaf with a bit test on a slot left the table");
+    keeps({0x74, 0x04}, "a leaf with a branch into its exit after the free left the table");
+    keeps({0x48, 0x89, 0x04, 0x2d, 0xf0, 0xff, 0xff, 0xff}, "a leaf that uses rbp as a SIB index without a base left the table");
+    keeps({0x48, 0xbc, 0, 0, 0, 0, 0, 0, 0, 0}, "a leaf that moves an immediate into rsp left the table");
+    keeps({0x74, 0x05, 0x5b, 0x41, 0x5f, 0x5d, 0xc3}, "a leaf with an exit that does not free the allocation left the table");
+    const auto limit = allocationReport(allocatingLeaf({0x48, 0x89, 0x7d, 0xd8}, FreeingExit), true);
+    require(limit.RedZoneFunctions == 0 && limit.Leaves.empty(), "a slot at the lowest byte of the allocation kept the leaf in the table");
+    const auto pastLimit = allocationReport(allocatingLeaf({0x48, 0x89, 0x7d, 0xd7}, FreeingExit), true);
+    require(pastLimit.RedZoneFunctions == 1 && pastLimit.Leaves.size() == 1, "a slot one byte below the allocation left the table");
+    std::vector<std::uint8_t> twoExits = insideAllocation;
+    append(twoExits, {0x74, 0x09});
+    append(twoExits, FreeingExit);
+    const auto both = allocationReport(allocatingLeaf(twoExits, FreeingExit), true);
+    require(both.RedZoneFunctions == 0 && both.Leaves.empty(), "a leaf whose two exits both free the allocation stayed in the table");
+    std::vector<std::uint8_t> wide{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x53, 0x48, 0x81, 0xec, 0x18, 0x00, 0x00, 0x00};
+    append(wide, insideAllocation);
+    append(wide, {0x48, 0x81, 0xc4, 0x18, 0x00, 0x00, 0x00, 0x5b, 0x41, 0x5f, 0x5d, 0xc3});
+    const auto wideReport = allocationReport(wide, true);
+    require(wideReport.RedZoneFunctions == 0 && wideReport.Leaves.empty(), "a leaf with a 32-bit allocation stayed in the table");
+    keeps({0x74, 0xec}, "a leaf with a branch into its prologue left the table");
+    keeps({0x74, 0xf8}, "a leaf with a branch into the middle of an instruction left the table");
+    keeps({0x74, 0x10}, "a leaf with a branch past its end left the table");
+    keeps({0x66, 0x74, 0x00}, "a leaf with a 16-bit conditional branch left the table");
+    keeps({0x66, 0xeb, 0x00}, "a leaf with a 16-bit short jump left the table");
+    keeps({0x66, 0xe9, 0x00, 0x00}, "a leaf with a 16-bit near jump left the table");
+    const auto removed = [&](const std::vector<std::uint8_t>& extra, const char* what) {
+        std::vector<std::uint8_t> body = insideAllocation;
+        append(body, extra);
+        const auto report = allocationReport(allocatingLeaf(body, FreeingExit), true);
+        require(report.RedZoneFunctions == 0 && report.Leaves.empty(), what);
+    };
+    removed({0x0f, 0x28, 0x6d, 0xe0, 0x0f, 0x28, 0xec}, "a leaf whose only frame-register-numbered operands are xmm registers stayed in the table");
+    removed({0x4c, 0x89, 0x65, 0xe0, 0x4d, 0x89, 0xec}, "a leaf that uses r12 and r13 stayed in the table");
+    removed({0xeb, 0x02, 0xcd, 0x41, 0x8b, 0x45, 0xdc}, "a leaf with an int 0x41 skipped by a jump stayed in the table");
+    keeps({0xeb, 0x02, 0xcd, 0x41, 0x48, 0x89, 0x7d, 0xd0}, "a leaf with a store below its allocation after an int 0x41 left the table");
+    keeps({0xeb, 0x01, 0xcc, 0x8b, 0x45, 0xdc}, "a leaf with code after an int3 inside its body left the table");
+    keeps({0xeb, 0x02, 0xcd, 0x2d, 0x8b, 0x45, 0xdc}, "a leaf with an int 0x2d, which resumes past its own bytes, left the table");
+    {
+        auto tail = allocatingLeaf(insideAllocation, FreeingExit);
+        append(tail, {0xcc, 0x90});
+        const auto report = allocationReport(tail, true);
+        require(report.RedZoneFunctions == 1 && report.Leaves.size() == 1, "a leaf with code after its int3 padding left the table");
+    }
+    {
+        std::vector<std::uint8_t> body = insideAllocation;
+        append(body, {0xeb, 0x02, 0xcd, 0x41});
+        const auto uncounted = allocationReport(allocatingLeaf(body, FreeingExit), false);
+        require(uncounted.RedZoneFunctions == 1 && uncounted.Leaves.size() == 1 && uncounted.Leaves[0].Reason == "other use of rsp", "without --frame-pointer-allocation an int 0x41 changed how the leaf is listed");
+    }
+    std::vector<std::uint8_t> pastInt3 = insideAllocation;
+    append(pastInt3, {0x74, 0x0a});
+    std::vector<std::uint8_t> exitThenInt3 = FreeingExit;
+    append(exitThenInt3, {0xcc, 0xc3});
+    const auto afterInt3 = allocationReport(allocatingLeaf(pastInt3, exitThenInt3), true);
+    require(afterInt3.RedZoneFunctions == 1 && afterInt3.Leaves.size() == 1, "a leaf with a branch past an int3 inside its FDE left the table");
+    std::vector<std::uint8_t> fallThrough = AllocatingPrologue;
+    append(fallThrough, insideAllocation);
+    append(fallThrough, {0x74, 0x09});
+    append(fallThrough, FreeingExit);
+    fallThrough.push_back(0x90);
+    const auto fell = allocationReport(fallThrough, true);
+    require(fell.RedZoneFunctions == 1 && fell.Leaves.size() == 1, "a leaf that falls off its end after a ret left the table");
+    const auto immediate = allocationReport(allocatingLeaf(insideAllocation, {0x48, 0x83, 0xc4, 0x18, 0x5b, 0x41, 0x5f, 0x5d, 0xc2, 0x08, 0x00}), true);
+    require(immediate.RedZoneFunctions == 1 && immediate.Leaves.size() == 1, "a leaf that returns with an immediate left the table");
+    const auto shortRestore = allocationReport(allocatingLeaf(insideAllocation, {0x48, 0x8d, 0x65, 0xe8, 0x5b, 0x41, 0x5f, 0x5d, 0xc3}), true);
+    require(shortRestore.RedZoneFunctions == 1 && shortRestore.Leaves.size() == 1, "a leaf whose exit restores rsp from rbp at the wrong offset left the table");
+    removed({0xc4, 0xe2, 0xb0, 0xf5, 0x52, 0x08}, "a leaf with a BMI2 bzhi on general registers stayed in the table");
+    keeps({0xc4, 0xe2, 0xd0, 0xf5, 0x52, 0x08}, "a leaf with a bzhi whose index register is rbp left the table");
+    removed({0xc4, 0x62, 0xb0, 0xf5, 0x62, 0x08}, "a bzhi into r12 kept the leaf in the table");
+    removed({0xc4, 0xe2, 0x90, 0xf5, 0x52, 0x08}, "a bzhi indexed by r13 kept the leaf in the table");
+    removed({0xc4, 0xc2, 0xb0, 0xf5, 0xd4}, "a bzhi from r12 kept the leaf in the table");
+    removed({0xc4, 0xa2, 0xb0, 0xf5, 0x14, 0x20}, "a bzhi over an r12 SIB index kept the leaf in the table");
+    keeps({0xc4, 0xe2, 0xb0, 0xf5, 0x62, 0x08}, "a bzhi into rsp left the table");
+    keeps({0xc4, 0xe2, 0xb0, 0xf5, 0xd5}, "a bzhi from rbp left the table");
+    keeps({0xc4, 0xe2, 0xb0, 0xf5, 0x14, 0x28}, "a bzhi over an rbp SIB index left the table");
+    std::vector<std::uint8_t> noReturn = AllocatingPrologue;
+    append(noReturn, insideAllocation);
+    append(noReturn, {0xeb, 0xfe});
+    const auto tail = allocationReport(noReturn, true);
+    require(tail.RedZoneFunctions == 1 && tail.Leaves.size() == 1, "a leaf without a ret left the table");
+    const auto indexed = allocationReport(allocatingLeaf({0x48, 0x89, 0x7c, 0xcd, 0xe0}, FreeingExit), true);
+    require(indexed.RedZoneFunctions == 1 && indexed.Leaves.size() == 1, "an indexed slot inside the allocation, which can reach below it, left the table");
+}
+
+Codegen::RedZoneFrameReport suspectReport(const std::vector<std::uint8_t>& function, const bool suspect) {
+    const auto input = image({function});
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements, false, false, suspect);
+    return report;
+}
+
+void listsFramePointerLeavesWithUnanalyzedInstructionsWhenAsked() {
+    const auto movedFramePointer = leaf({0x48, 0x83, 0xed, 0x40, 0x48, 0x89, 0x45, 0xf8});
+    const auto quiet = suspectReport(movedFramePointer, false);
+    require(quiet.RedZoneFunctions == 0 && quiet.Leaves.empty(), "without --suspect-frame-pointer-leaves a leaf that moves rbp was listed");
+    const auto suspected = suspectReport(movedFramePointer, true);
+    require(suspected.RedZoneFunctions == 1 && suspected.Framed == 0 && suspected.Leaves.size() == 1 && suspected.Leaves[0].Reason == "frame-pointer leaf with an instruction the framer does not prove safe", "a leaf that moves rbp was not listed as a suspect");
+    const auto indexed = suspectReport(leaf({0x48, 0x89, 0x44, 0x29, 0xf0}), true);
+    require(indexed.RedZoneFunctions == 1 && indexed.Framed == 0, "a leaf that indexes with rbp was not listed as a suspect");
+    const auto early = suspectReport(leaf({0xc9, 0x48, 0x8b, 0x45, 0xf8}), true);
+    require(early.RedZoneFunctions == 1 && early.Framed == 0, "a leaf that reads through rbp after leave was not listed as a suspect");
+    const auto pointer = suspectReport(leaf({0x48, 0x8d, 0x44, 0x24, 0x08}), true);
+    require(pointer.RedZoneFunctions == 1 && pointer.Framed == 0, "a leaf that takes the address of an rsp slot was not listed as a suspect");
+    const auto loop = suspectReport(leaf({0x48, 0x8b, 0x45, 0x08, 0x75, 0xfa}), true);
+    require(loop.RedZoneFunctions == 0 && loop.Leaves.empty(), "a frame-pointer leaf that loops back to its first body instruction was listed as a suspect");
+    const auto intoPrologue = suspectReport(leaf({0x48, 0x8b, 0x45, 0x08, 0x75, 0xf3}), true);
+    require(intoPrologue.RedZoneFunctions == 1 && intoPrologue.Framed == 0, "a frame-pointer leaf that branches into its prologue was not listed as a suspect");
+    const auto suspects = [&](const std::vector<std::uint8_t>& function, const char* what) {
+        const auto report = suspectReport(function, true);
+        require(report.RedZoneFunctions == 1 && report.Framed == 0 && report.Leaves.size() == 1 && report.Leaves[0].Reason == "frame-pointer leaf with an instruction the framer does not prove safe", what);
+    };
+    suspects(leaf({0x48, 0x8b, 0x45, 0x08, 0x75, 0xfb}), "a frame-pointer leaf that branches into the middle of an instruction was not listed as a suspect");
+    std::vector<std::uint8_t> leaveWithPushes = Prologue;
+    append(leaveWithPushes, {0x48, 0x8b, 0x45, 0x08, 0xc9, 0xc3});
+    suspects(leaveWithPushes, "a frame-pointer leaf that leaves without popping its pushes was not listed as a suspect");
+    std::vector<std::uint8_t> wrongRestore = Prologue;
+    append(wrongRestore, {0x48, 0x8b, 0x45, 0x08, 0x48, 0x8d, 0x65, 0xf8});
+    append(wrongRestore, Exit);
+    suspects(wrongRestore, "a frame-pointer leaf that restores rsp from rbp at the wrong offset was not listed as a suspect");
+    std::vector<std::uint8_t> unbalanced = AllocatingPrologue;
+    append(unbalanced, {0x48, 0x8b, 0x45, 0x08, 0x48, 0x83, 0xc4, 0x10, 0x5b, 0x41, 0x5f, 0x5d, 0xc3});
+    suspects(unbalanced, "a frame-pointer leaf that frees less than it allocated was not listed as a suspect");
+    std::vector<std::uint8_t> immediateReturn = Prologue;
+    append(immediateReturn, {0x48, 0x8b, 0x45, 0x08, 0x5b, 0x41, 0x5f, 0x5d, 0xc2, 0x08, 0x00});
+    suspects(immediateReturn, "a frame-pointer leaf that returns with an immediate was not listed as a suspect");
+    std::vector<std::uint8_t> bareReturn = Prologue;
+    append(bareReturn, {0x48, 0x8b, 0x45, 0x08, 0xc3});
+    suspects(bareReturn, "a frame-pointer leaf that returns without popping rbp was not listed as a suspect");
+    std::vector<std::uint8_t> unfreed = AllocatingPrologue;
+    append(unfreed, {0x48, 0x8b, 0x45, 0x08});
+    append(unfreed, Exit);
+    suspects(unfreed, "a frame-pointer leaf that pops without freeing its allocation was not listed as a suspect");
+    suspects(leaf({0x48, 0x8b, 0x45, 0x08, 0x74, 0x01}), "a frame-pointer leaf that branches into the middle of its exit was not listed as a suspect");
+    std::vector<std::uint8_t> freed = AllocatingPrologue;
+    append(freed, {0x48, 0x8b, 0x45, 0x08});
+    append(freed, FreeingExit);
+    const auto allocatedPlain = suspectReport(freed, true);
+    require(allocatedPlain.RedZoneFunctions == 0 && allocatedPlain.Leaves.empty(), "a frame-pointer leaf with an allocation and a matching exit was listed as a suspect");
+    suspects(leaf({0xc5, 0xfc, 0x10, 0x45, 0x10}), "a frame-pointer leaf with an instruction the framer does not decode was not listed as a suspect");
+    const auto plain = suspectReport(leaf(LoadAbovePushes), true);
+    require(plain.RedZoneFunctions == 0 && plain.Leaves.empty(), "a frame-pointer leaf with only analyzed instructions was listed as a suspect");
+    std::vector<std::uint8_t> leaving{0x55, 0x48, 0x89, 0xe5, 0x48, 0x8b, 0x45, 0x10, 0xc9, 0xc3};
+    const auto leaveExit = suspectReport(leaving, true);
+    require(leaveExit.RedZoneFunctions == 0 && leaveExit.Leaves.empty(), "a frame-pointer leaf that ends with leave; ret was listed as a suspect");
+}
+
 int main() {
     try {
         framesRedZoneLeaf();
@@ -959,6 +1157,8 @@ int main() {
         leavesCodeWithoutAFunctionRange();
         listsEachRedZoneLeafWithWhyItWasNotFramed();
         tellsPopsWithoutRexFromXop();
+        countsAFramePointerLeafsAllocationOnlyWhenAsked();
+        listsFramePointerLeavesWithUnanalyzedInstructionsWhenAsked();
         std::cout << "red-zone framer tests passed\n";
         return 0;
     } catch (const std::exception& error) {

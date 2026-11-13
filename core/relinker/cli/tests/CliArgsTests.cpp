@@ -213,6 +213,12 @@ void frameRedZoneRequiresWindows() {
     require(!ok.preciseRedZoneGuard, "--precise-red-zone-guard was on without being asked");
     const auto precise = parse({"--windows", "--frame-red-zone", "--precise-red-zone-guard", "input.elf", "output.elf"});
     require(precise.frameRedZone && precise.preciseRedZoneGuard, "--precise-red-zone-guard with --frame-red-zone was rejected");
+    expectThrows({"--windows", "--frame-pointer-allocation", "input.elf", "output.elf"}, "--frame-pointer-allocation requires --frame-red-zone");
+    const auto counted = parse({"--windows", "--frame-red-zone", "--frame-pointer-allocation", "input.elf", "output.elf"});
+    require(counted.framePointerAllocation && !ok.framePointerAllocation, "--frame-pointer-allocation was not parsed");
+    expectThrows({"--windows", "--suspect-frame-pointer-leaves", "input.elf", "output.elf"}, "--suspect-frame-pointer-leaves requires --frame-red-zone");
+    const auto suspect = parse({"--windows", "--frame-red-zone", "--suspect-frame-pointer-leaves", "input.elf", "output.elf"});
+    require(suspect.suspectFramePointerLeaves && !ok.suspectFramePointerLeaves, "--suspect-frame-pointer-leaves was not parsed");
 }
 
 void missingPositionals() {

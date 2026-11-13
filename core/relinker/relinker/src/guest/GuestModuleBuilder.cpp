@@ -432,7 +432,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
                 image.Bytes[header.Offset + offset + 1] = 0x0B;
             }
         }
-        auto redZoneTable = redZoneTables && windows ? RedZoneGuardTable(image.Bytes, image.Headers, image.Trampolines, nullptr) : std::string{};
+        auto redZoneTable = redZoneTables && windows ? RedZoneGuardTable(image.Bytes, image.Headers, image.Trampolines, nullptr, false, nullptr, countFramePointerAllocation, suspectFramePointerLeaves) : std::string{};
         const auto relativeDirectory = appDirectory(image);
         const auto destination = outputDirectory / relativeDirectory;
         const auto target = destination / image.OutputName;

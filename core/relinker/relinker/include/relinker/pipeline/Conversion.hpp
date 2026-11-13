@@ -18,6 +18,8 @@ struct ConversionOptions {
     bool FrameRedZone = false;
     bool FrameShrinkWrapped = false;
     bool PreciseRedZoneGuard = false;
+    bool FramePointerAllocation = false;
+    bool SuspectFramePointerLeaves = false;
     bool SkipSyscallCheck = false;
     bool TrapSdkSyscallStubs = false;
     bool LazyBinding = false;
