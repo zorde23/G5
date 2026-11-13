@@ -1484,27 +1484,84 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
     recorder->KeepDrawSnapshot(address, copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived);
 }
 
+struct InPlaceInputSample {
+    static constexpr std::size_t parts = 4;
+    bool sampled = false;
+    std::chrono::steady_clock::time_point last;
+    std::array<std::uint64_t, parts> ns{};
+    void Lap(std::size_t part) {
+        if (!sampled) return;
+        const auto now = std::chrono::steady_clock::now();
+        ns[part] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count());
+        last = now;
+    }
+};
+
+enum class InPlaceOutcome : std::size_t { Used, PendingWrite, LabelOrStore, CopiedWriter, NoImport, Count };
+
+void NoteInPlaceInput(const InPlaceInputSample& sample, InPlaceOutcome outcome, std::uint64_t address, std::size_t bytes) {
+    static std::array<std::atomic<std::uint64_t>, InPlaceInputSample::parts> totalNs{};
+    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(InPlaceOutcome::Count)> outcomes{};
+    static std::atomic<std::uint64_t> sampledCalls{0}, repeats{0};
+    static std::atomic<std::int64_t> reportedAt{0};
+    thread_local std::uint64_t seenFrame = 0;
+    thread_local std::vector<std::pair<std::uint64_t, std::size_t>>* seenSlot = nullptr;
+    auto& seen = ShaderRecompiler::ThreadOwned(seenSlot);
+    if (const auto frame = Recorder::Presents(); frame != seenFrame) {
+        seenFrame = frame;
+        seen.clear();
+    }
+    const auto range = std::make_pair(address, bytes);
+    if (std::find(seen.begin(), seen.end(), range) != seen.end()) repeats.fetch_add(1, std::memory_order_relaxed);
+    else if (seen.size() < 4096) seen.push_back(range);
+    for (std::size_t part = 0; part < sample.ns.size(); ++part) totalNs[part].fetch_add(sample.ns[part], std::memory_order_relaxed);
+    outcomes[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+    sampledCalls.fetch_add(1, std::memory_order_relaxed);
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    const auto calls = sampledCalls.exchange(0, std::memory_order_relaxed);
+    if (calls == 0) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto per = [&](std::atomic<std::uint64_t>& value) { return static_cast<double>(value.exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(calls); };
+    const double flushUs = per(totalNs[0]), pendingUs = per(totalNs[1]), lookupUs = per(totalNs[2]), noteUs = per(totalNs[3]);
+    AgcDriver::ProfilePrint_nid_no_patch("[inplace-inputs] 10 s, %llu sampled in-place input checks (1 in 16), us each: flush and pending writes %.2f, labels, stores and copied writers %.2f, import lookup %.2f, pending read note %.2f; used %llu, refused by pending write %llu, label or queued store %llu, copied writer %llu, no import or misaligned %llu; %llu repeated an earlier (address, bytes) of the same frame on the thread\n", static_cast<unsigned long long>(calls), flushUs, pendingUs, lookupUs, noteUs, take(outcomes[0]), take(outcomes[1]), take(outcomes[2]), take(outcomes[3]), take(outcomes[4]), take(repeats));
+}
+
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite) {
     auto* recorder = context.recorder;
     if (recorder == nullptr || bytes == 0 || !context.drawInputsInPlace) return nullptr;
+    InPlaceInputSample sample;
+    if (MemoCStats()) {
+        thread_local std::uint64_t calls = 0;
+        sample.sampled = calls++ % 16 == 0;
+        if (sample.sampled) sample.last = std::chrono::steady_clock::now();
+    }
+    const auto done = [&](InPlaceOutcome outcome, const HostImport* result) {
+        if (sample.sampled) NoteInPlaceInput(sample, outcome, address, bytes);
+        return result;
+    };
     bool behind = false;
     if (behindGpuWrite == nullptr) {
         GuestMemory::FlushGpuWrites(address, bytes);
-        if (recorder->PendingWriteOverlaps(address, bytes)) return nullptr;
+        if (recorder->PendingWriteOverlaps(address, bytes)) return done(InPlaceOutcome::PendingWrite, nullptr);
     } else {
         StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input");
         behind = recorder->PendingWriteOverlaps(address, bytes);
     }
-    if (recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes)) return nullptr;
+    sample.Lap(0);
+    if (recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes)) return done(InPlaceOutcome::LabelOrStore, nullptr);
     const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
-    if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return nullptr;
+    if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return done(InPlaceOutcome::CopiedWriter, nullptr);
     const auto drawWriters = DrawCopiedWriters();
-    if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return nullptr;
+    if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return done(InPlaceOutcome::CopiedWriter, nullptr);
+    sample.Lap(1);
     const auto* import = HostImportFor(context, address, bytes);
-    if (import == nullptr || HostImportOffset(*import, address) % alignment != 0) return nullptr;
+    sample.Lap(2);
+    if (import == nullptr || HostImportOffset(*import, address) % alignment != 0) return done(InPlaceOutcome::NoImport, nullptr);
     recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
+    sample.Lap(3);
     if (behindGpuWrite != nullptr && behind) *behindGpuWrite = true;
-    return import;
+    return done(InPlaceOutcome::Used, import);
 }
 
 InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart) {

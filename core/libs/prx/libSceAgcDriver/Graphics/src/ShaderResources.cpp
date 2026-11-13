@@ -3623,6 +3623,33 @@ void noteEpochProof(bool reused, bool verified, bool failed) {
 }
 }
 
+namespace {
+
+void noteEpochGate(bool hit, bool unproved, bool epochMoved, bool proofMoved, bool pendingMoved) {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!stats) return;
+    static std::array<std::atomic<std::uint64_t>, 6> counts{};
+    static std::atomic<std::int64_t> reportedAt{0};
+    static std::atomic<std::uint64_t> lastBumps{0}, lastProof{0}, lastPending{0};
+    counts[hit ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+    if (!hit) {
+        if (unproved) counts[2].fetch_add(1, std::memory_order_relaxed);
+        if (epochMoved) counts[3].fetch_add(1, std::memory_order_relaxed);
+        if (proofMoved) counts[4].fetch_add(1, std::memory_order_relaxed);
+        if (pendingMoved) counts[5].fetch_add(1, std::memory_order_relaxed);
+    }
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    const auto bumps = GuestMemory::CollectEpochBumps();
+    const auto proof = GuestMemory::ProofSerial();
+    const auto pending = StorageTexture::PendingSerial();
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto advance = [](std::atomic<std::uint64_t>& last, std::uint64_t now) { return static_cast<unsigned long long>(now - last.exchange(now, std::memory_order_relaxed)); };
+    AgcDriver::ProfilePrint_nid_no_patch("[epoch-gate] 10 s: %llu hits, %llu misses (never proved or last failed %llu, collect epoch moved %llu, proof serial moved %llu, pending serial moved %llu); advanced in the period: collect epoch bumps %llu, proof serial %llu, pending serial %llu\n", take(counts[0]), take(counts[1]), take(counts[2]), take(counts[3]), take(counts[4]), take(counts[5]), advance(lastBumps, bumps), advance(lastProof, proof), advance(lastPending, pending));
+}
+
+}
+
 void ShaderResources::PublishDirectRegions() const {
     for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region", PublishScope::Whole, nullptr, false, FlushReader::Gpu);
 }
@@ -3632,7 +3659,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         const auto epoch = GuestMemory::CollectEpoch();
         const auto proof = GuestMemory::ProofSerial();
         const auto pending = StorageTexture::PendingSerial();
-        if (epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending) {
+        const bool gateHit = epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending;
+        noteEpochGate(gateHit, provedEpoch == 0, provedEpoch != 0 && provedEpoch != epoch, provedProof != proof, provedPending != pending);
+        if (gateHit) {
             if (depthCopies) {
                 static const bool traceDepth = std::getenv("APS5_TRACE_DEPTH_COPY") != nullptr;
                 static std::atomic<std::uint64_t> refreshed{0}, checked{0};
