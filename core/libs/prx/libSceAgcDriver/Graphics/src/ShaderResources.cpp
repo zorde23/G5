@@ -3211,10 +3211,10 @@ std::size_t ShaderResources::LookupLogCapacity() {
 }
 
 struct ShaderResources::ProofLaps {
-    static constexpr std::size_t count = 9;
+    static constexpr std::size_t count = 12;
     std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
     std::array<std::uint64_t, count> ns{};
-    std::uint64_t queries = 0, pending = 0;
+    std::uint64_t queries = 0, pending = 0, serialLoops = 0;
 };
 
 namespace {
@@ -3233,7 +3233,7 @@ void countProofQueries(ShaderResources::ProofLaps& laps, std::size_t queries, st
 
 struct ProofLapTotals {
     AgcDriver::Mutex mutex;
-    std::uint64_t proofs = 0, textures = 0, storage = 0, regions = 0, ranges = 0, queries = 0, pending = 0;
+    std::uint64_t proofs = 0, textures = 0, storage = 0, regions = 0, ranges = 0, queries = 0, pending = 0, serialLoops = 0;
     std::array<std::uint64_t, ShaderResources::ProofLaps::count> ns{};
     std::int64_t reportedAt = 0;
 };
@@ -3684,7 +3684,7 @@ ShaderResources::ProofLapsScope::~ProofLapsScope() {
     if (laps == nullptr) return;
     owner.proofLaps = nullptr;
     if (!fastPath || !passed) return;
-    lapProof(laps.get(), 8);
+    lapProof(laps.get(), 11);
     static ProofLapTotals totals;
     std::lock_guard lock(totals.mutex);
     ++totals.proofs;
@@ -3694,11 +3694,12 @@ ShaderResources::ProofLapsScope::~ProofLapsScope() {
     totals.ranges += owner.describedRanges.size();
     totals.queries += laps->queries;
     totals.pending += laps->pending;
+    totals.serialLoops += laps->serialLoops;
     for (std::size_t part = 0; part < laps->ns.size(); ++part) totals.ns[part] += laps->ns[part];
     const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
     if (totals.reportedAt == tenSeconds) return;
     totals.reportedAt = tenSeconds;
-    static constexpr std::array<const char*, ProofLaps::count> names{"prefix", "setup", "textures", "storage images", "pending scan", "unchanged since", "close", "T1 and audit", "imports, staging and depth copies"};
+    static constexpr std::array<const char*, ProofLaps::count> names{"prefix", "setup", "textures", "storage images", "pending scan", "unchanged since", "close", "T1 and audit", "imports pending flush", "import identity (serial loop and DescribeCommitted)", "staging copies", "depth copies and the rest"};
     const auto per = [&](std::uint64_t value) { return static_cast<double>(value) / static_cast<double>(totals.proofs); };
     std::string line = "[fast-proof] 10 s, " + std::to_string(totals.proofs) + " fast proofs (1 in 64 revalidations past the epoch gate, on the proving thread), us each:";
     for (std::size_t part = 0; part < names.size(); ++part) {
@@ -3706,11 +3707,11 @@ ShaderResources::ProofLapsScope::~ProofLapsScope() {
         std::snprintf(text, sizeof(text), " %s %.2f;", names[part], per(totals.ns[part]) / 1000.0);
         line += text;
     }
-    char counts[256];
-    std::snprintf(counts, sizeof(counts), " per proof: textures %.1f, storage images %.1f, direct regions %.1f, described ranges %.1f, unchanged queries %.1f, pending queries %.1f", per(totals.textures), per(totals.storage), per(totals.regions), per(totals.ranges), per(totals.queries), per(totals.pending));
+    char counts[384];
+    std::snprintf(counts, sizeof(counts), " per proof: textures %.1f, storage images %.1f, direct regions %.1f, described ranges %.1f, unchanged queries %.1f, pending queries %.1f, import serial loops %.2f", per(totals.textures), per(totals.storage), per(totals.regions), per(totals.ranges), per(totals.queries), per(totals.pending), per(totals.serialLoops));
     line += counts;
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
-    totals.proofs = totals.textures = totals.storage = totals.regions = totals.ranges = totals.queries = totals.pending = 0;
+    totals.proofs = totals.textures = totals.storage = totals.regions = totals.ranges = totals.queries = totals.pending = totals.serialLoops = 0;
     totals.ns = {};
 }
 
@@ -3748,14 +3749,25 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     // else by the same lookups as the build (which refresh or replace them as guest memory changed):
     // they must hand back the very objects the set's views belong to. The build appended them stage
     // by stage, binding by binding, so the walk repeats that order.
+    struct WalkMiss {
+        int point = 0;
+        std::size_t texture = 0;
+        std::uint64_t address = 0;
+        std::uint32_t width = 0, height = 0, format = 0;
+    } walkMiss;
     const auto fullWalk = [&] {
+        walkMiss = {};
         lastFullWalk = std::chrono::steady_clock::now();
         lookupLog().clear();
         BuildLookups lookups;
         std::size_t textureIndex = 0;
         std::size_t storageIndex = 0;
+        const auto walkMissed = [&](int point, const GuestTextureResource* resource) {
+            walkMiss = {point, textureIndex, resource != nullptr ? resource->baseAddress : 0, resource != nullptr ? resource->width : 0, resource != nullptr ? resource->height : 0, resource != nullptr ? resource->format : 0};
+            return false;
+        };
         for (const auto& shader : shaders) {
-            if (shader.program == nullptr) return false;
+            if (shader.program == nullptr) return walkMissed(6, nullptr);
             for (const auto& binding : shader.program->bindings) {
                 if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages) continue;
                 if (binding.kind == ShaderRecompiler::DescriptorKind::SampledImage) {
@@ -3768,18 +3780,18 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
                         const auto resource = DecodeTextureResource(words);
                         const VkComponentMapping components = ViewComponents(resource);
                         const VkImageViewType multisampleViewType = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
-                        if (textureIndex >= textures.size() || cachedTexture(context, words, resource, components, 0, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element), multisampleViewType) != textures[textureIndex]) return false;
+                        if (textureIndex >= textures.size() || cachedTexture(context, words, resource, components, 0, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element), multisampleViewType) != textures[textureIndex]) return walkMissed(1, &resource);
                         ++textureIndex;
                     }
                 } else if (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage) {
                     for (std::uint32_t element = 0; element < binding.count; ++element) {
                         const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
                         if (IsNullTextureResource(words)) continue;
-                        if (storageIndex >= storageTextures.size()) return false;
+                        if (storageIndex >= storageTextures.size()) return walkMissed(5, nullptr);
                         std::shared_ptr<StorageTexture> expected;
                         if (SameAsPreviousStorageElement(binding, element) && StorageDedupeEnabled()) expected = storageTextures[storageIndex - 1];
                         else expected = cachedStorageTexture(context, words, DecodeTextureResource(words), storageMips[storageIndex], 0, storageWritten[storageIndex]);
-                        if (expected != storageTextures[storageIndex]) return false;
+                        if (expected != storageTextures[storageIndex]) return walkMissed(5, nullptr);
                         ++storageIndex;
                     }
                 }
@@ -3788,7 +3800,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         for (const auto& table : tableStages) {
             if (table.elementTextures.empty()) continue;
             const auto* images = tableImages(shaders, table.stage);
-            if (images == nullptr || images->count != table.elementTextures.size()) return false;
+            if (images == nullptr || images->count != table.elementTextures.size()) return walkMissed(7, nullptr);
             std::vector<std::shared_ptr<Texture>> cached;
             if (auto* reused = FindReusedTable(context.device, *images, CurrentTableState()); reused != nullptr && TableCurrent(*reused) && CachedTableTextures(*reused, cached)) {
                 auto next = cached.begin();
@@ -3805,7 +3817,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
                     same = index == textureIndex && textureIndex < textures.size() && textures[textureIndex] == texture;
                     ++textureIndex;
                 }
-                if (!same) return false;
+                if (!same) return walkMissed(3, nullptr);
                 TextureCounts().tablesReused.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
@@ -3816,11 +3828,11 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
                 const auto words = firstLayerWords(raw, images->imageShapes.at(element), narrowed, false);
                 const auto resource = DecodeTextureResource(words);
                 const VkImageViewType multisampleViewType = images->imageShapes.at(element) == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
-                if (textureIndex >= textures.size() || table.elementTextures[element] != textureIndex || cachedTexture(context, words, resource, ViewComponents(resource), 0, images->imageDepthCompare.at(element), multisampleViewType) != textures[textureIndex]) return false;
+                if (textureIndex >= textures.size() || table.elementTextures[element] != textureIndex || cachedTexture(context, words, resource, ViewComponents(resource), 0, images->imageDepthCompare.at(element), multisampleViewType) != textures[textureIndex]) return walkMissed(2, &resource);
                 ++textureIndex;
             }
         }
-        if (textureIndex != textures.size() || storageIndex != storageTextures.size()) return false;
+        if (textureIndex != textures.size() || storageIndex != storageTextures.size()) return walkMissed(4, nullptr);
         // The walk proved every object current again: the records move to what it proved, or one
         // spurious stamp (a label sharing a 64 KiB block with a surface's edge) would keep this
         // object on the full walk for good.
@@ -3915,7 +3927,12 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         if (fastProofs++ % every == 0) {
             std::size_t movedAt = 0;
             const bool same = walkAgrees(movedAt);
-            if (!same) std::fprintf(stderr, "[verify-fast] the fast proof disagrees with the full walk: %s (%zu textures, %zu storage images)\n", movedAt == SIZE_MAX ? "the walk failed or found another object" : ("element " + std::to_string(movedAt) + "'s content version moved").c_str(), textures.size(), storageTextures.size());
+            if (!same) {
+                static constexpr std::array<const char*, 8> points{"none", "a sampled element's lookup found another object", "an image table element's lookup found another object", "a reused image table holds other objects", "the element counts differ", "a storage element differs", "a stage has no program", "an image table's shape differs"};
+                const auto point = walkMiss.point >= 0 && static_cast<std::size_t>(walkMiss.point) < points.size() ? points[static_cast<std::size_t>(walkMiss.point)] : "?";
+                if (movedAt != SIZE_MAX) std::fprintf(stderr, "[verify-fast] the fast proof disagrees with the full walk: element %zu's content version moved (%zu textures, %zu storage images)\n", movedAt, textures.size(), storageTextures.size());
+                else std::fprintf(stderr, "[verify-fast] the fast proof disagrees with the full walk: %s at texture %zu (address 0x%llx, %ux%u, format %u, source view %d; %zu textures, %zu storage images, %zu image tables)\n", point, walkMiss.texture, static_cast<unsigned long long>(walkMiss.address), walkMiss.width, walkMiss.height, walkMiss.format, walkMiss.texture < validatedTextures.size() && validatedTextures[walkMiss.texture].source != nullptr ? 1 : 0, textures.size(), storageTextures.size(), tableStages.size());
+            }
             NoteFastVerify(!same);
             if (!same && movedAt == SIZE_MAX) return finish(false, false);
         }
@@ -3953,9 +3970,11 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
                 if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region", PublishScope::Whole, nullptr, false, FlushReader::Gpu);
             }
         }
+        lapProof(proofLaps, 8);
         if (HostImportsUnchanged(context, importsProof)) {
             if (profile) Revalidations().importSkips.fetch_add(1, std::memory_order_relaxed);
         } else {
+            if (proofLaps != nullptr) ++proofLaps->serialLoops;
             if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
             importsProof = HostImportsIdentity(context);
         }
@@ -3964,6 +3983,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         for (const auto& [begin, end] : guestMemory.Writes()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
         if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
     }
+    lapProof(proofLaps, 9);
     // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
     // from their imports anew for this use, after the flushes above and before the work is
     // recorded; a failure to record leaves the object unusable for this dispatch, not the batch.
@@ -3975,6 +3995,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             return finish(fast, false);
         }
     }
+    lapProof(proofLaps, 10);
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
     depthCopies = false;
     for (const auto& texture : textures) {
