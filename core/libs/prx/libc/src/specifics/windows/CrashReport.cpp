@@ -370,6 +370,59 @@ std::vector<RedZoneTable>* g_redZoneTables = nullptr;
 std::atomic<std::uint64_t> g_redZoneLogged[1024]{};
 std::atomic<std::uint64_t> g_redZoneFaults{0};
 
+struct FaultSlot {
+    std::atomic<std::uint64_t> key{0};
+    std::atomic<std::uint64_t> count{0};
+};
+
+bool g_redZoneStats = false;
+std::atomic<std::uint64_t> g_resumedFaults{0};
+std::atomic<std::uint64_t> g_outsideFaults{0};
+std::atomic<std::uint64_t> g_untrackedFaults{0};
+std::atomic<std::uint64_t> g_handlerTicks{0};
+FaultSlot g_faultThreads[64];
+FaultSlot g_faultSites[512];
+
+template <std::size_t Size>
+bool countFault(FaultSlot (&slots)[Size], std::uint64_t key) {
+    const auto start = static_cast<std::size_t>((key * 0x9e3779b97f4a7c15ull) >> 40) % Size;
+    for (std::size_t probe = 0; probe < 32; ++probe) {
+        auto& slot = slots[(start + probe) % Size];
+        std::uint64_t expected = 0;
+        if (slot.key.load(std::memory_order_relaxed) == key || slot.key.compare_exchange_strong(expected, key, std::memory_order_relaxed) || expected == key) {
+            slot.count.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+    }
+    return false;
+}
+
+std::int64_t handlerTicks() {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+}
+
+void noteResumedFault(const EXCEPTION_POINTERS* info, std::int64_t entered) {
+    if (!g_redZoneStats) return;
+    g_resumedFaults.fetch_add(1, std::memory_order_relaxed);
+    const bool threadKept = countFault(g_faultThreads, GetCurrentThreadId());
+    const bool siteKept = countFault(g_faultSites, static_cast<std::uint64_t>(info->ContextRecord->Rip));
+    if (!threadKept || !siteKept) g_untrackedFaults.fetch_add(1, std::memory_order_relaxed);
+    g_handlerTicks.fetch_add(static_cast<std::uint64_t>(handlerTicks() - entered), std::memory_order_relaxed);
+}
+
+template <std::size_t Size>
+std::vector<std::pair<std::uint64_t, std::uint64_t>> takeTop(FaultSlot (&slots)[Size], std::size_t keep) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> counted;
+    for (auto& slot : slots) {
+        if (const auto count = slot.count.exchange(0, std::memory_order_relaxed); count != 0) counted.emplace_back(count, slot.key.load(std::memory_order_relaxed));
+    }
+    std::sort(counted.begin(), counted.end(), [](const auto& left, const auto& right) { return left.first > right.first; });
+    if (counted.size() > keep) counted.resize(keep);
+    return counted;
+}
+
 void LoadRedZoneTables(const std::filesystem::path& directory, std::vector<RedZoneTable>& tables) {
     std::error_code error;
     for (const auto& entry : std::filesystem::directory_iterator(directory, error)) {
@@ -402,6 +455,7 @@ void InstallRedZoneGuard() {
         if (armed) Report("[red-zone-guard] WARNING: APS5_ARM_SHARED_IMPORTS arms shared guest pages with the guard turned off by APS5_RED_ZONE_GUARD=0; a fault resumed in an unframed red-zone leaf corrupts its stack silently\n");
         return;
     }
+    g_redZoneStats = guard != nullptr || armed || std::getenv("APS5_PIPELINE_STATS") != nullptr;
     if (guard == nullptr && !armed) return;
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -433,6 +487,7 @@ void GuardRedZone(const EXCEPTION_POINTERS* info) {
         if (next != table.Ranges.begin() && rva < std::prev(next)->End) hit = &*std::prev(next);
         break;
     }
+    if (tabled && hit == nullptr) g_outsideFaults.fetch_add(1, std::memory_order_relaxed);
     if (hit != nullptr && !hit->Uncovered) {
         Report("[red-zone-guard] %s fault at %ls+0x%llx resumed inside a red-zone leaf without a frame [0x%llx, 0x%llx) (%s): its values below RSP were overwritten; terminating\n", access == 1 ? "write" : access == 0 ? "read" : "other", path, static_cast<unsigned long long>(rva), static_cast<unsigned long long>(hit->Begin), static_cast<unsigned long long>(hit->End), hit->Reason);
         TerminateProcess(GetCurrentProcess(), 0xC0000409u);
@@ -446,12 +501,15 @@ void GuardRedZone(const EXCEPTION_POINTERS* info) {
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
     const auto* fault = info->ExceptionRecord;
+    const auto entered = g_redZoneStats && fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ? handlerTicks() : 0;
     if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) {
         GuardRedZone(info);
+        noteResumedFault(info, entered);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 0 && GuestArena::GuestArenaHandleRead_nid_postfix(fault->ExceptionInformation[1])) {
         GuardRedZone(info);
+        noteResumedFault(info, entered);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
@@ -790,5 +848,29 @@ const bool g_crashReportInstalled = [] {
     return true;
 }();
 
+}
+
+extern "C" void LibcReportRedZoneFaults_nid_no_patch() {
+    if (!g_redZoneStats) return;
+    static std::atomic<std::int64_t> reportedAt{0};
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    const auto faults = g_resumedFaults.exchange(0, std::memory_order_relaxed);
+    const auto handlerUs = g_handlerTicks.exchange(0, std::memory_order_relaxed) * 1000000u / static_cast<std::uint64_t>(frequency.QuadPart);
+    std::string line = "[red-zone-faults] 10 s: " + std::to_string(faults) + " resumed guest-memory faults, " + std::to_string(g_outsideFaults.exchange(0, std::memory_order_relaxed)) + " outside every listed range, " + std::to_string(g_untrackedFaults.exchange(0, std::memory_order_relaxed)) + " past the slot tables; handler " + std::to_string(handlerUs) + " us; by thread:";
+    for (const auto& [count, thread] : takeTop(g_faultThreads, 5)) line += " " + std::to_string(thread) + " " + std::to_string(count) + ";";
+    line += " by site:";
+    for (const auto& [count, rip] : takeTop(g_faultSites, 10)) {
+        HMODULE module = nullptr;
+        char path[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(rip), &module) && module != nullptr) GetModuleFileNameA(module, path, MAX_PATH);
+        const char* name = std::strrchr(path, '\\');
+        char site[MAX_PATH + 48];
+        std::snprintf(site, sizeof(site), " %s+0x%llx %llu;", name != nullptr ? name + 1 : path, static_cast<unsigned long long>(rip - reinterpret_cast<std::uint64_t>(module)), static_cast<unsigned long long>(count));
+        line += site;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
 }
 #endif

@@ -4,5 +4,8 @@
 extern "C" void LibcRegisterFailureReport_nid_no_patch(void (*report)() noexcept);
 extern "C" void LibcUnregisterFailureReport_nid_no_patch(void (*report)() noexcept) noexcept;
 extern "C" void LibcRunFailureReports_nid_no_patch() noexcept;
+#ifdef _WIN32
+extern "C" void LibcReportRedZoneFaults_nid_no_patch();
+#endif
 
 #endif
