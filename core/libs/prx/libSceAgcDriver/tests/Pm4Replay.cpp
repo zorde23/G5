@@ -26,6 +26,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -313,6 +314,19 @@ void testOverwrittenAcrossSubmissions(const std::filesystem::path& directory) {
     const auto& wait = waitOn(analysis, &syntheticLabel);
     check(wait.verdict == WaitReport::Verdict::Unknown && !wait.crossQueue && listed(wait, WriterMatch::Effect::Rejected, 1) && listed(wait, WriterMatch::Effect::Overwritten, 0) && wait.reason.find("depends on when it ran") != std::string::npos,
           "a store of 1 in an earlier submission, overwritten by a store of 0, does not leave the wait unknown (the label history holds it only if it ran after the waiting submission entered the driver): " + verdict(wait));
+}
+
+void testRetiredLabelEviction() {
+    struct Store {
+        std::uint64_t stamp = 0;
+    };
+    std::unordered_map<std::uint64_t, std::array<Store, AgcDriver::DriverDetail::LabelStoreHistory>> stores;
+    stores[0x100][0].stamp = 10;
+    stores[0x104][0].stamp = 30;
+    stores[0x108][0].stamp = 5;
+    stores[0x108][1].stamp = 40;
+    check(AgcDriver::DriverDetail::EvictRetiredLabelStores(stores, 20) == 1, "one address has every store at or below the cutoff");
+    check(!stores.contains(0x100) && stores.contains(0x104) && stores.contains(0x108), "an address with any store above the cutoff is kept");
 }
 
 void testLabelHistory(const std::filesystem::path& directory, std::size_t newer) {
@@ -700,6 +714,7 @@ int main() {
         testDriverCapture(directory);
         testWriterPresent(directory, scratch / "writer-present");
         testOverwrittenAcrossSubmissions(scratch / "overwritten");
+        testRetiredLabelEviction();
         testLabelHistory(scratch / "history-kept", AgcDriver::DriverDetail::LabelStoreHistory - 1);
         testLabelHistory(scratch / "history-evicted", AgcDriver::DriverDetail::LabelStoreHistory);
         testUnreleasable(scratch / "unreleasable");

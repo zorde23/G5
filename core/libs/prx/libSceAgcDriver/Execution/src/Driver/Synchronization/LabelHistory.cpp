@@ -17,14 +17,19 @@ void Driver::noteLabelStore(std::uint64_t address, std::span<const std::byte> by
         history[0].queue = queue;
         std::memcpy(&history[0].value, bytes.data() + offset, 4);
     }
+    if (labelStores.size() >= labelStoresSweepAt && stamp > LabelStoreRetireWindow) {
+        const auto cutoff = stamp - LabelStoreRetireWindow;
+        labelStoresEvicted += EvictRetiredLabelStores(labelStores, cutoff);
+        labelStoresEvictedBelow = std::max(labelStoresEvictedBelow, cutoff);
+        labelStoresSweepAt = std::max(LabelStoreSweepAt, labelStores.size() * 2);
+    }
 }
 
 bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t* writer) {
     std::lock_guard lock(labelStoresMutex);
     const auto low = labelStores.find(address);
-    if (low == labelStores.end()) return false;
     const auto high = bytes == 8 ? labelStores.find(address + 4) : labelStores.end();
-    if (bytes == 8 && high == labelStores.end()) return false;
+    if (low == labelStores.end() || (bytes == 8 && high == labelStores.end())) return missedSince(received);
     for (const auto& store : low->second) {
         if (store.stamp <= received) continue;
         std::uint64_t value = store.value;
@@ -38,6 +43,11 @@ bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t ad
             return true;
         }
     }
+    return missedSince(received);
+}
+
+bool Driver::missedSince(std::uint64_t received) {
+    if (received < labelStoresEvictedBelow) ++labelStoresAskedAfterEviction;
     return false;
 }
 

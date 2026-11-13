@@ -4126,6 +4126,16 @@ std::string VulkanDevice::MemoryCachesText() const {
     }
     if (state->descriptorCache != nullptr) text += ", " + state->descriptorCache->MemoryText();
     if (state->bufferPool != nullptr) text += ", " + state->bufferPool->MemoryText();
+    if (const auto& context = state->context; state->contextReady && context.memoryProperties2 != nullptr) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &reported};
+        context.memoryProperties2(context.physical, &properties);
+        text += ", vulkan heaps used/budget MiB";
+        for (std::uint32_t heap = 0; heap < context.memory.memoryHeapCount; ++heap) {
+            const bool local = (context.memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+            text += " " + std::to_string(heap) + (local ? "d " : "h ") + std::to_string(reported.heapUsage[heap] >> 20u) + "/" + std::to_string(reported.heapBudget[heap] >> 20u);
+        }
+    }
     return text;
 }
 

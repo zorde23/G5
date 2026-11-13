@@ -102,6 +102,31 @@ void Driver::reportMemoryCaches() {
         previousFaults = counters.PageFaultCount;
     }
     text += " libc saved direct pages " + std::to_string(GuestArena::GuestArenaSavedCommittedBytes_nid_no_patch() >> 20u) + " MiB committed;";
+    using MiOutput = void (*)(const char*, void*);
+    using MiStatsPrint = void (*)(MiOutput, void*);
+    static const auto miStats = [] {
+        const auto module = GetModuleHandleA("mimalloc.dll");
+        return module != nullptr ? reinterpret_cast<MiStatsPrint>(reinterpret_cast<void*>(GetProcAddress(module, "mi_stats_print_out"))) : nullptr;
+    }();
+    if (miStats != nullptr) {
+        std::string printed;
+        miStats([](const char* message, void* out) { *static_cast<std::string*>(out) += message; }, &printed);
+        text += " mimalloc";
+        for (std::size_t start = 0; start < printed.size();) {
+            auto end = printed.find('\n', start);
+            if (end == std::string::npos) end = printed.size();
+            const auto line = printed.substr(start, end - start);
+            start = end + 1;
+            const auto first = line.find_first_not_of(' ');
+            if (first == std::string::npos || !(line.compare(first, 9, "reserved:") == 0 || line.compare(first, 10, "committed:") == 0 || line.compare(first, 8, "touched:") == 0 || line.compare(first, 7, "purged:") == 0)) continue;
+            std::string squeezed;
+            for (const char c : line.substr(first)) {
+                if (c != ' ' || (!squeezed.empty() && squeezed.back() != ' ')) squeezed += c;
+            }
+            text += " [" + squeezed + "]";
+        }
+        text += ";";
+    }
 #endif
     {
         std::unique_lock lock(drawCacheMutex, std::try_to_lock);
@@ -113,7 +138,12 @@ void Driver::reportMemoryCaches() {
     }
     {
         std::unique_lock lock(labelStoresMutex, std::try_to_lock);
-        text += ", label stores " + (lock.owns_lock() ? std::to_string(labelStores.size()) : std::string("?"));
+        if (lock.owns_lock()) {
+            const auto bytes = labelStores.size() * (sizeof(void*) + sizeof(decltype(labelStores)::value_type)) + labelStores.bucket_count() * sizeof(void*);
+            text += ", label stores " + std::to_string(labelStores.size()) + " (" + std::to_string(bytes >> 20u) + " MiB, " + std::to_string(labelStores.empty() ? 0 : bytes / labelStores.size()) + " B each; evicted " + std::to_string(labelStoresEvicted) + ", asked after eviction " + std::to_string(labelStoresAskedAfterEviction) + ")";
+        } else {
+            text += ", label stores ?";
+        }
     }
     if (const auto current = device.Load()) text += ", " + current->MemoryCachesText();
     text += ", " + Graphics::PipelineStoreMemoryText() + ", " + Graphics::DepthSurfacesMemoryText() + ", " + Graphics::DccSpeculationsMemoryText() + ", " + GuestMemory::WriteTrackerMemoryText() + ", " + Graphics::TextureCachesMemoryText() + ", " + Graphics::HostImportsMemoryText();
