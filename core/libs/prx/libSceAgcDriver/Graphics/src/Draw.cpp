@@ -1337,7 +1337,17 @@ struct TemplateLookupCounts {
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Refusal::Count)> refusals{};
     std::atomic<std::uint64_t> withMoved{0};
     std::atomic<std::int64_t> reportedAt{0};
+    static_assert(static_cast<std::size_t>(ShaderResources::FastFail::Count) == 11 && static_cast<std::size_t>(ShaderResources::FastFail::NoRecord) == 0 && static_cast<std::size_t>(ShaderResources::FastFail::Audit) == 10);
+    static constexpr std::size_t pathCount = 3 + static_cast<std::size_t>(ShaderResources::FastFail::Count) + 1;
+    std::array<std::atomic<std::uint64_t>, pathCount> pathHits{}, pathNs{}, pathFailed{};
 };
+
+std::size_t proofPathBucket(const ShaderResources::ProofReport& proof) {
+    if (proof.gate) return 0;
+    if (proof.path == ShaderResources::ProofPath::Fast) return 1;
+    if (proof.path == ShaderResources::ProofPath::OwnRefreshed) return 2;
+    return 3 + static_cast<std::size_t>(proof.walkReason);
+}
 
 TemplateLookupCounts& templateLookups() {
     static TemplateLookupCounts counts;
@@ -1359,6 +1369,15 @@ void noteTemplateLookup(TemplateLookup outcome, const ShaderResources::ProofRepo
     if (outcome == TemplateLookup::MoveRefused) counts.refusals[static_cast<std::size_t>(refusal)].fetch_add(1, std::memory_order_relaxed);
     if (outcome == TemplateLookup::MoveRefused || outcome == TemplateLookup::Hit) counts.paths[static_cast<std::size_t>(proof.path)].fetch_add(1, std::memory_order_relaxed);
     if (movedBuffers) counts.withMoved.fetch_add(1, std::memory_order_relaxed);
+    if (outcome != TemplateLookup::FindMiss) {
+        const auto bucket = proofPathBucket(proof);
+        if (outcome == TemplateLookup::ProofFailed) {
+            counts.pathFailed[bucket].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            counts.pathHits[bucket].fetch_add(1, std::memory_order_relaxed);
+            counts.pathNs[bucket].fetch_add(ns, std::memory_order_relaxed);
+        }
+    }
     const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
     if (counts.reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
     const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
@@ -1373,6 +1392,18 @@ void noteTemplateLookup(TemplateLookup outcome, const ShaderResources::ProofRepo
         rebuildUs[i] = built[i] != 0 ? static_cast<double>(buildNs) / 1000.0 / static_cast<double>(built[i]) : 0.0;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[template-lookups] 10 s (us per event: proof and move check / rebuild): find misses %llu (%.1f / %.1f), proof failed %llu (%.1f / %.1f; imports %llu, evicted %llu, pending %llu, changed %llu, keys %llu, other %llu), proved then move refused %llu (%.1f / %.1f; bindings differ %llu, not read in place %llu, written or emptied %llu, over the limit %llu, unmapped %llu, pending write %llu), hits %llu (%.1f; %llu with moved buffers); proved by fast %llu, T1 refreshed %llu, full or epoch gate %llu\n", events[0], proofUs[0], rebuildUs[0], events[1], proofUs[1], rebuildUs[1], take(counts.failures[1]), take(counts.failures[2]), take(counts.failures[3]), take(counts.failures[4]), take(counts.failures[5]), take(counts.failures[6]), events[2], proofUs[2], rebuildUs[2], take(counts.refusals[1]), take(counts.refusals[2]), take(counts.refusals[3]), take(counts.refusals[4]), take(counts.refusals[5]), take(counts.refusals[6]), events[3], proofUs[3], take(counts.withMoved), take(counts.paths[0]), take(counts.paths[1]), take(counts.paths[2]));
+    static constexpr std::array<const char*, TemplateLookupCounts::pathCount> pathNames{"epoch gate", "fast", "T1 refreshed", "walk after no record", "walk after collect", "walk after pending", "walk after evicted", "walk after changed", "walk after keys", "walk after cleared view", "walk after storage keys", "walk after depth", "walk after replaced", "walk after audit", "walk without fast"};
+    std::string line = "[proof-paths] 10 s, proved or failed lookups by path (count, us each, failed):";
+    for (std::size_t bucket = 0; bucket < pathNames.size(); ++bucket) {
+        const auto hits = take(counts.pathHits[bucket]);
+        const auto bucketNs = take(counts.pathNs[bucket]);
+        const auto failed = take(counts.pathFailed[bucket]);
+        if (hits == 0 && failed == 0) continue;
+        char text[96];
+        std::snprintf(text, sizeof(text), " %s %llu %.1f %llu;", pathNames[bucket], hits, hits != 0 ? static_cast<double>(bucketNs) / 1000.0 / static_cast<double>(hits) : 0.0, failed);
+        line += text;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
 }
 
 // One line per draw with the phases that took time (APS5_TRACE_DRAWS), and the 10 s totals.

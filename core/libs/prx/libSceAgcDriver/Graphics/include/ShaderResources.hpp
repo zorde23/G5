@@ -299,11 +299,14 @@ public:
     // and fragment stages, or one compute stage): their bindings are walked like the build did.
     // How a Revalidate proved (or refused) the object, for the [recipe] line: the proof path taken
     // and, on a refusal, what failed.
+    enum class FastFail : std::size_t;
     enum class ProofPath : std::size_t { Fast, OwnRefreshed, Full, Count };
     enum class ProofFailure : std::size_t { None, Imports, Evicted, Pending, Changed, Keys, Other, Count };
     struct ProofReport {
         ProofPath path = ProofPath::Fast;
         ProofFailure failure = ProofFailure::None;
+        bool gate = false;
+        FastFail walkReason = FastFail::Count;
     };
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
     static bool EpochProofs();
