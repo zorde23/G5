@@ -1286,6 +1286,29 @@ void reportVertexParts(const DrawTimer& timer) {
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
 }
 
+enum class TemplateLookup : std::size_t { FindMiss, ProofFailed, MoveRefused, Hit, Count };
+
+void noteTemplateLookup(TemplateLookup outcome, const ShaderResources::ProofReport& proof, bool movedBuffers) {
+    if (!MemoCStats()) return;
+    using Failure = ShaderResources::ProofFailure;
+    using Path = ShaderResources::ProofPath;
+    static_assert(static_cast<std::size_t>(Failure::Count) == 7 && static_cast<std::size_t>(Failure::Imports) == 1 && static_cast<std::size_t>(Failure::Other) == 6);
+    static_assert(static_cast<std::size_t>(Path::Count) == 3 && static_cast<std::size_t>(Path::Fast) == 0 && static_cast<std::size_t>(Path::Full) == 2);
+    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TemplateLookup::Count)> outcomes{};
+    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Failure::Count)> failures{};
+    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Path::Count)> paths{};
+    static std::atomic<std::uint64_t> withMoved{0};
+    static std::atomic<std::int64_t> reportedAt{0};
+    outcomes[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+    if (outcome == TemplateLookup::ProofFailed) failures[static_cast<std::size_t>(proof.failure)].fetch_add(1, std::memory_order_relaxed);
+    if (outcome != TemplateLookup::FindMiss && outcome != TemplateLookup::ProofFailed) paths[static_cast<std::size_t>(proof.path)].fetch_add(1, std::memory_order_relaxed);
+    if (movedBuffers) withMoved.fetch_add(1, std::memory_order_relaxed);
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    AgcDriver::ProfilePrint_nid_no_patch("[template-lookups] 10 s: find misses %llu, proof failed %llu (imports %llu, evicted %llu, pending %llu, changed %llu, keys %llu, other %llu), proved then move refused %llu, hits %llu (%llu with moved buffers); proved by fast %llu, T1 refreshed %llu, full or epoch gate %llu\n", take(outcomes[0]), take(outcomes[1]), take(failures[1]), take(failures[2]), take(failures[3]), take(failures[4]), take(failures[5]), take(failures[6]), take(outcomes[2]), take(outcomes[3]), take(withMoved), take(paths[0]), take(paths[1]), take(paths[2]));
+}
+
 // One line per draw with the phases that took time (APS5_TRACE_DRAWS), and the 10 s totals.
 // `waitedBefore` is the thread's GPU waits at the draw's start and `ownWaitedMs` the draw's own
 // syncs (see DrawOutcome::hookWaitUs).
@@ -1956,14 +1979,17 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
             if (partsReportedAt.exchange(tenSeconds, std::memory_order_relaxed) != tenSeconds) AgcDriver::ProfilePrint_nid_no_patch("[lookup-parts] 10 s (sampled draws): key %.1f ms, find %.1f ms, revalidate %.1f ms, moved %.1f ms, sampled hits %llu\n", static_cast<double>(partNs[0].exchange(0)) / 1e6, static_cast<double>(partNs[1].exchange(0)) / 1e6, static_cast<double>(partNs[2].exchange(0)) / 1e6, static_cast<double>(partNs[3].exchange(0)) / 1e6, static_cast<unsigned long long>(partNs[4].exchange(0)));
         }
+        if (!cached) noteTemplateLookup(TemplateLookup::FindMiss, {}, false);
         if (cached) {
             if (parts) partNs[4].fetch_add(1, std::memory_order_relaxed);
-            const bool valid = cached->Revalidate(shaders);
+            ShaderResources::ProofReport proof;
+            const bool valid = cached->Revalidate(shaders, MemoCStats() ? &proof : nullptr);
             lap(2);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color);
             lap(3);
+            if (!valid || recorder != nullptr) noteTemplateLookup(!valid ? TemplateLookup::ProofFailed : moved.has_value() ? TemplateLookup::Hit : TemplateLookup::MoveRefused, proof, moved.has_value() && !moved->empty());
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 resolved.resources = std::move(cached);
