@@ -118,7 +118,10 @@ void Driver::reportMemoryCaches() {
             const auto line = printed.substr(start, end - start);
             start = end + 1;
             const auto first = line.find_first_not_of(' ');
-            if (first == std::string::npos || !(line.compare(first, 9, "reserved:") == 0 || line.compare(first, 10, "committed:") == 0 || line.compare(first, 8, "touched:") == 0 || line.compare(first, 7, "purged:") == 0)) continue;
+            const auto colon = line.find(':');
+            if (first == std::string::npos || colon == std::string::npos || colon <= first) continue;
+            const auto label = line.substr(first, line.find_last_not_of(' ', colon - 1) + 1 - first);
+            if (label != "reserved" && label != "committed" && label != "touched" && label != "purged") continue;
             std::string squeezed;
             for (const char c : line.substr(first)) {
                 if (c != ' ' || (!squeezed.empty() && squeezed.back() != ' ')) squeezed += c;
