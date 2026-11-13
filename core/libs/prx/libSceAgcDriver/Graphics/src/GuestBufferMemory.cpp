@@ -4136,31 +4136,86 @@ std::uint64_t HostImportsSettled() {
     return settledImports.load(std::memory_order_relaxed);
 }
 
+namespace {
+
+struct ImportLookupSample {
+    static constexpr std::size_t parts = 5;
+    bool sampled = false;
+    std::chrono::steady_clock::time_point last;
+    std::array<std::uint64_t, parts> ns{};
+    int outcome = 0;
+    void Lap(std::size_t part) {
+        if (!sampled) return;
+        const auto now = std::chrono::steady_clock::now();
+        ns[part] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count());
+        last = now;
+    }
+    ~ImportLookupSample() {
+        if (!sampled) return;
+        static std::array<std::atomic<std::uint64_t>, parts> totalNs{};
+        static std::array<std::atomic<std::uint64_t>, 4> outcomes{};
+        static std::atomic<std::uint64_t> calls{0};
+        static std::atomic<std::int64_t> reportedAt{0};
+        for (std::size_t part = 0; part < parts; ++part) totalNs[part].fetch_add(ns[part], std::memory_order_relaxed);
+        outcomes[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+        calls.fetch_add(1, std::memory_order_relaxed);
+        const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+        if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+        const auto sampledCalls = calls.exchange(0, std::memory_order_relaxed);
+        if (sampledCalls == 0) return;
+        const auto per = [&](std::atomic<std::uint64_t>& value) { return static_cast<double>(value.exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(sampledCalls); };
+        const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+        const double lockUs = per(totalNs[0]), settleUs = per(totalNs[1]), staleUs = per(totalNs[2]), findUs = per(totalNs[3]), missUs = per(totalNs[4]);
+        AgcDriver::ProfilePrint_nid_no_patch("[import-lookup] 10 s, %llu sampled HostImportFor calls (1 in 64), us each: lock %.2f, settle unwatched %.2f, stale check %.2f, recent or indexed find %.2f, reconcile and import on a miss %.2f; recent hits %llu, indexed hits %llu, misses %llu\n", static_cast<unsigned long long>(sampledCalls), lockUs, settleUs, staleUs, findUs, missUs, take(outcomes[1]), take(outcomes[2]), take(outcomes[3]));
+    }
+};
+
+}
+
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes, ImportRequester requester) {
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
     ensurePinWaiter();
+    ImportLookupSample sample;
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (stats) {
+        thread_local std::uint64_t calls = 0;
+        sample.sampled = calls++ % 64 == 0;
+        if (sample.sampled) sample.last = std::chrono::steady_clock::now();
+    }
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
+    sample.Lap(0);
 #ifdef _WIN32
     settleUnwatchedImports(context, state);
 #endif
+    sample.Lap(1);
     // A hit is only valid while the registry has not changed since the imports were reconciled.
-    if (!importsStale(context, state)) {
+    const bool stale = importsStale(context, state);
+    sample.Lap(2);
+    if (!stale) {
         if (recentImportsEnabled()) {
             if (const auto* entry = recentImport(state, address, address + bytes)) {
                 entry->lastUse = ++state.useCounter;
+                sample.Lap(3);
+                sample.outcome = 1;
                 return entry;
             }
         }
         if (const auto* entry = findImport(state, address, address + bytes)) {
             entry->lastUse = ++state.useCounter;
             if (recentImportsEnabled()) rememberImport(state, entry);
+            sample.Lap(3);
+            sample.outcome = 2;
             return entry;
         }
     }
+    sample.Lap(3);
+    sample.outcome = 3;
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
-    return importAccess(context, state, address, address + bytes, lease, requester);
+    const auto* imported = importAccess(context, state, address, address + bytes, lease, requester);
+    sample.Lap(4);
+    return imported;
 }
 
 const HostImport* ExistingHostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
