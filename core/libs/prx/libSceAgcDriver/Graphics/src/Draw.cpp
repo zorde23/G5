@@ -1170,6 +1170,8 @@ struct DrawTimer {
         recordLap = now;
     }
     std::array<double, 8> vertexUs{};
+    std::uint32_t indexKind = 0;
+    std::uint64_t indexCount = 0;
     std::chrono::steady_clock::time_point vertexLap;
     void vertexPart(std::size_t part) {
         if (!profile) return;
@@ -1269,9 +1271,13 @@ void reportRecordParts(const DrawTimer& timer) {
 void reportVertexParts(const DrawTimer& timer) {
     static constexpr std::array<const char*, 8> names{"indices", "input layout", "attribute decode", "copy plan", "in-place ranges", "copied ranges", "zero-padded copies", "handles"};
     static std::array<std::atomic<std::uint64_t>, 8> totalNs{};
-    static std::atomic<std::uint64_t> draws{0};
+    static std::array<std::atomic<std::uint64_t>, 4> indexKinds{}, indexNs{};
+    static std::atomic<std::uint64_t> draws{0}, indices{0};
     static std::atomic<std::int64_t> reportedAt{0};
     for (std::size_t part = 0; part < names.size(); ++part) totalNs[part].fetch_add(static_cast<std::uint64_t>(timer.vertexUs[part] * 1000.0), std::memory_order_relaxed);
+    indexKinds[timer.indexKind].fetch_add(1, std::memory_order_relaxed);
+    indexNs[timer.indexKind].fetch_add(static_cast<std::uint64_t>(timer.vertexUs[0] * 1000.0), std::memory_order_relaxed);
+    if (timer.indexKind != 0) indices.fetch_add(timer.indexCount, std::memory_order_relaxed);
     draws.fetch_add(1, std::memory_order_relaxed);
     const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
     if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
@@ -1283,30 +1289,72 @@ void reportVertexParts(const DrawTimer& timer) {
         std::snprintf(text, sizeof(text), " %s %.2f;", names[part], static_cast<double>(totalNs[part].exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(sampled));
         line += text;
     }
+    static constexpr std::array<const char*, 4> kinds{"not indexed or expanded", "indices in place", "indices copied", "indices copy reused"};
+    const auto indexed = sampled - std::min(sampled, indexKinds[0].load(std::memory_order_relaxed));
+    const auto indexTotal = indices.exchange(0, std::memory_order_relaxed);
+    line += " indexed draws " + std::to_string(indexed) + " with " + std::to_string(indexed != 0 ? indexTotal / indexed : 0) + " indices each;";
+    for (std::size_t kind = 0; kind < kinds.size(); ++kind) {
+        const auto count = indexKinds[kind].exchange(0, std::memory_order_relaxed);
+        const auto ns = indexNs[kind].exchange(0, std::memory_order_relaxed);
+        char text[96];
+        std::snprintf(text, sizeof(text), " %s %llu (indices %.2f us);", kinds[kind], static_cast<unsigned long long>(count), count != 0 ? static_cast<double>(ns) / 1000.0 / static_cast<double>(count) : 0.0);
+        line += text;
+    }
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
 }
 
 enum class TemplateLookup : std::size_t { FindMiss, ProofFailed, MoveRefused, Hit, Count };
 
-void noteTemplateLookup(TemplateLookup outcome, const ShaderResources::ProofReport& proof, bool movedBuffers) {
-    if (!MemoCStats()) return;
+struct TemplateLookupCounts {
     using Failure = ShaderResources::ProofFailure;
     using Path = ShaderResources::ProofPath;
+    using Refusal = ShaderResources::MoveRefusal;
     static_assert(static_cast<std::size_t>(Failure::Count) == 7 && static_cast<std::size_t>(Failure::Imports) == 1 && static_cast<std::size_t>(Failure::Other) == 6);
     static_assert(static_cast<std::size_t>(Path::Count) == 3 && static_cast<std::size_t>(Path::Fast) == 0 && static_cast<std::size_t>(Path::Full) == 2);
-    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TemplateLookup::Count)> outcomes{};
-    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Failure::Count)> failures{};
-    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Path::Count)> paths{};
-    static std::atomic<std::uint64_t> withMoved{0};
-    static std::atomic<std::int64_t> reportedAt{0};
-    outcomes[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
-    if (outcome == TemplateLookup::ProofFailed) failures[static_cast<std::size_t>(proof.failure)].fetch_add(1, std::memory_order_relaxed);
-    if (outcome != TemplateLookup::FindMiss && outcome != TemplateLookup::ProofFailed) paths[static_cast<std::size_t>(proof.path)].fetch_add(1, std::memory_order_relaxed);
-    if (movedBuffers) withMoved.fetch_add(1, std::memory_order_relaxed);
+    static_assert(static_cast<std::size_t>(Refusal::Count) == 8 && static_cast<std::size_t>(Refusal::Shape) == 1 && static_cast<std::size_t>(Refusal::Bindings) == 7);
+    static constexpr std::size_t outcomeCount = static_cast<std::size_t>(TemplateLookup::Count);
+    std::array<std::atomic<std::uint64_t>, outcomeCount> outcomes{}, proofNs{}, rebuilds{}, rebuildNs{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Failure::Count)> failures{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Path::Count)> paths{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Refusal::Count)> refusals{};
+    std::atomic<std::uint64_t> withMoved{0};
+    std::atomic<std::int64_t> reportedAt{0};
+};
+
+TemplateLookupCounts& templateLookups() {
+    static TemplateLookupCounts counts;
+    return counts;
+}
+
+void noteTemplateRebuild(TemplateLookup outcome, std::uint64_t ns) {
+    auto& counts = templateLookups();
+    counts.rebuilds[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+    counts.rebuildNs[static_cast<std::size_t>(outcome)].fetch_add(ns, std::memory_order_relaxed);
+}
+
+void noteTemplateLookup(TemplateLookup outcome, const ShaderResources::ProofReport& proof, bool movedBuffers, ShaderResources::MoveRefusal refusal, std::uint64_t ns) {
+    auto& counts = templateLookups();
+    const auto at = static_cast<std::size_t>(outcome);
+    counts.outcomes[at].fetch_add(1, std::memory_order_relaxed);
+    counts.proofNs[at].fetch_add(ns, std::memory_order_relaxed);
+    if (outcome == TemplateLookup::ProofFailed) counts.failures[static_cast<std::size_t>(proof.failure)].fetch_add(1, std::memory_order_relaxed);
+    if (outcome == TemplateLookup::MoveRefused) counts.refusals[static_cast<std::size_t>(refusal)].fetch_add(1, std::memory_order_relaxed);
+    if (outcome == TemplateLookup::MoveRefused || outcome == TemplateLookup::Hit) counts.paths[static_cast<std::size_t>(proof.path)].fetch_add(1, std::memory_order_relaxed);
+    if (movedBuffers) counts.withMoved.fetch_add(1, std::memory_order_relaxed);
     const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
-    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    if (counts.reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
     const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
-    AgcDriver::ProfilePrint_nid_no_patch("[template-lookups] 10 s: find misses %llu, proof failed %llu (imports %llu, evicted %llu, pending %llu, changed %llu, keys %llu, other %llu), proved then move refused %llu, hits %llu (%llu with moved buffers); proved by fast %llu, T1 refreshed %llu, full or epoch gate %llu\n", take(outcomes[0]), take(outcomes[1]), take(failures[1]), take(failures[2]), take(failures[3]), take(failures[4]), take(failures[5]), take(failures[6]), take(outcomes[2]), take(outcomes[3]), take(withMoved), take(paths[0]), take(paths[1]), take(paths[2]));
+    std::array<double, TemplateLookupCounts::outcomeCount> proofUs{}, rebuildUs{};
+    std::array<unsigned long long, TemplateLookupCounts::outcomeCount> events{}, built{};
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        events[i] = take(counts.outcomes[i]);
+        built[i] = take(counts.rebuilds[i]);
+        const auto lookupNs = take(counts.proofNs[i]);
+        const auto buildNs = take(counts.rebuildNs[i]);
+        proofUs[i] = events[i] != 0 ? static_cast<double>(lookupNs) / 1000.0 / static_cast<double>(events[i]) : 0.0;
+        rebuildUs[i] = built[i] != 0 ? static_cast<double>(buildNs) / 1000.0 / static_cast<double>(built[i]) : 0.0;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[template-lookups] 10 s (us per event: proof and move check / rebuild): find misses %llu (%.1f / %.1f), proof failed %llu (%.1f / %.1f; imports %llu, evicted %llu, pending %llu, changed %llu, keys %llu, other %llu), proved then move refused %llu (%.1f / %.1f; bindings differ %llu, not read in place %llu, written or emptied %llu, over the limit %llu, unmapped %llu, pending write %llu), hits %llu (%.1f; %llu with moved buffers); proved by fast %llu, T1 refreshed %llu, full or epoch gate %llu\n", events[0], proofUs[0], rebuildUs[0], events[1], proofUs[1], rebuildUs[1], take(counts.failures[1]), take(counts.failures[2]), take(counts.failures[3]), take(counts.failures[4]), take(counts.failures[5]), take(counts.failures[6]), events[2], proofUs[2], rebuildUs[2], take(counts.refusals[1]), take(counts.refusals[2]), take(counts.refusals[3]), take(counts.refusals[4]), take(counts.refusals[5]), take(counts.refusals[6]), events[3], proofUs[3], take(counts.withMoved), take(counts.paths[0]), take(counts.paths[1]), take(counts.paths[2]));
 }
 
 // One line per draw with the phases that took time (APS5_TRACE_DRAWS), and the 10 s totals.
@@ -1664,6 +1712,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         DrawInputCopy copy;
         if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
         else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
+        timer.indexKind = import != nullptr ? 1u : copy.reused ? 3u : 2u;
+        timer.indexCount = draw.indexCount;
         std::optional<std::uint32_t> highest;
         if (import != nullptr) {
             highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
@@ -1955,6 +2005,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     // the alias checks instead. Debug aid: APS5_NO_DRAW_KEY_TRIM=1 keys them as before.
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+    auto lookupOutcome = TemplateLookup::FindMiss;
     if (resolved.cacheable) {
         static std::array<std::atomic<std::uint64_t>, 5> partNs{};
         static std::atomic<std::int64_t> partsReportedAt{0};
@@ -1979,17 +2030,21 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
             if (partsReportedAt.exchange(tenSeconds, std::memory_order_relaxed) != tenSeconds) AgcDriver::ProfilePrint_nid_no_patch("[lookup-parts] 10 s (sampled draws): key %.1f ms, find %.1f ms, revalidate %.1f ms, moved %.1f ms, sampled hits %llu\n", static_cast<double>(partNs[0].exchange(0)) / 1e6, static_cast<double>(partNs[1].exchange(0)) / 1e6, static_cast<double>(partNs[2].exchange(0)) / 1e6, static_cast<double>(partNs[3].exchange(0)) / 1e6, static_cast<unsigned long long>(partNs[4].exchange(0)));
         }
-        if (!cached) noteTemplateLookup(TemplateLookup::FindMiss, {}, false);
+        const bool lookupStats = MemoCStats();
+        const auto lookupStart = lookupStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (!cached && lookupStats) noteTemplateLookup(TemplateLookup::FindMiss, {}, false, ShaderResources::MoveRefusal::None, 0);
         if (cached) {
             if (parts) partNs[4].fetch_add(1, std::memory_order_relaxed);
             ShaderResources::ProofReport proof;
-            const bool valid = cached->Revalidate(shaders, MemoCStats() ? &proof : nullptr);
+            const bool valid = cached->Revalidate(shaders, lookupStats ? &proof : nullptr);
             lap(2);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
-            if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color);
+            auto refusal = ShaderResources::MoveRefusal::None;
+            if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &refusal);
             lap(3);
-            if (!valid || recorder != nullptr) noteTemplateLookup(!valid ? TemplateLookup::ProofFailed : moved.has_value() ? TemplateLookup::Hit : TemplateLookup::MoveRefused, proof, moved.has_value() && !moved->empty());
+            lookupOutcome = !valid ? TemplateLookup::ProofFailed : recorder == nullptr ? TemplateLookup::Count : moved.has_value() ? TemplateLookup::Hit : TemplateLookup::MoveRefused;
+            if (lookupStats && lookupOutcome != TemplateLookup::Count) noteTemplateLookup(lookupOutcome, proof, moved.has_value() && !moved->empty(), refusal, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - lookupStart).count()));
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 resolved.resources = std::move(cached);
@@ -2008,11 +2063,14 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     }
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
+        const bool rebuildStats = resolved.cacheable && MemoCStats();
+        const auto rebuildStart = rebuildStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
         outcome.kind = outcome.addressBased ? KindBda : KindBuild;
         if (resolved.cacheable) countCache(&DrawProfile::cacheMisses);
+        if (rebuildStats && lookupOutcome != TemplateLookup::Count) noteTemplateRebuild(lookupOutcome, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - rebuildStart).count()));
     }
     timer.phase(PhaseResources);
     APS5_LOG_CHARS_OUT_DEBUG("ShaderResources created");
