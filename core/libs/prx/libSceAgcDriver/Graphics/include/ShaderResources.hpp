@@ -317,6 +317,7 @@ public:
         bool fastPath = false;
         bool passed = false;
     };
+    std::uint64_t ApproxBytes() const;
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
     static bool EpochProofs();
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
@@ -740,6 +741,7 @@ public:
     std::size_t Size() const;
     std::size_t Capacity() const;
     std::optional<std::size_t> TrySize() const;
+    std::optional<std::pair<std::size_t, std::uint64_t>> TryFootprint() const;
     void SetBase(std::size_t entries, std::size_t shrinkWindow);
     std::uint64_t TableElements() const;
     static std::uint64_t TableElementBudget();

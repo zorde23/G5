@@ -404,15 +404,22 @@ void destroyImport(const Context& context, const HostImport& entry) {
 
 using ImportNode = std::map<std::uint64_t, HostImport>::node_type;
 
+std::atomic<std::uint64_t> retiredHeld{0}, retiredHeldBytes{0};
+
 // Frees a dropped import's Vulkan objects when it is released. Never copied: a copy would destroy the
 // same handles twice (and a temporary would destroy them at once).
 struct RetiredImport {
     RetiredImport(VkDevice device, PFN_vkDestroyBuffer destroyBuffer, PFN_vkFreeMemory freeMemory, ImportNode node)
-        : device(device), destroyBuffer(destroyBuffer), freeMemory(freeMemory), node(std::move(node)) {}
+        : device(device), destroyBuffer(destroyBuffer), freeMemory(freeMemory), node(std::move(node)) {
+        retiredHeld.fetch_add(1, std::memory_order_relaxed);
+        retiredHeldBytes.fetch_add(this->node.mapped().bytes, std::memory_order_relaxed);
+    }
     RetiredImport(const RetiredImport&) = delete;
     RetiredImport& operator=(const RetiredImport&) = delete;
     ~RetiredImport() {
         const auto& entry = node.mapped();
+        retiredHeld.fetch_sub(1, std::memory_order_relaxed);
+        retiredHeldBytes.fetch_sub(entry.bytes, std::memory_order_relaxed);
         destroyBuffer(device, entry.buffer, nullptr);
         freeMemory(device, entry.memory, nullptr);
 #ifdef _WIN32
@@ -4093,7 +4100,7 @@ std::string HostImportsMemoryText() {
     auto& state = Imports();
     std::unique_lock lock(state.mutex, std::try_to_lock);
     if (!lock.owns_lock()) return "host imports ?";
-    return "host imports " + std::to_string(state.imports.size()) + " (" + std::to_string(state.liveBytes >> 20u) + " MiB live)";
+    return "host imports " + std::to_string(state.imports.size()) + " (" + std::to_string(state.liveBytes >> 20u) + " MiB live; retired but still held " + std::to_string(retiredHeld.load(std::memory_order_relaxed)) + ", " + std::to_string(retiredHeldBytes.load(std::memory_order_relaxed) >> 20u) + " MiB)";
 }
 
 std::string FormatHostImportCounts(const HostImportCounts& counts) {

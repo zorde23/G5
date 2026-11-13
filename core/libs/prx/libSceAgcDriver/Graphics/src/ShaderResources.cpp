@@ -1401,8 +1401,8 @@ std::string TextureCachesMemoryText() {
         std::unique_lock lock(storage.mutex, std::try_to_lock);
         text += ", storage textures " + (lock.owns_lock() ? std::to_string(storage.entries.size()) : std::string("?")) + " (" + std::to_string(storageCacheBytes() >> 20u) + " MiB GPU, " + std::to_string(StorageTexture::SnapshotHostBytes() >> 20u) + " MiB host originals and baselines of all storage textures)";
     }
-    const auto resources = SharedResourceCache().TrySize();
-    text += ", shared resource templates " + (resources ? std::to_string(*resources) : std::string("?"));
+    const auto resources = SharedResourceCache().TryFootprint();
+    text += ", shared resource templates " + (resources ? std::to_string(resources->first) + " (~" + std::to_string(resources->second >> 20u) + " MiB of keys and template vectors)" : std::string("?"));
     return text;
 }
 
@@ -4504,6 +4504,19 @@ void ResourceCache::SetBase(std::size_t entries, std::size_t window) {
 std::size_t ResourceCache::Size() const {
     std::lock_guard lock(mutex);
     return entries.size();
+}
+
+std::optional<std::pair<std::size_t, std::uint64_t>> ResourceCache::TryFootprint() const {
+    std::unique_lock lock(mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return std::nullopt;
+    std::uint64_t bytes = 0;
+    for (const auto& [key, resources] : entries) bytes += 2 * key.capacity() * sizeof(std::uint32_t) + (resources != nullptr ? resources->ApproxBytes() : 0);
+    return std::make_pair(entries.size(), bytes);
+}
+
+std::uint64_t ShaderResources::ApproxBytes() const {
+    const auto vec = [](const auto& items) { return static_cast<std::uint64_t>(items.capacity() * sizeof(*items.data())); };
+    return sizeof(*this) + vec(layoutKey) + vec(fragmentLayoutKey) + vec(allocations) + vec(descriptorBuffers) + vec(descriptorImages) + vec(descriptorWrites) + vec(writeOnlyRanges) + vec(textures) + vec(storageTextures) + vec(storageMips) + vec(storageKeys) + vec(samplers) + vec(samplerSources) + vec(directRegions) + vec(validatedTextures) + vec(pushPatches) + vec(dataPatches) + vec(bindings) + vec(refreshResourceKey) + vec(deferredImages) + vec(multisampleSources);
 }
 
 std::optional<std::size_t> ResourceCache::TrySize() const {

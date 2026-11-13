@@ -13,6 +13,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include <cstdlib>
 #ifdef _WIN32
@@ -102,6 +104,38 @@ void Driver::reportMemoryCaches() {
         previousFaults = counters.PageFaultCount;
     }
     text += " libc saved direct pages " + std::to_string(GuestArena::GuestArenaSavedCommittedBytes_nid_no_patch() >> 20u) + " MiB committed;";
+    static std::atomic<bool> sweeping{false};
+    static std::atomic<std::uint64_t> sweptGuest{0}, sweptHost{0}, sweptMapped{0}, sweptImage{0}, sweeps{0};
+    static std::uint64_t reports = 0;
+    if (reports++ % 6 == 0 && !sweeping.exchange(true)) try {
+        std::thread([] {
+            std::uintptr_t arenaBase = 0;
+            std::size_t arenaBytes = 0;
+            GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
+            std::uint64_t guest = 0, host = 0, mapped = 0, image = 0;
+            MEMORY_BASIC_INFORMATION memory{};
+            for (std::uintptr_t cursor = 0x10000; VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) == sizeof(memory);) {
+                const auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
+                const auto end = base + memory.RegionSize;
+                if (memory.State == MEM_COMMIT) {
+                    if (memory.Type == MEM_PRIVATE) (base >= arenaBase && end <= arenaBase + arenaBytes ? guest : host) += memory.RegionSize;
+                    else if (memory.Type == MEM_MAPPED) mapped += memory.RegionSize;
+                    else image += memory.RegionSize;
+                }
+                if (end <= cursor) break;
+                cursor = end;
+            }
+            sweptGuest.store(guest, std::memory_order_relaxed);
+            sweptHost.store(host, std::memory_order_relaxed);
+            sweptMapped.store(mapped, std::memory_order_relaxed);
+            sweptImage.store(image, std::memory_order_relaxed);
+            sweeps.fetch_add(1, std::memory_order_release);
+            sweeping.store(false, std::memory_order_release);
+        }).detach();
+    } catch (const std::system_error&) {
+        sweeping.store(false, std::memory_order_release);
+    }
+    if (sweeps.load(std::memory_order_acquire) != 0) text += " last commit sweep: guest arena private " + std::to_string(sweptGuest.load(std::memory_order_relaxed) >> 20u) + " MiB, other private " + std::to_string(sweptHost.load(std::memory_order_relaxed) >> 20u) + " MiB, mapped " + std::to_string(sweptMapped.load(std::memory_order_relaxed) >> 20u) + " MiB, image " + std::to_string(sweptImage.load(std::memory_order_relaxed) >> 20u) + " MiB;";
     using MiOutput = void (*)(const char*, void*);
     using MiStatsPrint = void (*)(MiOutput, void*);
     static const auto miStats = [] {
