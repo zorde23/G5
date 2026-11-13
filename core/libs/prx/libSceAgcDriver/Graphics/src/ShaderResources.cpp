@@ -717,6 +717,19 @@ void reportGuestAllocation(const GuestTextureResource& resource, std::uint64_t g
     std::fprintf(stderr, "[gpu] view 0x%llx of %llu MiB lies in the guest allocation 0x%llx..0x%llx (%llu MiB, range 0x%llx..0x%llx, %s%s%s): %llu of its %u slices fit in the range\n", static_cast<unsigned long long>(resource.baseAddress), static_cast<unsigned long long>(guestBytes >> 20u), static_cast<unsigned long long>(range->allocationAddress), static_cast<unsigned long long>(range->allocationAddress + range->allocationBytes), static_cast<unsigned long long>(range->allocationBytes >> 20u), static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(end), range->readable ? "r" : "-", range->writable ? "w" : "-", range->gpu ? "g" : "-", static_cast<unsigned long long>(fitting), geometry.layers);
 }
 
+struct SampledLookupTrace {
+    bool active = false;
+    const StorageTexture* pending = nullptr;
+    const StorageTexture* chosen = nullptr;
+    const StorageTexture* entrySource = nullptr;
+    bool entryFound = false, stagedFlushed = false, sourceDiffers = false, keysEndView = false, keysNotServed = false, snapshotStale = false, admittedUncached = false, hit = false;
+};
+
+SampledLookupTrace& sampledLookupTrace() {
+    thread_local SampledLookupTrace trace;
+    return trace;
+}
+
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D) {
     const auto resource = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
@@ -803,6 +816,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const bool depthCopy = depthCompare && guestBytes >= DepthCopyMinBytes() && Texture::DepthCopyFormat(ResolveTextureFormat(resource.format)) != VK_FORMAT_UNDEFINED && resource.dimension != TextureDimension::k3D;
     const bool srgbExpand = !depthCompare && SrgbExpandsToRgba8(context, resource.format);
     auto source = StorageTexture::FindPending(address, guestBytes);
+    static SampledLookupTrace idle;
+    static const bool traced = std::getenv("APS5_VERIFY_FAST_PROOF") != nullptr;
+    auto& trace = traced ? sampledLookupTrace() : idle;
+    if (trace.active) trace = {true, source.get()};
     const bool blockCopy = source != nullptr && !depthCompare && !srgbExpand && Texture::CanBlockCopyFrom(*source, resource);
     const bool repackCopy = source != nullptr && !depthCompare && Texture::CanRepackCopyFrom(*source, resource);
     if (source != nullptr && !blockCopy && !repackCopy && (depthCompare ? !depthCopy || !Texture::CanDepthCopyFrom(*source, resource) : srgbExpand ? !Texture::CanSrgbExpandFrom(context, *source, resource) : !Texture::CanCopyFrom(*source, resource))) source.reset();
@@ -930,7 +947,17 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const CacheHold held(sampledCacheHeld);
     dropUncachedViews(cache);
     std::vector<std::byte> recycled;
+    if (trace.active) trace.chosen = source.get();
     if (auto it = findTexture(cache, key); it != cache.entries.end()) {
+        if (trace.active) {
+            trace.entryFound = true;
+            trace.entrySource = it->source.get();
+            trace.stagedFlushed = stagedFlushed;
+            trace.sourceDiffers = it->source != nullptr && source != nullptr && source != it->source;
+            trace.keysEndView = it->source != nullptr && source == nullptr && *keys != DccKeys::Uncompressed;
+            trace.keysNotServed = it->source != nullptr && !StorageImageServesKeys(*it->source, resource.dccAddress);
+            trace.snapshotStale = it->source == nullptr;
+        }
         if (it->source != nullptr) {
             // The view follows the storage image, whatever the GPU wrote to it since; guest memory
             // written meanwhile is taken in by refreshing the image. A fast clear the image cannot
@@ -941,6 +968,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 it->keys = *keys;
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, 0, it->source.get()});
+                if (trace.active) trace.hit = true;
                 reportTextureCounters();
                 if (profile) LookupOutcomes::Add(*keys != DccKeys::Uncompressed ? LookupOutcomes::SampledHitClearedView : LookupOutcomes::SampledHitView, start);
                 return it->texture;
@@ -1031,6 +1059,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto budget = sampledBudget(context, cache);
     auto texture = entry.texture;
     if (!admitTexture(cache, key, entry.accounted, budget)) {
+        if (trace.active) trace.admittedUncached = true;
         noteReleased(texture);
         logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
         reportCacheCounts(cache, budget);
@@ -3079,6 +3108,18 @@ bool AuditBeforeFast() {
     return enabled;
 }
 
+void noteFastCopies(bool behind) {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!stats) return;
+    static std::atomic<std::uint64_t> proofs{0}, behindProofs{0};
+    static std::atomic<std::int64_t> reportedAt{0};
+    proofs.fetch_add(1, std::memory_order_relaxed);
+    if (behind) behindProofs.fetch_add(1, std::memory_order_relaxed);
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[fast-copies] 10 s: %llu fast proofs, %llu of them with a depth, block, repack or sRGB copy behind its source before the refresh at the end of the proof\n", static_cast<unsigned long long>(proofs.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(behindProofs.exchange(0, std::memory_order_relaxed)));
+}
+
 void NoteFastVerify(bool divergent) {
     static std::atomic<std::uint64_t> verified{0}, diverged{0};
     static std::atomic<std::int64_t> reportedAt{0};
@@ -3955,12 +3996,26 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         thread_local std::uint64_t fastProofs = 0;
         if (fastProofs++ % every == 0) {
             std::size_t movedAt = 0;
+            const auto serialAtProof = serialBefore;
+            const bool wasAccepted = acceptedBefore;
+            const auto* oldTexture = !textures.empty() ? textures.front().get() : nullptr;
+            struct TraceScope {
+                SampledLookupTrace& trace;
+                ~TraceScope() { trace.active = false; }
+            } traceScope{sampledLookupTrace()};
+            traceScope.trace = {true};
             const bool same = walkAgrees(movedAt);
+            const auto seen = traceScope.trace;
             if (!same) {
                 static constexpr std::array<const char*, 8> points{"none", "a sampled element's lookup found another object", "an image table element's lookup found another object", "a reused image table holds other objects", "the element counts differ", "a storage element differs", "a stage has no program", "an image table's shape differs"};
                 const auto point = walkMiss.point >= 0 && static_cast<std::size_t>(walkMiss.point) < points.size() ? points[static_cast<std::size_t>(walkMiss.point)] : "?";
                 if (movedAt != SIZE_MAX) std::fprintf(stderr, "[verify-fast] the fast proof disagrees with the full walk: element %zu's content version moved (%zu textures, %zu storage images)\n", movedAt, textures.size(), storageTextures.size());
                 else std::fprintf(stderr, "[verify-fast] the fast proof disagrees with the full walk: %s at texture %zu (address 0x%llx, %ux%u, format %u, source view %d; %zu textures, %zu storage images, %zu image tables)\n", point, walkMiss.texture, static_cast<unsigned long long>(walkMiss.address), walkMiss.width, walkMiss.height, walkMiss.format, walkMiss.texture < validatedTextures.size() && validatedTextures[walkMiss.texture].source != nullptr ? 1 : 0, textures.size(), storageTextures.size(), tableStages.size());
+                if (movedAt == SIZE_MAX && walkMiss.point == 1) {
+                    const auto* oldSource = walkMiss.texture < validatedTextures.size() ? validatedTextures[walkMiss.texture].source : nullptr;
+                    const auto* missed = walkMiss.texture < textures.size() ? textures[walkMiss.texture].get() : oldTexture;
+                    std::fprintf(stderr, "[verify-fast] lookup detail: old texture released %d, old source %p cached %d; pending in the walk %s; chosen source %s; cache entry %s (its source %s, staged flushed %d, source differs %d, keys end the view %d, keys not served %d, snapshot stale %d), admitted uncached %d; pending serial at the proof %llu, now %llu; previous proof accepted %d\n", missed != nullptr && missed->Released() ? 1 : 0, static_cast<const void*>(oldSource), oldSource != nullptr && oldSource->Cached() ? 1 : 0, seen.pending == nullptr ? "none" : seen.pending == oldSource ? "the old source" : "another image", seen.chosen == nullptr ? "none" : seen.chosen == oldSource ? "the old source" : seen.chosen == seen.pending ? "the pending image" : "another image (storage cache)", seen.entryFound ? "found" : "missing", seen.entrySource == nullptr ? "none" : seen.entrySource == oldSource ? "the old source" : "another image", seen.stagedFlushed ? 1 : 0, seen.sourceDiffers ? 1 : 0, seen.keysEndView ? 1 : 0, seen.keysNotServed ? 1 : 0, seen.snapshotStale ? 1 : 0, seen.admittedUncached ? 1 : 0, static_cast<unsigned long long>(serialAtProof), static_cast<unsigned long long>(StorageTexture::PendingSerial()), wasAccepted ? 1 : 0);
+                }
             }
             NoteFastVerify(!same);
             if (!same && movedAt == SIZE_MAX) return finish(false, false);
@@ -4027,12 +4082,16 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     lapProof(proofLaps, 10);
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
     depthCopies = false;
+    std::size_t copiesBehind = 0;
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->IsDepthCopy()) {
             depthCopies = true;
+            if (texture->CopyBehindSource()) ++copiesBehind;
             texture->RefreshDepthCopy();
         }
     }
+    if (fast) noteFastCopies(copiesBehind != 0);
+    acceptedBefore = fast && accepted;
     lapsScope.passed = true;
     return finish(fast, true);
 }

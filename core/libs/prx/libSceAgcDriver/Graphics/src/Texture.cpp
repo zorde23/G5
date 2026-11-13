@@ -908,6 +908,10 @@ bool Texture::refreshSrgbExpand() {
     return true;
 }
 
+bool Texture::CopyBehindSource() const {
+    return IsDepthCopy() && storageSource != nullptr && (!copiedOnce || storageSource->Version() != copiedVersion);
+}
+
 bool Texture::RefreshDepthCopy() {
     if (perUseCopy != PerUseCopy::RefreshedOnReuse || storageSource == nullptr) return false;
     if (copiedOnce && storageSource->Version() == copiedVersion) return false;

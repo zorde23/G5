@@ -81,6 +81,7 @@ public:
     Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, RepackCopyTag);
     static bool CanRepackCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
     bool IsDepthCopy() const { return perUseCopy == PerUseCopy::RefreshedOnReuse; }
+    bool CopyBehindSource() const;
     bool RefreshDepthCopy();
     struct DepthCopyCounts {
         std::uint64_t textures;
