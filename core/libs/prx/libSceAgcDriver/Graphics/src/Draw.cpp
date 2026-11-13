@@ -1154,6 +1154,8 @@ struct DrawTimer {
     bool profile;
     std::chrono::steady_clock::time_point phaseStart;
     std::array<double, PhaseCount> us{};
+    std::array<double, 10> recordUs{};
+    std::chrono::steady_clock::time_point recordLap;
     explicit DrawTimer(bool profile) : profile(profile), phaseStart(std::chrono::steady_clock::now()) {}
     void phase(DrawPhase which) {
         if (!profile) return;
@@ -1161,13 +1163,107 @@ struct DrawTimer {
         us[which] += std::chrono::duration<double, std::micro>(now - phaseStart).count();
         phaseStart = now;
     }
+    void recordPart(std::size_t part) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        recordUs[part] += std::chrono::duration<double, std::micro>(now - (part == 0 ? phaseStart : recordLap)).count();
+        recordLap = now;
+    }
 };
+
+bool MemoCStats() {
+    static const bool enabled = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return enabled;
+}
+
+struct MemoCCounts {
+    std::atomic<std::uint64_t> framebuffers{0}, sameFramebuffer{0}, sameViews{0}, timedFramebuffers{0}, framebufferNs{0};
+    std::atomic<std::uint64_t> passSetups{0}, timedPassSetups{0}, passSetupNs{0}, storedLinearNs{0}, bindingsNs{0};
+};
+
+MemoCCounts& memoC() {
+    static MemoCCounts counts;
+    return counts;
+}
+
+struct CommitterDrawCounts {
+    std::array<std::atomic<std::uint64_t>, 2> draws{}, longestNs{}, pipelines{}, pipelineNs{};
+};
+
+CommitterDrawCounts& committerDraws() {
+    static CommitterDrawCounts counts;
+    return counts;
+}
+
+void reportCommitterDraws() {
+    static std::atomic<std::int64_t> reportedAt{0};
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    auto& draws = committerDraws();
+    const auto onDraws = take(draws.draws[0]), onLongest = take(draws.longestNs[0]), onPipelines = take(draws.pipelines[0]), onPipelineNs = take(draws.pipelineNs[0]);
+    const auto offDraws = take(draws.draws[1]), offLongest = take(draws.longestNs[1]), offPipelines = take(draws.pipelines[1]), offPipelineNs = take(draws.pipelineNs[1]);
+    AgcDriver::ProfilePrint_nid_no_patch("[c-draws] 10 s: %llu draws on the committer, longest %.0f us; %llu draws on other threads, longest %.0f us; graphics pipelines built: %llu on the committer in %.1f ms, %llu on other threads in %.1f ms\n", onDraws, static_cast<double>(onLongest) / 1e3, offDraws, static_cast<double>(offLongest) / 1e3, onPipelines, static_cast<double>(onPipelineNs) / 1e6, offPipelines, static_cast<double>(offPipelineNs) / 1e6);
+    auto& counts = memoC();
+    const auto scaled = [](unsigned long long ns, unsigned long long timed, unsigned long long all) { return timed != 0 ? static_cast<double>(ns) * static_cast<double>(all) / static_cast<double>(timed) / 1e6 : 0.0; };
+    const auto framebuffers = take(counts.framebuffers), timedFramebuffers = take(counts.timedFramebuffers), framebufferNs = take(counts.framebufferNs);
+    const auto passSetups = take(counts.passSetups), timedPassSetups = take(counts.timedPassSetups), passSetupNs = take(counts.passSetupNs), storedLinearNs = take(counts.storedLinearNs), bindingsNs = take(counts.bindingsNs);
+    AgcDriver::ProfilePrint_nid_no_patch("[memo-c] 10 s, sampled 1 in 64 and scaled: %llu framebuffer acquires %.1f ms (%llu the same framebuffer as the thread's previous draw, %llu the same target views); %llu pass setups from the pass key to StartDrawPass %.1f ms (of it the drawn linear stores %.1f ms, the draw bindings %.1f ms and the rest %.1f ms)\n", framebuffers, scaled(framebufferNs, timedFramebuffers, framebuffers), take(counts.sameFramebuffer), take(counts.sameViews), passSetups, scaled(passSetupNs, timedPassSetups, passSetups), scaled(storedLinearNs, timedPassSetups, passSetups), scaled(bindingsNs, timedPassSetups, passSetups), scaled(passSetupNs > storedLinearNs + bindingsNs ? passSetupNs - storedLinearNs - bindingsNs : 0, timedPassSetups, passSetups));
+}
+
+struct CommitterDrawSpan {
+    std::chrono::steady_clock::time_point start = MemoCStats() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    CommitterDrawSpan() = default;
+    CommitterDrawSpan(const CommitterDrawSpan&) = delete;
+    CommitterDrawSpan& operator=(const CommitterDrawSpan&) = delete;
+    ~CommitterDrawSpan() {
+        if (start == std::chrono::steady_clock::time_point{}) return;
+        const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        const std::size_t other = Recorder::OnCommitter() ? 0u : 1u;
+        auto& draws = committerDraws();
+        draws.draws[other].fetch_add(1, std::memory_order_relaxed);
+        auto longest = draws.longestNs[other].load(std::memory_order_relaxed);
+        while (ns > longest && !draws.longestNs[other].compare_exchange_weak(longest, ns, std::memory_order_relaxed)) {}
+        reportCommitterDraws();
+    }
+};
+
+bool sampledDraw() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const std::uint64_t sampleEvery = [] {
+        const char* value = std::getenv("APS5_TMP_DRAW_PHASES");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+    }();
+    thread_local std::uint64_t sampled = 0;
+    return profile || (sampleEvery != 0 && sampled++ % sampleEvery == 0);
+}
+
+void reportRecordParts(const DrawTimer& timer) {
+    static constexpr std::array<const char*, 10> names{"before recordDraw", "queued stores", "pass reads and targets", "drawn linear stores", "draw bindings", "pass start", "pass begin", "pipeline, bindings and push", "draw commands", "pass end"};
+    static std::array<std::atomic<std::uint64_t>, 10> totalNs{};
+    static std::atomic<std::uint64_t> draws{0};
+    static std::atomic<std::int64_t> reportedAt{0};
+    for (std::size_t part = 0; part < names.size(); ++part) totalNs[part].fetch_add(static_cast<std::uint64_t>(timer.recordUs[part] * 1000.0), std::memory_order_relaxed);
+    draws.fetch_add(1, std::memory_order_relaxed);
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    const auto sampled = draws.exchange(0, std::memory_order_relaxed);
+    if (sampled == 0) return;
+    std::string line = "[draw-record-parts] 10 s, " + std::to_string(sampled) + " sampled draws, us per draw (driver calls included):";
+    for (std::size_t part = 0; part < names.size(); ++part) {
+        char text[64];
+        std::snprintf(text, sizeof(text), " %s %.2f;", names[part], static_cast<double>(totalNs[part].exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(sampled));
+        line += text;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
+}
 
 // One line per draw with the phases that took time (APS5_TRACE_DRAWS), and the 10 s totals.
 // `waitedBefore` is the thread's GPU waits at the draw's start and `ownWaitedMs` the draw's own
 // syncs (see DrawOutcome::hookWaitUs).
 void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResources::BuildTiming* built, DrawOutcome& outcome, double waitedBefore, double ownWaitedMs, const char* suffix) {
     if (!timer.profile) return;
+    if (timer.recordLap != std::chrono::steady_clock::time_point{}) reportRecordParts(timer);
     static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     outcome.hookWaitUs = std::max(0.0, Recorder::ThreadWaitedMs() - waitedBefore - ownWaitedMs) * 1000.0;
     outcome.ownSyncUs = ownWaitedMs * 1000.0;
@@ -1800,17 +1896,37 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
     if (resolved.cacheable) {
+        static std::array<std::atomic<std::uint64_t>, 5> partNs{};
+        static std::atomic<std::int64_t> partsReportedAt{0};
+        const bool parts = timer.profile;
+        auto mark = parts ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto lap = [&](std::size_t index) {
+            if (!parts) return;
+            const auto now = std::chrono::steady_clock::now();
+            partNs[index].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - mark).count()), std::memory_order_relaxed);
+            mark = now;
+        };
         if (prep != nullptr && prep->keyed) {
             resolved.contentKey = prep->contentKey;
         } else {
             PerformanceTimer pure("Draw.prep_pure");
             resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
         }
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        lap(0);
+        auto cached = SharedResourceCache().Find(resolved.contentKey);
+        lap(1);
+        if (parts) {
+            const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+            if (partsReportedAt.exchange(tenSeconds, std::memory_order_relaxed) != tenSeconds) AgcDriver::ProfilePrint_nid_no_patch("[lookup-parts] 10 s (sampled draws): key %.1f ms, find %.1f ms, revalidate %.1f ms, moved %.1f ms, sampled hits %llu\n", static_cast<double>(partNs[0].exchange(0)) / 1e6, static_cast<double>(partNs[1].exchange(0)) / 1e6, static_cast<double>(partNs[2].exchange(0)) / 1e6, static_cast<double>(partNs[3].exchange(0)) / 1e6, static_cast<unsigned long long>(partNs[4].exchange(0)));
+        }
+        if (cached) {
+            if (parts) partNs[4].fetch_add(1, std::memory_order_relaxed);
             const bool valid = cached->Revalidate(shaders);
+            lap(2);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color);
+            lap(3);
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 resolved.resources = std::move(cached);
@@ -2316,6 +2432,7 @@ bool WriteOnlyPasses() {
 thread_local bool previousDrawWrote = false;
 
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr) {
+    timer.recordPart(0);
     std::uint32_t subdraw = 0;
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
@@ -2327,6 +2444,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // within the open batch) and the extent. The previous draw's pass is continued only when this
     // draw neither reads its attachments (a barrier would be owed, which no pass allows) nor
     // records anything outside a pass (an indirect draw's argument barrier and scratch copies).
+    thread_local std::uint64_t passSetups = 0;
+    const bool timedPassSetup = MemoCStats() && ++passSetups % 64 == 0;
+    const auto passSetupStart = timedPassSetup ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto passKey = DrawRenderPassKey(context, state, record.targetViews);
     const bool readsTarget = std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return resources.ReadsImage(target.get()); });
     // A queued DCC key store over memory the draw writes or reads in place (unknown for an
@@ -2354,6 +2474,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* passReadsSlot = nullptr;
     auto& passReads = ShaderRecompiler::ThreadOwned(passReadsSlot);
     passReads.clear();
+    timer.recordPart(1);
     if (!addressBased) resources.DeviceReads(passReads);
     const auto deviceReads = passReads.size();
     if (gpuIndirect) {
@@ -2373,8 +2494,17 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     for (const auto image : record.multisampleImages) passAttachments.emplace_back(image, true);
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
+    timer.recordPart(2);
+    const auto storedLinearStart = timedPassSetup ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory));
+    const auto storedLinearEnd = timedPassSetup ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    timer.recordPart(3);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    if (timedPassSetup) {
+        memoC().storedLinearNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(storedLinearEnd - storedLinearStart).count()), std::memory_order_relaxed);
+        memoC().bindingsNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - storedLinearEnd).count()), std::memory_order_relaxed);
+    }
+    timer.recordPart(4);
     static const bool addressReadPasses = std::getenv("APS5_NO_ADDRESS_READ_PASSES") == nullptr;
     const bool readOnlyBda = addressReadPasses && resources.BdaReadOnly();
     outcome.addressDraw = addressBased;
@@ -2408,8 +2538,17 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
     outcome.passContinued = continued;
+    if (MemoCStats()) {
+        auto& counts = memoC();
+        counts.passSetups.fetch_add(1, std::memory_order_relaxed);
+        if (timedPassSetup) {
+            counts.passSetupNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - passSetupStart).count()), std::memory_order_relaxed);
+            counts.timedPassSetups.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     outcome.passBegun = !continued;
     const auto commands = start.commands;
+    timer.recordPart(5);
     if (!continued) {
         recorder->PrepareSampleSlot();
         PerformanceTrace::Count(PerformanceTrace::RenderPassScope);
@@ -2436,6 +2575,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     VkBuffer argumentBuffer = VK_NULL_HANDLE;
     VkDeviceSize argumentOffset = 0;
     bool rewritten = false;
+    timer.recordPart(6);
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
     if (continued) {
         record.pipeline->Continue(commands, state);
@@ -2490,6 +2630,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
+    timer.recordPart(7);
     static const bool timeEachDraw = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
     auto eachDrawTiming = Recorder::NoTiming;
     if (timeEachDraw) {
@@ -2521,6 +2662,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
+    timer.recordPart(8);
     std::function<void(VkCommandBuffer)> storeProxies;
     if (!continued && (!record.proxies.empty() || !record.reordered.empty() || record.depthLocations)) {
         storeProxies = [proxies = record.proxies, reordered = record.reordered, reorderPass = record.reorderPass, depthLocations = record.depthLocations, context, recorder](VkCommandBuffer passCommands) {
@@ -2541,6 +2683,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         };
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
+    timer.recordPart(9);
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), state.scissor, std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
     timer.phase(PhaseKeep);
@@ -3062,9 +3205,8 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     auto& timing = prepared.timing.emplace("Graphics.Draw");
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& timer = prepared.timer;
-    timer = DrawTimer(profile);
+    timer = DrawTimer(sampledDraw());
     // APS5_TRACE_DRAWS (together with APS5_PROFILE_DRAW; alone it only enables Driver.cpp's own
     // [draw] lines) additionally prints one line per draw with its phases and, for synchronous
     // draws, their inputs: per-draw string building at ~1400 draws per 10 s is itself a cost the
@@ -3075,7 +3217,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     // The thread's GPU waits so far: the difference at the report, less the draw's own syncs
     // (`ownWaitedMs`, sampled around them), is what this draw waited for through the flush hook
     // (nested in the draw's hold, see DrawOutcome::hookWaitUs).
-    const auto waitedBefore = prepared.waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
+    const auto waitedBefore = prepared.waitedBefore = timer.profile ? Recorder::ThreadWaitedMs() : 0.0;
     auto& ownWaitedMs = prepared.ownWaitedMs;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
     auto& inputs = prepared.inputs;
@@ -3170,7 +3312,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
                     memoVerify = true;
                 }
             }
-            binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
+            binding.resident = refreshResidentTarget(context, state, color, outcome, timer.profile, [&] {
                 if (color.arrayLastSlice != 0) {
                     Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
                     const auto array = ArraySurfaceForTarget(color);
@@ -3510,7 +3652,24 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         framebufferOwners.push_back(binding.multisampled ? binding.multisampleOwner : binding.resident);
     }
     auto& framebuffer = prepared.framebuffer;
+    thread_local std::uint64_t acquires = 0;
+    const bool timedAcquire = MemoCStats() && ++acquires % 64 == 0;
+    const auto acquireStart = timedAcquire ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     framebuffer = pipeline->AcquireFramebuffer(targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
+    if (MemoCStats()) {
+        auto& counts = memoC();
+        if (timedAcquire) {
+            counts.framebufferNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - acquireStart).count()), std::memory_order_relaxed);
+            counts.timedFramebuffers.fetch_add(1, std::memory_order_relaxed);
+        }
+        thread_local const void* previousFramebuffer = nullptr;
+        thread_local std::vector<VkImageView> previousViews;
+        counts.framebuffers.fetch_add(1, std::memory_order_relaxed);
+        if (framebuffer.get() == previousFramebuffer) counts.sameFramebuffer.fetch_add(1, std::memory_order_relaxed);
+        if (std::ranges::equal(targetViews, previousViews)) counts.sameViews.fetch_add(1, std::memory_order_relaxed);
+        previousFramebuffer = framebuffer.get();
+        previousViews.assign(targetViews.begin(), targetViews.end());
+    }
     auto& reordered = prepared.reordered;
     auto& reorderPass = prepared.reorderPass;
     if (pipeline->ReordersSamples()) {
@@ -3845,9 +4004,9 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             // write-back runs before the next packet, so the CPU never reads copied results or
             // touches a leased allocation before they landed.
             Recorder::CountSync(3);
-            const auto ownBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
+            const auto ownBefore = timer.profile ? Recorder::ThreadWaitedMs() : 0.0;
             recorder->Sync();
-            if (profile) ownWaitedMs += Recorder::ThreadWaitedMs() - ownBefore;
+            if (timer.profile) ownWaitedMs += Recorder::ThreadWaitedMs() - ownBefore;
             timer.phase(PhaseSync);
         }
         report(outcome.waited ? (outcome.reason == SyncLease ? " recorded then waited (lease)" : " recorded then waited (copied writes)") : completion ? " recorded with completion" : " recorded");
@@ -3855,10 +4014,10 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     }
     {
         // The recorder sync SubmitAndWait makes is the draw's own wait, not a nested hook wait.
-        const auto ownBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
+        const auto ownBefore = timer.profile ? Recorder::ThreadWaitedMs() : 0.0;
         batch->SubmitAndWait();
         if (!stencilReferences.empty()) resources->CheckFaults();
-        if (profile) ownWaitedMs += Recorder::ThreadWaitedMs() - ownBefore;
+        if (timer.profile) ownWaitedMs += Recorder::ThreadWaitedMs() - ownBefore;
     }
     if (checkRecords) checkRecords();
     timer.phase(PhaseSync);
@@ -4092,6 +4251,13 @@ const char* DrawPrepDifference(const DrawPrep& a, const DrawPrep& b, bool full) 
     return nullptr;
 }
 
+void NoteGraphicsPipelineBuilt(std::uint64_t ns) {
+    if (!MemoCStats()) return;
+    const std::size_t other = Recorder::OnCommitter() ? 0u : 1u;
+    committerDraws().pipelines[other].fetch_add(1, std::memory_order_relaxed);
+    committerDraws().pipelineNs[other].fetch_add(ns, std::memory_order_relaxed);
+}
+
 void NoteDrawPrepSkip(DrawPrepSkip skip) {
     drawPrepCounts().skipped[static_cast<std::size_t>(skip)].fetch_add(1, std::memory_order_relaxed);
     reportDrawPrep();
@@ -4099,6 +4265,7 @@ void NoteDrawPrepSkip(DrawPrepSkip skip) {
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, const DrawPrep* prep) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
+    const CommitterDrawSpan span;
     if (state.stages.tessellationGeometry) {
         drawTessellationGeometry(context, state, draw, shaders, snapshots, trace);
         return;
@@ -4114,19 +4281,19 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
 
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
+    const CommitterDrawSpan span;
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     static_cast<void>(snapshots);
     PerformanceTimer timing("Graphics.DrawWithRecipe");
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    DrawTimer timer(profile);
+    DrawTimer timer(sampledDraw());
     DrawRecipeOutcome result;
     DrawOutcome outcome;
     outcome.kind = KindRecipeHit;
-    const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
+    const auto waitedBefore = timer.profile ? Recorder::ThreadWaitedMs() : 0.0;
     double ownWaitedMs = 0;
     const auto miss = [&](DrawRecipeMiss reason) {
         result.miss = reason;
-        if (profile) {
+        if (timer.profile) {
             auto& stats = Profile();
             std::lock_guard lock(stats.mutex);
             ++stats.recipeMisses[static_cast<std::size_t>(reason)];
@@ -4157,7 +4324,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         if (state.colors[index].fmaskAddress != 0) GuardOneFragmentFmask(context, state.colors[index]);
         auto stored = recipe.targets[index].lock();
         if (stored == nullptr || !StorageImageCached(context, stored.get()) || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) return miss(DrawRecipeMiss::TargetGone);
-        auto resident = refreshResidentTarget(context, state, state.colors[index], outcome, profile, [&] {
+        auto resident = refreshResidentTarget(context, state, state.colors[index], outcome, timer.profile, [&] {
             if (state.colors[index].arrayLastSlice != 0) stored->RefreshLayers(state.colors[index].arraySlice, 1);
             else stored->Refresh();
             return stored;
@@ -4180,9 +4347,9 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     auto resources = recipe.templateRef.lock();
     if (resources == nullptr) return miss(DrawRecipeMiss::TemplateGone);
     Require(resources->Reusable(), "draw recipe over a non-reusable template");
-    const auto proofStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto proofStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool proved = resources->ProveCurrent(shaders, &result.proof);
-    if (profile) result.proofUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - proofStart).count();
+    if (timer.profile) result.proofUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - proofStart).count();
     if (!proved) {
         SharedResourceCache().Remove(recipe.key, resources.get());
         countCache(&DrawProfile::cacheInvalidated);
@@ -4209,7 +4376,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
     }
     timer.phase(PhasePipeline);
-    const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto recordStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     RecordedDraw record;
     record.recorder = recorder;
     record.completion = outcome.completion;
@@ -4223,7 +4390,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     record.pushStages = recipe.pushStages;
     record.depthLocations = passDepthLocations(context, state, *record.pipeline);
     recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, trace);
-    if (profile) {
+    if (timer.profile) {
         result.recordUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - recordStart).count();
         auto& stats = Profile();
         std::lock_guard lock(stats.mutex);

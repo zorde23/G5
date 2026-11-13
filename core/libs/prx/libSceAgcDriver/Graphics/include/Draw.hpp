@@ -50,6 +50,7 @@ DrawPrepReject CheckDrawPrep(const Context& context, const DrawPrep& prep, const
 // The first field two preps differ in, or null: the stored pipeline and the resource key, with `full` every field.
 const char* DrawPrepDifference(const DrawPrep& a, const DrawPrep& b, bool full);
 void NoteDrawPrepSkip(DrawPrepSkip skip);
+void NoteGraphicsPipelineBuilt(std::uint64_t ns);
 
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under

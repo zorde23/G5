@@ -449,6 +449,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
 
 Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size() + (state.depth ? 1u : 0u)), colorAttachments(state.colors.size()), depthBounds(state.depth.has_value() && state.depthBoundsTest), depthBias(state.depth.has_value() && state.depthBias), dynamicRendering(context.graphicsPipelineLibrary) {
     PerformanceTimer timing("Vulkan.GraphicsPipeline");
+    const auto builtStart = std::chrono::steady_clock::now();
     for (const auto& color : state.colors) boundAttachments.push_back(color.partialWriteMask == 0u);
     if (state.depth) boundAttachments.push_back(true);
     sampleLocationsEnabled = ValidateSampleLocations(context, state);
@@ -752,6 +753,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
         _modules.clear();
         timing.Mark("create");
+        NoteGraphicsPipelineBuilt(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - builtStart).count()));
         PerformanceCounters::CountPipeline();
         LogPipelineStatistics_nid_no_patch(context, pipeline);
     } catch (...) {
