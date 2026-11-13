@@ -1172,6 +1172,15 @@ struct DrawTimer {
     std::array<double, 8> vertexUs{};
     std::uint32_t indexKind = 0;
     std::uint64_t indexCount = 0;
+    std::array<double, 4> indexUs{};
+    std::chrono::steady_clock::time_point indexLap;
+    bool indexClamped = false;
+    void indexPart(std::size_t part) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        indexUs[part] += std::chrono::duration<double, std::micro>(now - (indexLap == std::chrono::steady_clock::time_point{} ? phaseStart : indexLap)).count();
+        indexLap = now;
+    }
     std::chrono::steady_clock::time_point vertexLap;
     void vertexPart(std::size_t part) {
         if (!profile) return;
@@ -1272,9 +1281,12 @@ void reportVertexParts(const DrawTimer& timer) {
     static constexpr std::array<const char*, 8> names{"indices", "input layout", "attribute decode", "copy plan", "in-place ranges", "copied ranges", "zero-padded copies", "handles"};
     static std::array<std::atomic<std::uint64_t>, 8> totalNs{};
     static std::array<std::atomic<std::uint64_t>, 4> indexKinds{}, indexNs{};
-    static std::atomic<std::uint64_t> draws{0}, indices{0};
+    static std::array<std::atomic<std::uint64_t>, 4> indexPartNs{};
+    static std::atomic<std::uint64_t> draws{0}, indices{0}, clamped{0};
     static std::atomic<std::int64_t> reportedAt{0};
     for (std::size_t part = 0; part < names.size(); ++part) totalNs[part].fetch_add(static_cast<std::uint64_t>(timer.vertexUs[part] * 1000.0), std::memory_order_relaxed);
+    for (std::size_t part = 0; part < indexPartNs.size(); ++part) indexPartNs[part].fetch_add(static_cast<std::uint64_t>(timer.indexUs[part] * 1000.0), std::memory_order_relaxed);
+    if (timer.indexClamped) clamped.fetch_add(1, std::memory_order_relaxed);
     indexKinds[timer.indexKind].fetch_add(1, std::memory_order_relaxed);
     indexNs[timer.indexKind].fetch_add(static_cast<std::uint64_t>(timer.vertexUs[0] * 1000.0), std::memory_order_relaxed);
     if (timer.indexKind != 0) indices.fetch_add(timer.indexCount, std::memory_order_relaxed);
@@ -1292,7 +1304,13 @@ void reportVertexParts(const DrawTimer& timer) {
     static constexpr std::array<const char*, 4> kinds{"not indexed or expanded", "indices in place", "indices copied", "indices copy reused"};
     const auto indexed = sampled - std::min(sampled, indexKinds[0].load(std::memory_order_relaxed));
     const auto indexTotal = indices.exchange(0, std::memory_order_relaxed);
-    line += " indexed draws " + std::to_string(indexed) + " with " + std::to_string(indexed != 0 ? indexTotal / indexed : 0) + " indices each;";
+    line += " indexed draws " + std::to_string(indexed) + " with " + std::to_string(indexed != 0 ? indexTotal / indexed : 0) + " indices each, " + std::to_string(clamped.exchange(0, std::memory_order_relaxed)) + " clamped for zero fetches;";
+    static constexpr std::array<const char*, 4> indexParts{"lookup or copy", "highest index", "zero-fetch clamp", "quad or strip expansion"};
+    for (std::size_t part = 0; part < indexParts.size(); ++part) {
+        char text[80];
+        std::snprintf(text, sizeof(text), " %s %.2f us;", indexParts[part], static_cast<double>(indexPartNs[part].exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(sampled));
+        line += text;
+    }
     for (std::size_t kind = 0; kind < kinds.size(); ++kind) {
         const auto count = indexKinds[kind].exchange(0, std::memory_order_relaxed);
         const auto ns = indexNs[kind].exchange(0, std::memory_order_relaxed);
@@ -1703,6 +1721,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         inputs.indexOffset = 0;
         inputs.expandedIndexCount = outputIndexCount;
         inputs.indices = std::move(indexCopy);
+        timer.indexPart(3);
     } else if (draw.indexed) {
         const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         const bool fanGeometry = state.stages.mesh && state.stages.mesh->inputPrimitive == 5;
@@ -1712,6 +1731,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         DrawInputCopy copy;
         if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
         else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
+        timer.indexPart(0);
         timer.indexKind = import != nullptr ? 1u : copy.reused ? 3u : 2u;
         timer.indexCount = draw.indexCount;
         std::optional<std::uint32_t> highest;
@@ -1725,6 +1745,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         } else if (copy.derived != 0) {
             highest = copy.derived - 1u;
         }
+        timer.indexPart(1);
         if (!highest) {
             inputs.nothing = true;
             return inputs;
@@ -1741,6 +1762,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                 import = nullptr;
                 copy = DrawInputCopy{};
                 copy.buffer = std::move(clamped);
+                timer.indexPart(2);
+                timer.indexClamped = true;
                 if (!highest) {
                     inputs.nothing = true;
                     return inputs;
