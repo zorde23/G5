@@ -126,7 +126,12 @@ void extensionBits(const std::uint8_t* code, const Insn& insn, bool& r, bool& x,
 
 enum class Analysis : std::uint8_t { Understood, Unknown, FrameHazard };
 
-Analysis analyzeForFrame(const std::uint8_t* code, const Insn& insn, const bool rspBaseAllowed) {
+bool vectorOpcode(const std::uint8_t op) {
+    return (op >= 0x10 && op <= 0x17) || op == 0x28 || op == 0x29 || op == 0x2e || op == 0x2f || (op >= 0x51 && op <= 0x6d) || op == 0x6f || op == 0x70 || (op >= 0x74 && op <= 0x76) || op == 0x7f ||
+           op == 0xc2 || op == 0xc6 || op == 0xd4 || op == 0xd6 || op == 0xdb || op == 0xdf || op == 0xe6 || op == 0xeb || op == 0xef || op == 0xf4 || (op >= 0xfa && op <= 0xfe);
+}
+
+Analysis analyzeForFrame(const std::uint8_t* code, const Insn& insn, const bool rspBaseAllowed, const bool vexVectors = false) {
     const auto& info = insn.Info;
     const auto at = info.OpcodeOffset;
     const auto lead = code[at];
@@ -144,7 +149,10 @@ Analysis analyzeForFrame(const std::uint8_t* code, const Insn& insn, const bool 
     std::optional<unsigned> vexRegister;
     const bool vex = info.RexPrefix == 0 && (lead == 0xc4 || lead == 0xc5 || lead == 0x62 || xopPrefixed(code, insn));
     const auto op = info.Opcode;
-    if (vex) {
+    if (vex && vexVectors && (lead == 0xc5 || lead == 0xc4) && at + (lead == 0xc5 ? 2u : 3u) < insn.Length &&
+        (lead == 0xc5 || (code[at + 1] & 0x1fu) == 1) && vectorOpcode(code[at + (lead == 0xc5 ? 2 : 3)])) {
+        form = Form::Vector;
+    } else if (vex) {
         if (lead != 0xc4 || at + 3 >= insn.Length) return Analysis::Unknown;
         const auto map = code[at + 1] & 0x1fu;
         const auto vexOp = code[at + 3];
@@ -170,8 +178,7 @@ Analysis analyzeForFrame(const std::uint8_t* code, const Insn& insn, const bool 
         if ((op >= 0x40 && op <= 0x4f) || op == 0xaf || op == 0xb6 || op == 0xb7 || op == 0xbe || op == 0xbf) form = Form::General;
         else if ((op >= 0x90 && op <= 0x9f) || (op == 0x1f && digit == 0)) form = Form::Digit;
         else if (op >= 0x80 && op <= 0x8f) form = Form::None;
-        else if ((op >= 0x10 && op <= 0x17) || op == 0x28 || op == 0x29 || op == 0x2e || op == 0x2f || (op >= 0x51 && op <= 0x6d) || op == 0x6f || op == 0x70 || (op >= 0x74 && op <= 0x76) || op == 0x7f ||
-                 op == 0xc2 || op == 0xc6 || op == 0xd4 || op == 0xd6 || op == 0xdb || op == 0xdf || op == 0xe6 || op == 0xeb || op == 0xef || op == 0xf4 || (op >= 0xfa && op <= 0xfe)) form = Form::Vector;
+        else if (vectorOpcode(op)) form = Form::Vector;
     }
     if (!form) return Analysis::Unknown;
     if (*form == Form::None) return !info.HasModRm && (info.FlowKind == ControlFlowKind::Sequential || info.HasBranchTarget) ? Analysis::Understood : Analysis::Unknown;
@@ -202,10 +209,10 @@ Analysis analyzeForFrame(const std::uint8_t* code, const Insn& insn, const bool 
     return Analysis::Understood;
 }
 
-bool analyzedForAllocation(const std::uint8_t* code, const Insn& insn, const bool rspBaseAllowed = false) {
+bool analyzedForAllocation(const std::uint8_t* code, const Insn& insn, const bool rspBaseAllowed = false, const bool vexVectors = false) {
     const auto at = insn.Info.OpcodeOffset;
     if (insn.Length == 2 && at == 0 && code[0] == 0xcd && (code[1] == 0x41 || code[1] == 0x29)) return true;
-    return analyzeForFrame(code, insn, rspBaseAllowed) == Analysis::Understood;
+    return analyzeForFrame(code, insn, rspBaseAllowed, vexVectors) == Analysis::Understood;
 }
 
 bool twoByteRegisterIsGeneral(const std::uint8_t op) {
@@ -644,7 +651,7 @@ void frameSegment(
                     const auto& insn = body[k];
                     if (stubJumpsStayInBody && insideExistingSite(insn.Offset, insn.Offset + insn.Length)) continue;
                     const auto use = memoryUse(at(k), insn);
-                    if (!analyzedForAllocation(at(k), insn) || use.UsesRsp || pushesOrPops(at(k), insn) || (use.RbpBased && (use.Indexed || use.Address))) clean = false;
+                    if (!analyzedForAllocation(at(k), insn, false, stubJumpsStayInBody) || use.UsesRsp || pushesOrPops(at(k), insn) || (use.RbpBased && (use.Indexed || use.Address))) clean = false;
                     if (!branchStaysInBody(k)) clean = false;
                 }
                 if (clean) framePointerAllocation = allocated;
