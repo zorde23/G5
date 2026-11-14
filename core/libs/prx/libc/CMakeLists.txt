@@ -1204,6 +1204,20 @@ if(WIN32)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
+    add_test_executable(guest_donation_map_tests EXCLUDE_FROM_ALL ${LIBS_INCLUDE_DIR}/tests/GuestDonationMap.cpp)
+    target_include_directories(guest_donation_map_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_donation_map_tests PRIVATE libc)
+    configure_windows_unwind(guest_donation_map_tests)
+    if(BUILD_TESTING)
+        set_target_properties(guest_donation_map_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+        add_test(NAME guest_donation_map COMMAND guest_donation_map_tests)
+        add_test(NAME guest_donation_map_kyty COMMAND guest_donation_map_tests kyty)
+        set_tests_properties(guest_donation_map PROPERTIES TIMEOUT 30 ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        set_tests_properties(guest_donation_map_kyty PROPERTIES TIMEOUT 30 ENVIRONMENT "APS5_KYTY_GPU=1" ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
     add_test_executable(guest_commit_epoch_tests EXCLUDE_FROM_ALL ${LIBS_INCLUDE_DIR}/tests/GuestCommitEpoch.cpp)
     target_include_directories(guest_commit_epoch_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_commit_epoch_tests PRIVATE libc)

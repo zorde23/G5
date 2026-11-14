@@ -1,4 +1,5 @@
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/KytyGpu.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/WindowsMappings.hpp"
 #include <algorithm>
@@ -599,6 +600,7 @@ void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("reset", pointer, bytes);
     const CommitEpochNote note(pointer, bytes, CommitEpochOrigin::Reset);
     WindowsMappings::Get().Reset(pointer, bytes);
+    GuestArenaWithdraw_nid_no_patch(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
 void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
@@ -615,7 +617,8 @@ void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* sec
     std::vector<std::pair<std::uintptr_t, std::size_t>> created;
     std::exception_ptr failure;
     try {
-        WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), true, PAGE_EXECUTE_READWRITE, SIZE_MAX, &created);
+        WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), !KytyGpuEnabled(), PAGE_EXECUTE_READWRITE, SIZE_MAX, &created);
+        if (KytyGpuEnabled() && !GuestArenaDonate_nid_no_patch(reinterpret_cast<std::uintptr_t>(pointer), bytes)) throw std::runtime_error("the Kyty GPU donation table cannot hold a direct memory mapping");
     } catch (...) {
         failure = std::current_exception();
     }
