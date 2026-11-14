@@ -18,6 +18,7 @@ struct ConversionOptions {
     bool FrameRedZone = false;
     bool FrameShrinkWrapped = false;
     bool PreciseRedZoneGuard = false;
+    bool PreciseRedZoneKills = false;
     bool FramePointerAllocation = false;
     bool SuspectFramePointerLeaves = false;
     bool FramePointerStubJumps = false;

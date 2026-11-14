@@ -134,7 +134,7 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
         if (report.WidenedPrologues != 0 || report.WidenedExits != 0) { std::ostringstream message; message << "Red-zone framing: " << report.WidenedPrologues << " prologues widened over the instructions after them and " << report.WidenedExits << " exits over the instructions before them, as they were shorter than a jump (" << report.WidenedOperands << " rsp operands moved into their stubs)\n"; inputProgress.Message(message.str()); }
         for (const auto& [reason, count] : report.Skipped) { std::ostringstream message; message << "Red-zone framing: skipped " << count << ": " << reason << '\n'; inputProgress.Message(message.str()); }
         RedZoneGuardStats guard;
-        redZoneTable = RedZoneGuardTable(sourceBytes, headers, trampolines, &report, options.PreciseRedZoneGuard, &guard);
+        redZoneTable = RedZoneGuardTable(sourceBytes, headers, trampolines, &report, options.PreciseRedZoneGuard, &guard, false, false, false, options.PreciseRedZoneKills);
         if (options.PreciseRedZoneGuard) { std::ostringstream message; message << "Red-zone guard: " << guard.LeavesWithDeadCode << " of " << guard.Leaves << " unframed leaves have code where nothing below RSP is read again; " << guard.DeadBytes << " of " << guard.LeafBytes << " bytes left out of the guard table\n"; inputProgress.Message(message.str()); }
         trampolines.insert(trampolines.end(), std::make_move_iterator(framed.begin()), std::make_move_iterator(framed.end()));
     }

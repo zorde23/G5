@@ -38,7 +38,7 @@ void AddUncovered(const std::vector<std::uint8_t>& bytes, const Domain::ProgramH
 
 }
 
-std::string RedZoneGuardTable(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::vector<Codegen::TrampolineSite>& existing, const Codegen::RedZoneFrameReport* framed, const bool precise, RedZoneGuardStats* stats, const bool countFramePointerAllocation, const bool suspectFramePointerLeaves, const bool stubJumpsStayInBody) {
+std::string RedZoneGuardTable(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::vector<Codegen::TrampolineSite>& existing, const Codegen::RedZoneFrameReport* framed, const bool precise, RedZoneGuardStats* stats, const bool countFramePointerAllocation, const bool suspectFramePointerLeaves, const bool stubJumpsStayInBody, const bool killStores) {
     std::vector<Domain::ProgramHeader> codeSegments;
     std::uint64_t firstAddress = std::numeric_limits<std::uint64_t>::max();
     for (const auto& header : headers) {
@@ -72,7 +72,7 @@ std::string RedZoneGuardTable(const std::vector<std::uint8_t>& bytes, const std:
     if (precise) {
         std::vector<Codegen::RedZoneFunction> leaves;
         for (const auto& leaf : listed) leaves.push_back({leaf.Begin, leaf.End});
-        dead = Codegen::FindRedZoneDeadRanges(bytes, codeSegments, leaves);
+        dead = Codegen::FindRedZoneDeadRanges(bytes, codeSegments, leaves, killStores);
     }
     for (std::size_t index = 0; index < listed.size(); ++index) {
         auto cursor = listed[index].Begin;
