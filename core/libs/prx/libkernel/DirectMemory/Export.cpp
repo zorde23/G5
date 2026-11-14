@@ -6,6 +6,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/AppMetadata/include/ParamJsonParser.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
@@ -800,31 +801,48 @@ int APS5_VABI sceKernelMunlockall_nid_postfix() {
 extern "C" {
 
 int KytyGpuMapDriverMemory_nid_no_patch(std::uint64_t address, std::uint64_t bytes, std::int64_t* physical) {
-    int64_t start = -1;
     try {
-        if (const int result = sceKernelAllocateDirectMemory(0, static_cast<int64_t>(sceKernelGetDirectMemorySize()), bytes, bytes, 12, &start); result != 0) return result;
         void* mapped = reinterpret_cast<void*>(address);
-        if (const int result = sceKernelMapNamedDirectMemory(&mapped, bytes, 0x33, 0x10, start, bytes, "SceAgcDriver"); result != 0 || mapped != reinterpret_cast<void*>(address)) {
-            sceKernelReleaseDirectMemory(start, bytes);
-            return result != 0 ? result : -1;
+#ifdef _WIN32
+        GuestArena::GuestArenaCommit_nid_postfix(mapped, bytes, PAGE_READWRITE, bytes);
+#else
+        mapped = mmap(mapped, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (mapped != reinterpret_cast<void*>(address)) {
+            if (mapped != MAP_FAILED) munmap(mapped, bytes);
+            return -1;
         }
-        *physical = start;
+#endif
+        try {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(mapped, bytes, true, true, true);
+        } catch (...) {
+#ifdef _WIN32
+            GuestArena::GuestArenaReset_nid_postfix(mapped, bytes);
+#else
+            munmap(mapped, bytes);
+#endif
+            throw;
+        }
+        *physical = static_cast<std::int64_t>(address);
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[kyty-gpu] the driver memory at 0x%llx cannot be mapped: %s\n", static_cast<unsigned long long>(address), error.what());
-        if (start >= 0) {
-            try {
-                sceKernelReleaseDirectMemory(start, bytes);
-            } catch (const std::exception&) {
-            }
-        }
         return -1;
     }
 }
 
 int KytyGpuReleaseDriverMemory_nid_no_patch(std::int64_t physical, std::uint64_t bytes) {
     try {
-        return sceKernelReleaseDirectMemory(physical, bytes);
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(reinterpret_cast<void*>(physical));
+        }
+#ifdef _WIN32
+        GuestArena::GuestArenaReset_nid_postfix(reinterpret_cast<void*>(physical), bytes);
+#else
+        munmap(reinterpret_cast<void*>(physical), bytes);
+#endif
+        return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[kyty-gpu] the driver memory cannot be released: %s\n", error.what());
         return -1;

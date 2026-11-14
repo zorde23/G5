@@ -53,6 +53,8 @@ int main() {
         *reinterpret_cast<volatile std::uint32_t*>(driver) = 0x12345678;
         Require(*reinterpret_cast<volatile std::uint32_t*>(driver) == 0x12345678, "the driver memory does not hold a store");
         Require(KytyGpuReleaseDriverMemory_nid_no_patch(physical, 0x200000) == 0, "the driver memory was not released");
+        Require(KytyGpuMapDriverMemory_nid_no_patch(driver, 0x200000, &physical) == 0, "the driver memory could not be mapped again after its release");
+        Require(KytyGpuReleaseDriverMemory_nid_no_patch(physical, 0x200000) == 0, "the driver memory was not released the second time");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "kyty events: %s\n", error.what());
         return 1;
