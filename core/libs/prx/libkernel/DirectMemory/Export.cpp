@@ -800,8 +800,8 @@ int APS5_VABI sceKernelMunlockall_nid_postfix() {
 extern "C" {
 
 int KytyGpuMapDriverMemory_nid_no_patch(std::uint64_t address, std::uint64_t bytes, std::int64_t* physical) {
+    int64_t start = -1;
     try {
-        int64_t start = -1;
         if (const int result = sceKernelAllocateDirectMemory(0, static_cast<int64_t>(sceKernelGetDirectMemorySize()), bytes, bytes, 12, &start); result != 0) return result;
         void* mapped = reinterpret_cast<void*>(address);
         if (const int result = sceKernelMapNamedDirectMemory(&mapped, bytes, 0x33, 0x10, start, bytes, "SceAgcDriver"); result != 0 || mapped != reinterpret_cast<void*>(address)) {
@@ -812,6 +812,12 @@ int KytyGpuMapDriverMemory_nid_no_patch(std::uint64_t address, std::uint64_t byt
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[kyty-gpu] the driver memory at 0x%llx cannot be mapped: %s\n", static_cast<unsigned long long>(address), error.what());
+        if (start >= 0) {
+            try {
+                sceKernelReleaseDirectMemory(start, bytes);
+            } catch (const std::exception&) {
+            }
+        }
         return -1;
     }
 }
