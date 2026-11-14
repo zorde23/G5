@@ -104,6 +104,7 @@ inline constexpr std::size_t DonationPageBytes = 16 * 1024;
 bool GuestArenaDonate_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 void GuestArenaWithdraw_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 bool GuestArenaDonated_nid_no_patch(std::uintptr_t address);
+bool GuestArenaDonatedAny_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 
 }
 

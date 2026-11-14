@@ -56,6 +56,15 @@ void GuestArenaWithdraw_nid_no_patch(std::uintptr_t address, std::size_t bytes) 
     }
 }
 
+bool GuestArenaDonatedAny_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    if (bytes == 0 || address >= DonationEnd) return false;
+    const auto end = bytes > DonationEnd - address ? DonationEnd : address + bytes;
+    for (auto page = address / DonationPageBytes; page <= (end - 1) / DonationPageBytes; ++page) {
+        if (GuestArenaDonated_nid_no_patch(page * DonationPageBytes)) return true;
+    }
+    return false;
+}
+
 bool GuestArenaDonated_nid_no_patch(std::uintptr_t address) {
     if (address >= DonationEnd) return false;
     const auto* entry = Page(address, false);

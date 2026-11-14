@@ -17,12 +17,30 @@ void Require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+struct Counts {
+    std::uint64_t maps = 0, unmaps = 0, unmapsAfterTheSystem = 0, protects = 0, sectionsClosed = 0;
+};
+
+Counts FakeCounts() {
+    Counts counts;
+    const auto module = GetModuleHandleA("kyty_gpu_fake.dll");
+    if (module == nullptr) return counts;
+    const auto read = reinterpret_cast<void (*)(std::uint64_t*)>(reinterpret_cast<void*>(GetProcAddress(module, "kyty_fake_counts")));
+    std::uint64_t values[5]{};
+    read(values);
+    return Counts{values[0], values[1], values[2], values[3], values[4]};
+}
+
+void MapDirect(void* block, HANDLE section) {
+    GuestArena::GuestArenaMapDirect_nid_postfix(block, BlockBytes, section, 0, PAGE_READWRITE);
+}
+
 void Check(bool kyty) {
     auto* block = GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, BlockBytes);
     const auto address = reinterpret_cast<std::uintptr_t>(block);
     const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, BlockBytes, nullptr);
     Require(section != nullptr, "cannot create a section");
-    GuestArena::GuestArenaMapDirect_nid_postfix(block, BlockBytes, section, 0, PAGE_READWRITE);
+    MapDirect(block, section);
     std::uintptr_t start = 0, end = 0;
     const bool resident = GuestArena::GuestArenaResidentSpan_nid_postfix(address, BlockBytes, &start, &end);
     Require(resident != kyty, kyty ? "a direct mapping with the Kyty GPU is a resident run" : "a direct mapping without the Kyty GPU is not resident");
@@ -31,8 +49,23 @@ void Check(bool kyty) {
     }
     *static_cast<volatile std::uint32_t*>(block) = 0x5a5a5a5a;
     Require(*static_cast<volatile std::uint32_t*>(block) == 0x5a5a5a5a, "the direct mapping does not hold a store");
+    GuestArena::GuestArenaSetProtection_nid_postfix(address, BlockBytes, PAGE_READONLY);
+    GuestArena::GuestArenaSetProtection_nid_postfix(address, BlockBytes, PAGE_READWRITE);
+    GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
+    Require(GuestArena::GuestArenaDonated_nid_no_patch(address) == kyty, "a commit over a direct mapping (the mprotect path) changed its donation");
+    MapDirect(block, section);
+    Require(GuestArena::GuestArenaDonated_nid_no_patch(address) == kyty, "a direct mapping over a direct mapping lost its donation");
     GuestArena::GuestArenaReset_nid_postfix(block, BlockBytes);
     Require(!GuestArena::GuestArenaDonated_nid_no_patch(address), "a reset direct mapping is still donated");
+    const auto counts = FakeCounts();
+    if (kyty) {
+        Require(counts.maps == 2, "Kyty was not told about each of the 2 direct mappings");
+        Require(counts.unmaps == 2, "Kyty was not told about each of the 2 times a donated range left (mapped over, reset)");
+        Require(counts.unmapsAfterTheSystem == 0, "Kyty was told about an unmap after the system had unmapped the range");
+        Require(counts.protects == 3, "Kyty was not told about each protection change of the donated range (2 protects and the commit)");
+    } else {
+        Require(GetModuleHandleA("kyty_gpu_fake.dll") == nullptr, "the Kyty GPU DLL was loaded without APS5_KYTY_GPU");
+    }
     CloseHandle(section);
 }
 

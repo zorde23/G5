@@ -429,8 +429,17 @@ void GuestArenaMarkUsed_nid_postfix(const void* pointer, std::size_t bytes) {
     Arena::Get().MarkUsed(pointer, bytes);
 }
 
+namespace {
+void leaveKyty(std::uintptr_t address, std::size_t bytes) {
+    if (!KytyGpuEnabled() || !GuestArenaDonatedAny_nid_no_patch(address, bytes)) return;
+    KytyGpuOnUnmap(address, bytes);
+    GuestArenaWithdraw_nid_no_patch(address, bytes);
+}
+}
+
 void GuestArenaRelease_nid_postfix(const void* pointer, std::size_t bytes) {
     const CommitEpochNote note(pointer, bytes, CommitEpochOrigin::Release);
+    leaveKyty(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     Arena::Get().Release(pointer, bytes);
 }
 
@@ -536,6 +545,7 @@ std::invalid_argument OutsideArena(const char* operation, const void* pointer, s
 void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
     const CommitEpochNote note(reinterpret_cast<const void*>(address), bytes, CommitEpochOrigin::SetProtection);
     WindowsMappings::Get().SetProtection(address, bytes, protection);
+    if (KytyGpuEnabled() && GuestArenaDonatedAny_nid_no_patch(address, bytes)) KytyGpuOnProtect(address, bytes, protection);
     noteAccess(reinterpret_cast<const void*>(address), bytes);
 }
 
@@ -590,6 +600,7 @@ void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_
     const CommitEpochNote note(pointer, bytes, CommitEpochOrigin::Commit);
     const auto generation = commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
     const auto created = WindowsMappings::Get().Commit(pointer, bytes, protection, granule, Arena::Get().WriteWatched());
+    if (KytyGpuEnabled() && GuestArenaDonatedAny_nid_no_patch(reinterpret_cast<std::uintptr_t>(pointer), bytes)) KytyGpuOnProtect(reinterpret_cast<std::uintptr_t>(pointer), bytes, protection);
     if (const auto callback = privateMappingObserver.load(std::memory_order_acquire)) {
         for (const auto& [address, size] : created) callback(address, size, generation);
     }
@@ -599,13 +610,14 @@ void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("reset", pointer, bytes);
     const CommitEpochNote note(pointer, bytes, CommitEpochOrigin::Reset);
+    leaveKyty(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     WindowsMappings::Get().Reset(pointer, bytes);
-    GuestArenaWithdraw_nid_no_patch(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
 void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("shared mapping", pointer, bytes);
     const CommitEpochNote note(pointer, bytes, CommitEpochOrigin::Map);
+    leaveKyty(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), false);
     noteAccess(pointer, bytes);
 }
@@ -616,9 +628,13 @@ void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* sec
     const auto generation = commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
     std::vector<std::pair<std::uintptr_t, std::size_t>> created;
     std::exception_ptr failure;
+    leaveKyty(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     try {
         WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), !KytyGpuEnabled(), PAGE_EXECUTE_READWRITE, SIZE_MAX, &created);
-        if (KytyGpuEnabled() && !GuestArenaDonate_nid_no_patch(reinterpret_cast<std::uintptr_t>(pointer), bytes)) throw std::runtime_error("the Kyty GPU donation table cannot hold a direct memory mapping");
+        if (KytyGpuEnabled()) {
+            if (!GuestArenaDonate_nid_no_patch(reinterpret_cast<std::uintptr_t>(pointer), bytes)) throw std::runtime_error("the Kyty GPU donation table cannot hold a direct memory mapping");
+            KytyGpuOnMap(reinterpret_cast<std::uintptr_t>(pointer), bytes, protection, section, offset);
+        }
     } catch (...) {
         failure = std::current_exception();
     }
@@ -637,6 +653,7 @@ void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* sec
 void GuestArenaMapFile_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection, std::uint32_t viewProtection, std::size_t sectionBytes) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("file mapping", pointer, bytes);
     const CommitEpochNote note(pointer, bytes, CommitEpochOrigin::MapFile);
+    leaveKyty(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), false, viewProtection, sectionBytes);
 }
 
@@ -673,10 +690,12 @@ void GuestArenaTakeUnreportedPages_nid_no_patch(std::uintptr_t address, std::siz
 }
 
 void GuestArenaForgetSection_nid_postfix(void* section) {
+    KytyGpuOnSectionClosed(section);
     WindowsMappings::Get().ForgetSection(section);
 }
 
 bool GuestArenaForgetReusableSection_nid_no_patch(void* section) {
+    KytyGpuOnSectionClosed(section);
     return WindowsMappings::Get().ForgetSection(section);
 }
 #endif
