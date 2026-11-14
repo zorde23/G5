@@ -86,6 +86,7 @@ void GuestAllocationsInvalidateFrom_nid_no_patch(std::uintptr_t address, std::si
 // nothing to wait for counts against the same bound as a plain spin). Without one the mutation spins
 // until the lease is dropped by another thread.
 void GuestAllocationsSetPinWaiter_nid_postfix(bool (*callback)(std::uintptr_t address, std::size_t bytes));
+void GuestAllocationsPinnedWaits_nid_no_patch(std::uint64_t* nanoseconds, std::uint64_t* waits, std::uint64_t* rounds);
 void GuestAllocationsSetGpuMapObserver_nid_postfix(void (*callback)(const Mapped& ranges, std::uint64_t generation));
 void GuestAllocationsSetUnmapObserver_nid_postfix(void (*callback)(std::uintptr_t address, std::size_t bytes));
 void GuestAllocationsNoteGpuMapping_nid_postfix(void* mutation, const void* pointer, std::size_t bytes);

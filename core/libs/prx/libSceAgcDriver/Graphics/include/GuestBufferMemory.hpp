@@ -219,6 +219,7 @@ struct LeaseStats {
     std::uint64_t cacheDrops = 0;
     double contentionMs = 0;
     double contentionGpuMs = 0;
+    std::array<double, 7> contentionPhaseMs{};
     std::uint64_t contentionUnlocked = 0;
 };
 LeaseStats LeaseCounters();

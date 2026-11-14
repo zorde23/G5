@@ -70,6 +70,7 @@ void renewBacking(std::uintptr_t address, std::size_t bytes) {
 std::atomic<std::uint64_t> generation{1};
 std::atomic<void (*)(std::uintptr_t, std::size_t)> invalidator{nullptr};
 std::atomic<bool (*)(std::uintptr_t, std::size_t)> pinWaiter{nullptr};
+std::atomic<std::uint64_t> pinnedWaitNs{0}, pinnedWaits{0}, pinnedRounds{0};
 std::atomic<void (*)(const Mapped&, std::uint64_t)> gpuMapObserver{nullptr};
 std::atomic<void (*)(std::uintptr_t, std::size_t)> unmapObserver{nullptr};
 std::atomic<std::uint32_t> gpuMapObserverCalls{0};
@@ -212,6 +213,12 @@ void GuestAllocationsSetGpuMapObserver_nid_postfix(void (*callback)(const Mapped
 
 void GuestAllocationsNoteGpuMapping_nid_postfix(void* mutation, const void* pointer, std::size_t bytes) {
     if (mutation != nullptr && bytes != 0) static_cast<MutationState*>(mutation)->gpuMapped.emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+}
+
+void GuestAllocationsPinnedWaits_nid_no_patch(std::uint64_t* nanoseconds, std::uint64_t* waits, std::uint64_t* rounds) {
+    *nanoseconds = pinnedWaitNs.load(std::memory_order_relaxed);
+    *waits = pinnedWaits.load(std::memory_order_relaxed);
+    *rounds = pinnedRounds.load(std::memory_order_relaxed);
 }
 
 void GuestAllocationsSetPinWaiter_nid_postfix(bool (*callback)(std::uintptr_t, std::size_t)) {
@@ -436,6 +443,8 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
     auto* state = static_cast<MutationState*>(mutation);
     const auto deadline = std::chrono::steady_clock::now() + pinWait();
     int syncedRounds = 0;
+    std::uint64_t rounds = 0;
+    std::chrono::steady_clock::time_point pinnedSince{};
     for (;;) {
         registry().readableLease.reset();
         registry().allLease.reset();
@@ -452,8 +461,14 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
         }
         if (!pinned) {
             if (state != nullptr && bytes != 0) state->unpinned.emplace_back(address, bytes);
+            if (rounds != 0) {
+                pinnedWaitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pinnedSince).count()), std::memory_order_relaxed);
+                pinnedWaits.fetch_add(1, std::memory_order_relaxed);
+                pinnedRounds.fetch_add(rounds, std::memory_order_relaxed);
+            }
             return;
         }
+        if (rounds++ == 0) pinnedSince = std::chrono::steady_clock::now();
         if (std::chrono::steady_clock::now() >= deadline) PinnedFailure(address, bytes, ("waited " + std::to_string(pinWait().count()) + " ms for the lease (APS5_PIN_WAIT_MS)").c_str());
         const auto waiter = pinWaiter.load(std::memory_order_acquire);
         bool progressed = false;

@@ -3420,6 +3420,13 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
     bool droppedAddressSpace = false;
     double gpuWaitMs = 0;
     bool waitedUnlocked = false;
+    std::array<double, 7> phaseMs{};
+    auto lapAt = start;
+    const auto lap = [&](std::size_t phase) {
+        const auto now = std::chrono::steady_clock::now();
+        phaseMs[phase] += std::chrono::duration<double, std::milli>(now - lapAt).count();
+        lapAt = now;
+    };
     // A range pinned only by the cached address space is released by dropping the cache's
     // reference: no GPU wait, no device lock (the mutating thread may be a driver thread holding
     // it). The registry rescans; a range still pinned by a build or a batch holding the space comes
@@ -3447,6 +3454,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
             return true;
         }
     }
+    lap(0);
     if (Recorder::InCompletion()) throw std::runtime_error("guest allocation mutation cannot wait for an active GPU completion");
     if (GuestMemory::GpuMutex().HeldByThisThread()) {
         auto* recorder = Recorder::Active();
@@ -3456,10 +3464,13 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
             synced = true;
             drained = true;
         }
+        lap(2);
         if (recorder != nullptr) recorder->FlushDeferredReleases();
+        lap(3);
         const auto end = static_cast<std::uint64_t>(address) + bytes;
         auto& imports = Imports();
         if (releaseParkedImports(imports, address, end)) retiredImport = true;
+        lap(4);
         const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
         {
             std::lock_guard importsLock(imports.mutex);
@@ -3475,9 +3486,11 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
                 retiredImport = true;
             }
         }
+        lap(5);
 #ifdef _WIN32
         if (releaseSettleRetired(imports, address, end)) retiredImport = true;
 #endif
+        lap(6);
         if (retiredImport && recorder != nullptr && !recorder->Idle()) {
             Recorder::CountSync(4);
             recorder->Sync();
@@ -3485,9 +3498,11 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
             drained = true;
         }
         if (retiredImport && recorder != nullptr) recorder->FlushDeferredReleases();
+        lap(2);
     } else {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Pin);
         std::lock_guard lock(GuestMemory::GpuMutex());
+        lap(1);
         auto& state = Leases();
         auto* recorder = Recorder::Active();
         const auto target = state.newestLeaseSerial;
@@ -3513,11 +3528,14 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
         } else {
             std::this_thread::yield();
         }
+        lap(2);
         if (recorder != nullptr) recorder->FlushDeferredReleases();
+        lap(3);
 
         const auto end = static_cast<std::uint64_t>(address) + bytes;
         auto& imports = Imports();
         if (releaseParkedImports(imports, address, end)) retiredImport = true;
+        lap(4);
         bool overlapsImport = false;
         {
             std::lock_guard importsLock(imports.mutex);
@@ -3557,9 +3575,11 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
                 drained = true;
             }
         }
+        lap(5);
 #ifdef _WIN32
         if (releaseSettleRetired(imports, address, end)) retiredImport = true;
 #endif
+        lap(6);
     }
     auto& state = Leases();
     std::lock_guard lock(state.mutex);
@@ -3569,6 +3589,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
     if (drained) ++state.stats.contentionDrains;
     state.stats.contentionGpuMs += gpuWaitMs;
     if (waitedUnlocked) ++state.stats.contentionUnlocked;
+    for (std::size_t phase = 0; phase < phaseMs.size(); ++phase) state.stats.contentionPhaseMs[phase] += phaseMs[phase];
     state.stats.contentionMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     return synced || retiredImport;
 }
@@ -3614,7 +3635,9 @@ void CountLeaseOutcome(bool synced, std::uint64_t batchSerial) {
     const auto& stats = state.stats;
     const auto table = BdaResources::TableCacheCounters();
     const auto& snapshots = Snapshots();
-    AgcDriver::ProfilePrint_nid_no_patch("[address-sync] leases: %llu released at completion, %llu synced at once; %llu pin-contention waits by guest threads (%llu finished the lease batch, %llu drained the recorder, %llu cache-only drops) %.1f s, of which in the lease batch finish or recorder sync %.1f s (%llu of them waited for the GPU without the mutex); BDA table cache %llu hits / %llu misses (%zu tables held); snapshot compares: %llu skipped (live-backed region), %llu made\n", static_cast<unsigned long long>(stats.deferred), static_cast<unsigned long long>(stats.synced), static_cast<unsigned long long>(stats.contentionWaits), static_cast<unsigned long long>(stats.contentionSyncs), static_cast<unsigned long long>(stats.contentionDrains), static_cast<unsigned long long>(stats.cacheDrops), stats.contentionMs / 1000, stats.contentionGpuMs / 1000, static_cast<unsigned long long>(stats.contentionUnlocked), static_cast<unsigned long long>(table.hits), static_cast<unsigned long long>(table.misses), table.held, static_cast<unsigned long long>(snapshots.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.checked.load(std::memory_order_relaxed)));
+    std::uint64_t pinnedNs = 0, pinnedWaits = 0, pinnedRounds = 0;
+    GuestAllocations::GuestAllocationsPinnedWaits_nid_no_patch(&pinnedNs, &pinnedWaits, &pinnedRounds);
+    AgcDriver::ProfilePrint_nid_no_patch("[address-sync] leases: %llu released at completion, %llu synced at once; %llu pin-contention waits by guest threads (%llu finished the lease batch, %llu drained the recorder, %llu cache-only drops) %.1f s, of which in the lease batch finish or recorder sync %.1f s (%llu of them waited for the GPU without the mutex); BDA table cache %llu hits / %llu misses (%zu tables held); snapshot compares: %llu skipped (live-backed region), %llu made; pin waiter phases (s): unresolved address space drops %.1f, GPU mutex %.1f, finish or sync %.1f, deferred releases %.1f, parked imports %.1f, imports (with the syncs before and after a retire under the lock) %.1f, settle %.1f; guest mutations that waited for a pin %llu, %.1f s, %llu rounds\n", static_cast<unsigned long long>(stats.deferred), static_cast<unsigned long long>(stats.synced), static_cast<unsigned long long>(stats.contentionWaits), static_cast<unsigned long long>(stats.contentionSyncs), static_cast<unsigned long long>(stats.contentionDrains), static_cast<unsigned long long>(stats.cacheDrops), stats.contentionMs / 1000, stats.contentionGpuMs / 1000, static_cast<unsigned long long>(stats.contentionUnlocked), static_cast<unsigned long long>(table.hits), static_cast<unsigned long long>(table.misses), table.held, static_cast<unsigned long long>(snapshots.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.checked.load(std::memory_order_relaxed)), stats.contentionPhaseMs[0] / 1000, stats.contentionPhaseMs[1] / 1000, stats.contentionPhaseMs[2] / 1000, stats.contentionPhaseMs[3] / 1000, stats.contentionPhaseMs[4] / 1000, stats.contentionPhaseMs[5] / 1000, stats.contentionPhaseMs[6] / 1000, static_cast<unsigned long long>(pinnedWaits), static_cast<double>(pinnedNs) / 1e9, static_cast<unsigned long long>(pinnedRounds));
 }
 
 void FinishLeaseWork() {
