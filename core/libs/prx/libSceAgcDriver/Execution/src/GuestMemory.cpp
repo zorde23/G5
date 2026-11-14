@@ -941,7 +941,7 @@ void simulateCommitEpoch(std::uint64_t address, std::size_t bytes, bool writable
         if (bucketHit) simulator.bucketHits.fetch_add(1, std::memory_order_relaxed);
         if (keyHit) simulator.keyHits.fetch_add(1, std::memory_order_relaxed);
         keep = globalHit && keyHit;
-        if ((globalHit || bucketHit) && !sameCommitment(stored->result, fresh)) {
+        if ((globalHit || bucketHit) && stored->access == access && stored->generation == generation && !sameCommitment(stored->result, fresh)) {
             keep = false;
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             const auto retried = describe();
@@ -2633,6 +2633,7 @@ void EndHold() {
     auto& stats = LockStats();
     const auto heldNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - stats.holdStart).count();
     if (stats.holdSite == static_cast<std::size_t>(GpuLockSite::Other) && stats.holdCaller != nullptr) OtherHoldCallers().Add(stats.holdCaller, static_cast<std::uint64_t>(heldNs));
+    stats.holdCaller = nullptr;
     const auto heldMs = static_cast<double>(heldNs) / 1e6;
     ++stats.siteHolds[stats.holdSite];
     stats.siteHeldMs[stats.holdSite] += heldMs;
