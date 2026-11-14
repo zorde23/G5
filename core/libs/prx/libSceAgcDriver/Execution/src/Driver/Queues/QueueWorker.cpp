@@ -278,9 +278,11 @@ void Driver::run(std::uint32_t id) noexcept {
                 if (profile && submission.enqueuedAt != std::chrono::steady_clock::time_point{}) costs.dequeueNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submission.enqueuedAt).count());
             }
             const bool phased = id == 0 && ThreadPhasesProfiled();
+            if (phased) ThreadWaits() = {};
             const auto executeStart = phased ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             execute(submission);
             const auto executeEnd = phased ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (phased) NoteWorkerWaits(ThreadWaits());
             if (submission.progress && submission.rewindTail == nullptr && !completionDeferred()) submitOpenWork(submission.progress);
             if (traceGpu) std::fprintf(stderr, "[gpu] %.1f done serial=%llu queue=0x%x\n", TraceMs(), static_cast<unsigned long long>(submission.serial), id);
             const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

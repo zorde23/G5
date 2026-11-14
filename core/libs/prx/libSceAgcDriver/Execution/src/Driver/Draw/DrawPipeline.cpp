@@ -217,6 +217,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
             std::uint32_t& count;
             ~Waiting() { --count; }
         } waiting{fullWaiters};
+        const ThreadWaitTimer slotWait(ThreadWait::FinisherSlot);
         waitCounted(idle, lock, idleNotifies, [&] { return jobs.size() <= resume; });
     }
     jobs.push_back(std::move(job));
@@ -260,6 +261,22 @@ void NoteThreadPhases(bool finisher, std::uint64_t waitNs, std::uint64_t workNs,
     if (previous == 0) return;
     const double wall = static_cast<double>(nowNs - previous) / 1e6;
     AgcDriver::ProfilePrint_nid_no_patch(finisher ? "[f-phases] 10 s (draw finisher threads, summed), ms: wall %.1f per thread; waiting for a job %.1f, job bodies %.1f (%llu jobs), bookkeeping after a job %.1f\n" : "[w-phases] 10 s (queue 0 worker), ms: wall %.1f; waiting for a submission %.1f, executing %.1f (%llu submissions), completion and the rest after it %.1f\n", wall, wait, work, static_cast<unsigned long long>(items), after);
+}
+
+std::array<std::uint64_t, static_cast<std::size_t>(ThreadWait::Count)>& ThreadWaits() {
+    thread_local std::array<std::uint64_t, static_cast<std::size_t>(ThreadWait::Count)> waits{};
+    return waits;
+}
+
+void NoteWorkerWaits(const std::array<std::uint64_t, static_cast<std::size_t>(ThreadWait::Count)>& waits) {
+    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ThreadWait::Count)> totals{};
+    static std::atomic<std::int64_t> reportedAt{0};
+    for (std::size_t kind = 0; kind < waits.size(); ++kind) totals[kind].fetch_add(waits[kind], std::memory_order_relaxed);
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    const auto ms = [](std::atomic<std::uint64_t>& value) { return static_cast<double>(value.exchange(0, std::memory_order_relaxed)) / 1e6; };
+    const double guest = ms(totals[0]), rendering = ms(totals[1]), slot = ms(totals[2]);
+    AgcDriver::ProfilePrint_nid_no_patch("[w-waits] 10 s (queue 0 worker, inside executing), ms: guest memory waits %.1f, rendering waits %.1f, waiting for a draw finisher slot %.1f\n", guest, rendering, slot);
 }
 
 void DrawFinisher::run() {

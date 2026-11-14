@@ -138,6 +138,21 @@ private:
 
 bool ThreadPhasesProfiled();
 void NoteThreadPhases(bool finisher, std::uint64_t waitNs, std::uint64_t workNs, std::uint64_t afterNs);
+enum class ThreadWait : std::size_t { GuestMemory, Rendering, FinisherSlot, Count };
+std::array<std::uint64_t, static_cast<std::size_t>(ThreadWait::Count)>& ThreadWaits();
+void NoteWorkerWaits(const std::array<std::uint64_t, static_cast<std::size_t>(ThreadWait::Count)>& waits);
+
+class ThreadWaitTimer {
+public:
+    explicit ThreadWaitTimer(ThreadWait kind) : kind(kind), start(ThreadPhasesProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    ~ThreadWaitTimer() {
+        if (start != std::chrono::steady_clock::time_point{}) ThreadWaits()[static_cast<std::size_t>(kind)] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    }
+
+private:
+    ThreadWait kind;
+    std::chrono::steady_clock::time_point start;
+};
 
 class DrawFinisher {
 public:
