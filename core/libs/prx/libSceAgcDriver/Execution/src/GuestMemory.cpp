@@ -107,6 +107,7 @@ std::atomic<std::uint64_t> collectDirtyRuns{0};
 #endif
 std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
+thread_local std::uint64_t* trackerWaitSink = nullptr;
 std::uintptr_t PagesBase();
 std::size_t PagesSize();
 std::uintptr_t ImagePagesBase();
@@ -1493,15 +1494,18 @@ class TrackerLock {
 public:
     explicit TrackerLock(WriteTracker& tracker) : tracker(tracker), lock(tracker.mutex, std::defer_lock) {
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-        if (!profile) {
+        auto* sink = trackerWaitSink;
+        if (!profile && sink == nullptr) {
             lock.lock();
             return;
         }
         if (!lock.try_lock()) {
-            trackerWaits.fetch_add(1, std::memory_order_relaxed);
+            if (profile) trackerWaits.fetch_add(1, std::memory_order_relaxed);
+            const auto start = sink != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             lock.lock();
+            if (sink != nullptr) *sink += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
         }
-        trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
+        if (profile) trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
     }
     ~TrackerLock() {
         if (lock.owns_lock()) publish();
@@ -2484,6 +2488,9 @@ constexpr std::size_t HolderColumns = 12;
 constexpr std::uint32_t UnassignedHolder = 0xfffffffeu;
 constexpr std::uint32_t PresenterHolderTag = 0xfffffffdu;
 constexpr int PresenterColumn = 1;
+constexpr std::uint32_t CommitterHolderTag = 0xfffffffcu;
+constexpr std::uint32_t FinisherHolderTag = 0xfffffffbu;
+constexpr std::array<double, 5> WaitBucketMs{0.01, 0.1, 1, 10, 100};
 using HolderMatrixValues = std::array<std::array<std::uint64_t, GpuLockSiteCount>, HolderColumns>;
 struct HolderMatrix {
     std::array<std::atomic<std::uint32_t>, HolderColumns> tags{};
@@ -2544,6 +2551,7 @@ struct GpuLockStats {
     std::uint64_t triesFailed = 0;
     std::uint64_t lockedGpuWaits = 0;
     double lockedGpuWaitMs = 0;
+    std::array<std::uint64_t, WaitBucketMs.size() + 1> waitBuckets{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
@@ -2553,7 +2561,7 @@ GpuLockStats& LockStats() {
 }
 
 bool GpuLockProfiled() {
-    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr && std::getenv("APS5_NO_LOCK_PROFILE") == nullptr;
+    static const bool profiled = (std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_LOCK_PROFILE") != nullptr) && std::getenv("APS5_NO_LOCK_PROFILE") == nullptr;
     return profiled;
 }
 
@@ -2585,6 +2593,8 @@ const char* HolderName(std::size_t column, char* text, std::size_t size) {
     const auto tag = Holders().tags[column].load(std::memory_order_relaxed);
     if (tag == 0xffffffffu) std::snprintf(text, size, "untagged");
     else if (tag == PresenterHolderTag) std::snprintf(text, size, "presenter");
+    else if (tag == CommitterHolderTag) std::snprintf(text, size, "committer");
+    else if (tag == FinisherHolderTag) std::snprintf(text, size, "finishers");
     else std::snprintf(text, size, "q0x%x", tag);
     return text;
 }
@@ -2706,6 +2716,10 @@ namespace {
 thread_local std::uint64_t* gpuWaitSink = nullptr;
 }
 
+std::uint64_t* SetTrackerWaitSink(std::uint64_t* sink) {
+    return std::exchange(trackerWaitSink, sink);
+}
+
 std::uint64_t* SetGpuLockWaitSink(std::uint64_t* sink) {
     return std::exchange(gpuWaitSink, sink);
 }
@@ -2765,6 +2779,7 @@ void GpuMutexType::lock() {
         ++stats.waits;
         stats.siteWaitedMs[site] += waitedMs;
         ++stats.siteWaits[site];
+        ++stats.waitBuckets[static_cast<std::size_t>(std::upper_bound(WaitBucketMs.begin(), WaitBucketMs.end(), waitedMs) - WaitBucketMs.begin())];
         if (now - stats.lastReport < std::chrono::seconds(10)) return;
         // The line is printed from inside a contended acquisition, so a thread that rarely waits
         // reports a longer span than 10 s: the real interval is printed.
@@ -2798,7 +2813,12 @@ void GpuMutexType::lock() {
         char counts[160];
         std::snprintf(counts, sizeof(counts), "; lock() %llu / try %llu / try failed %llu; locked GPU waits %llu / %.0f ms", static_cast<unsigned long long>(stats.acquisitions), static_cast<unsigned long long>(stats.tries), static_cast<unsigned long long>(stats.triesFailed), static_cast<unsigned long long>(stats.lockedGpuWaits), stats.lockedGpuWaitMs);
         holds += counts;
-        if (stats.tag == 0xffffffffu) AgcDriver::ProfilePrint_nid_no_patch("[lock] %s waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.holderColumn == PresenterColumn ? "presenter" : "untagged thread", stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
+        const auto& buckets = stats.waitBuckets;
+        std::snprintf(counts, sizeof(counts), "; waits by length (<10 us, <100 us, <1 ms, <10 ms, <100 ms, longer): %llu %llu %llu %llu %llu %llu", static_cast<unsigned long long>(buckets[0]), static_cast<unsigned long long>(buckets[1]), static_cast<unsigned long long>(buckets[2]), static_cast<unsigned long long>(buckets[3]), static_cast<unsigned long long>(buckets[4]), static_cast<unsigned long long>(buckets[5]));
+        holds += counts;
+        stats.waitBuckets.fill(0);
+        char holder[24];
+        if (stats.tag == 0xffffffffu) AgcDriver::ProfilePrint_nid_no_patch("[lock] %s waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.holderColumn > 0 ? HolderName(static_cast<std::size_t>(stats.holderColumn), holder, sizeof(holder)) : "untagged thread", stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
         else AgcDriver::ProfilePrint_nid_no_patch("[lock] queue 0x%x waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.tag, stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
         stats.waitedMs = 0;
         stats.waits = 0;
@@ -2828,6 +2848,14 @@ void TagGpuLockSite(GpuLockSite site) {
 
 void MarkPresenterThread() {
     LockStats().holderColumn = PresenterColumn;
+}
+
+void MarkCommitterThread() {
+    if (GpuLockProfiled()) LockStats().holderColumn = static_cast<int>(HolderColumnFor(CommitterHolderTag));
+}
+
+void MarkFinisherThread() {
+    if (GpuLockProfiled()) LockStats().holderColumn = static_cast<int>(HolderColumnFor(FinisherHolderTag));
 }
 
 void NoteLockedGpuWait(double ms) {

@@ -1574,6 +1574,7 @@ InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std:
     const auto use = indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
     const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const auto generation = GuestMemory::CollectWrites(address, bytes);
+    if (generation != 0 && RepeatedInputsProfiled()) NoteRepeatedInput(RepeatedInput::IndexRange, (address * 0x9e3779b97f4a7c15ull ^ bytes) * 4 + static_cast<std::uint64_t>(use), generation * 0x100000001b3ull ^ registryGeneration);
     if (generation != 0 && recorder.KnownHighestIndex(address, bytes, use, indices.highest)) {
         indices.reused = true;
         return indices;

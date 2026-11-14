@@ -28,6 +28,10 @@ namespace AgcDriver::Graphics {
 
 class Recorder;
 
+enum class RepeatedInput : std::uint8_t { BdaRegion, ImportSerial, IndexRange, Count };
+bool RepeatedInputsProfiled();
+void NoteRepeatedInput(RepeatedInput kind, std::uint64_t key, std::uint64_t version);
+
 void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
 std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage = false);

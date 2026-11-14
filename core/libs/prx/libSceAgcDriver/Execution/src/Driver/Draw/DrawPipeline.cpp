@@ -332,6 +332,7 @@ struct CommitterLoop {
 
 void DrawFinisher::run() {
     PerformanceTrace::BindThread("draw finisher");
+    GuestMemory::MarkFinisherThread();
     const bool phased = ThreadPhasesProfiled();
     auto loopStart = phased ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (;;) {
@@ -550,6 +551,7 @@ void DrawPipeline::run() {
         ~Unbind() { Graphics::Recorder::UnbindCommitter(); }
     } unbind;
     PerformanceTrace::BindThread("draw committer");
+    GuestMemory::MarkCommitterThread();
     const bool reservedCore = PinCommitterThread();
     StartCommitterSampler();
     CommitterLoop loop;

@@ -4805,6 +4805,7 @@ bool mirrorOverlaps(const Regions& base, std::uint64_t begin, std::uint64_t end)
 
 void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t bytes, bool atomic, bool swept, bool readOnly) {
     validate(address, bytes);
+    if (RepeatedInputsProfiled()) NoteRepeatedInput(RepeatedInput::BdaRegion, (address * 0x9e3779b97f4a7c15ull ^ bytes) * 4 + (atomic ? 2 : 0) + (readOnly ? 1 : 0), GuestAllocations::GuestAllocationsGeneration_nid_postfix());
     const auto begin = address & ~std::uint64_t{3};
     const auto end = begin == address ? address + bytes : (address + bytes + 3) & ~std::uint64_t{3};
     const Region* inside = nullptr;

@@ -200,6 +200,8 @@ void TagGpuLockThread(std::uint32_t queue);
 // The presenter stays untagged (its tag is a queue id to the recorder) but takes its own column
 // of the [lock] holder matrix, apart from the game threads.
 void MarkPresenterThread();
+void MarkCommitterThread();
+void MarkFinisherThread();
 // The queue tag of the calling thread (0xffffffff when untagged), for reports that name the thread.
 std::uint32_t GpuLockThreadTag();
 // Lock sites (APS5_PROFILE_DRAW): a caller names the site of its next lock() so the [lock] line
@@ -212,6 +214,7 @@ std::uint32_t GpuLockThreadTag();
 enum class GpuLockSite : std::uint8_t { Other = 0, Dispatch, Indirect, Draw, Hook, Wait, Label, Flush, Present, Fill, Copy, End, Try, Count };
 void TagGpuLockSite(GpuLockSite site);
 std::uint64_t* SetGpuLockWaitSink(std::uint64_t* sink);
+std::uint64_t* SetTrackerWaitSink(std::uint64_t* sink);
 // A GPU wait (a fence or timeline wait that found its work unfinished) made while the calling
 // thread holds GpuMutex: counted on the thread's [lock] line as 'locked GPU waits' (APS5_PROFILE_DRAW).
 void NoteLockedGpuWait(double ms);

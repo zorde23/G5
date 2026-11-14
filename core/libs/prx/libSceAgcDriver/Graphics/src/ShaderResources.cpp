@@ -3252,11 +3252,52 @@ std::size_t ShaderResources::LookupLogCapacity() {
     return lookupLog().capacity();
 }
 
+bool RepeatedInputsProfiled() {
+    static const bool profiled = std::getenv("APS5_REPEAT_STATS") != nullptr;
+    return profiled;
+}
+
+void NoteRepeatedInput(RepeatedInput kind, std::uint64_t key, std::uint64_t version) {
+    constexpr std::size_t kinds = static_cast<std::size_t>(RepeatedInput::Count);
+    constexpr std::size_t slots = 1024;
+    struct Slot {
+        std::uint64_t key = 0, version = 0;
+    };
+    struct Totals {
+        std::array<std::atomic<std::uint64_t>, kinds> calls{}, sameKey{}, sameVersion{};
+        std::atomic<std::int64_t> reportedAt{0};
+    };
+    static Totals totals;
+    thread_local std::array<std::array<Slot, slots>, kinds> table{};
+    const auto index = static_cast<std::size_t>(kind);
+    auto& slot = table[index][(key ^ (key >> 29) ^ (key >> 47)) % slots];
+    totals.calls[index].fetch_add(1, std::memory_order_relaxed);
+    if (slot.key == key) {
+        totals.sameKey[index].fetch_add(1, std::memory_order_relaxed);
+        if (slot.version == version) totals.sameVersion[index].fetch_add(1, std::memory_order_relaxed);
+    }
+    slot = {key, version};
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (totals.reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    static constexpr std::array<const char*, kinds> names{"bda descriptor regions", "import serials", "in-place index ranges"};
+    std::string line = "[repeat-inputs] 10 s, calls with the key and version of the last call for that key (key seen again):";
+    for (std::size_t k = 0; k < kinds; ++k) {
+        const auto calls = totals.calls[k].exchange(0, std::memory_order_relaxed);
+        const auto seen = totals.sameKey[k].exchange(0, std::memory_order_relaxed);
+        const auto same = totals.sameVersion[k].exchange(0, std::memory_order_relaxed);
+        char text[128];
+        std::snprintf(text, sizeof(text), " %s %llu of %llu (%llu);", names[k], static_cast<unsigned long long>(same), static_cast<unsigned long long>(calls), static_cast<unsigned long long>(seen));
+        line += text;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
+}
+
 struct ShaderResources::ProofLaps {
     static constexpr std::size_t count = 12;
     std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
     std::array<std::uint64_t, count> ns{};
-    std::uint64_t queries = 0, pending = 0, serialLoops = 0, collectNs = 0, imageBytes = 0;
+    std::uint64_t queries = 0, pending = 0, serialLoops = 0, collectNs = 0, imageBytes = 0, trackerWaitNs = 0;
+    std::uint64_t* outerTrackerSink = nullptr;
     std::size_t walkReason = static_cast<std::size_t>(FastFail::Count);
     bool spurious = false;
 };
@@ -3280,7 +3321,7 @@ struct ProofLapTotals {
     AgcDriver::Mutex mutex;
     std::uint64_t proofs = 0, textures = 0, storage = 0, regions = 0, ranges = 0, queries = 0, pending = 0, serialLoops = 0;
     std::array<std::uint64_t, ShaderResources::ProofLaps::count> ns{};
-    std::uint64_t collectNs = 0, imageBytes = 0, regionBytes = 0, rangeBytes = 0;
+    std::uint64_t collectNs = 0, imageBytes = 0, regionBytes = 0, rangeBytes = 0, trackerWaitNs = 0;
     std::array<std::uint64_t, FastFailNames.size()> walks{}, walkNs{}, spurious{};
     std::int64_t reportedAt = 0;
 };
@@ -3761,12 +3802,14 @@ ShaderResources::ProofLapsScope::ProofLapsScope(ShaderResources& owner) : owner(
     if (stats && proofs++ % 64 == 0) {
         laps = std::make_unique<ProofLaps>();
         owner.proofLaps = laps.get();
+        laps->outerTrackerSink = GuestMemory::SetTrackerWaitSink(&laps->trackerWaitNs);
     }
 }
 
 ShaderResources::ProofLapsScope::~ProofLapsScope() {
     if (laps == nullptr) return;
     owner.proofLaps = nullptr;
+    GuestMemory::SetTrackerWaitSink(laps->outerTrackerSink);
     const bool walked = laps->walkReason < FastFailNames.size();
     if (!(fastPath && passed) && !walked) return;
     lapProof(laps.get(), 11);
@@ -3782,6 +3825,7 @@ ShaderResources::ProofLapsScope::~ProofLapsScope() {
     }
     ++totals.proofs;
     totals.collectNs += laps->collectNs;
+    totals.trackerWaitNs += laps->trackerWaitNs;
     totals.imageBytes += laps->imageBytes;
     for (const auto& region : owner.directRegions) totals.regionBytes += region.end - region.begin;
     for (const auto& range : owner.describedRanges) totals.rangeBytes += range.bytes;
@@ -3807,8 +3851,8 @@ ShaderResources::ProofLapsScope::~ProofLapsScope() {
     char counts[384];
     std::snprintf(counts, sizeof(counts), " per proof: textures %.1f, storage images %.1f, direct regions %.1f, described ranges %.1f, unchanged queries %.1f, pending queries %.1f, import serial loops %.2f", per(totals.textures), per(totals.storage), per(totals.regions), per(totals.ranges), per(totals.queries), per(totals.pending), per(totals.serialLoops));
     line += counts;
-    char collects[80];
-    std::snprintf(collects, sizeof(collects), "; write collects inside textures and storage images %.2f us", per(totals.collectNs) / 1000.0);
+    char collects[160];
+    std::snprintf(collects, sizeof(collects), "; write collects inside textures and storage images %.2f us, write tracker lock waits in the whole proof %.2f us", per(totals.collectNs) / 1000.0, per(totals.trackerWaitNs) / 1000.0);
     line += collects;
     char pages[160];
     std::snprintf(pages, sizeof(pages), "; 4 KiB pages per proof: images (unchanged queries) %.1f, direct regions %.1f, described ranges %.1f", per(totals.imageBytes) / 4096.0, per(totals.regionBytes) / 4096.0, per(totals.rangeBytes) / 4096.0);
@@ -3821,7 +3865,7 @@ ShaderResources::ProofLapsScope::~ProofLapsScope() {
         line += text;
     }
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
-    totals.collectNs = totals.imageBytes = totals.regionBytes = totals.rangeBytes = 0;
+    totals.collectNs = totals.imageBytes = totals.regionBytes = totals.rangeBytes = totals.trackerWaitNs = 0;
     totals.walks = {};
     totals.walkNs = {};
     totals.spurious = {};
@@ -4085,6 +4129,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         for (const auto& region : directRegions) {
             auto serial = HostImportSerial(context, region.begin, static_cast<std::size_t>(region.end - region.begin), true);
             if (serial == 0) serial = ImageMirrorSerial(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
+            if (RepeatedInputsProfiled()) NoteRepeatedInput(RepeatedInput::ImportSerial, region.begin * 0x9e3779b97f4a7c15ull ^ region.end, serial);
             if (serial != region.serial) return false;
             if (region.regionEnd != 0) {
                 const auto committed = GuestMemory::DescribeCommitted(region.begin, static_cast<std::size_t>(region.regionEnd - region.begin));
