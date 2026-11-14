@@ -16,6 +16,8 @@
 
 namespace {
 
+std::atomic<std::uint64_t> g_maps{0}, g_mapBytes{0}, g_unmaps{0}, g_protects{0}, g_trackedPages[3]{}, g_kytyFaults{0};
+
 struct Aps5Host {
     std::uint32_t version;
     bool (*protectHost)(std::uint64_t address, std::uint64_t bytes, std::uint32_t tracker);
@@ -121,15 +123,22 @@ void* KytyGpuImport(void* target, const char* name, const char* library) {
 }
 
 void KytyGpuOnMap(std::uintptr_t address, std::size_t bytes, std::uint32_t protection, void* section, std::uint64_t offset) {
-    if (KytyGpuEnabled()) Ready().onMap(address, bytes, protection, section, offset);
+    if (!KytyGpuEnabled()) return;
+    g_maps.fetch_add(1, std::memory_order_relaxed);
+    g_mapBytes.fetch_add(bytes, std::memory_order_relaxed);
+    Ready().onMap(address, bytes, protection, section, offset);
 }
 
 void KytyGpuOnUnmap(std::uintptr_t address, std::size_t bytes) {
-    if (KytyGpuEnabled()) Ready().onUnmap(address, bytes);
+    if (!KytyGpuEnabled()) return;
+    g_unmaps.fetch_add(1, std::memory_order_relaxed);
+    Ready().onUnmap(address, bytes);
 }
 
 void KytyGpuOnProtect(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
-    if (KytyGpuEnabled()) Ready().onProtect(address, bytes, protection);
+    if (!KytyGpuEnabled()) return;
+    g_protects.fetch_add(1, std::memory_order_relaxed);
+    Ready().onProtect(address, bytes, protection);
 }
 
 void KytyGpuOnSectionClosed(void* section) {
@@ -195,6 +204,7 @@ bool KytyGpuProtectHost(std::uint64_t address, std::uint64_t bytes, std::uint32_
     for (auto page = address & ~std::uint64_t{GuestArena::HostPageBytes - 1}; page < address + bytes; page += GuestArena::HostPageBytes) {
         if (!GuestArena::GuestArenaDonated_nid_no_patch(page)) return false;
     }
+    g_trackedPages[tracker].fetch_add((address + bytes - (address & ~std::uint64_t{GuestArena::HostPageBytes - 1}) + GuestArena::HostPageBytes - 1) / GuestArena::HostPageBytes, std::memory_order_relaxed);
     return GuestArena::GuestArenaSetHostPageState_nid_no_patch(address, bytes, TrackerMask, static_cast<std::uint8_t>(tracker)) && ApplyEffective(address, bytes, false);
 }
 
@@ -203,7 +213,22 @@ void KytyGpuPrepareHostWrite(std::uintptr_t address, std::size_t bytes) {
 }
 
 bool KytyGpuHandleFault(std::uintptr_t address, std::uint32_t access, std::uint64_t rip, void* context) {
-    return KytyGpuEnabled() && GuestArena::GuestArenaDonated_nid_no_patch(address) && Dll().handleFault(address, access, rip, context);
+    if (!KytyGpuEnabled() || !GuestArena::GuestArenaDonated_nid_no_patch(address) || !Dll().handleFault(address, access, rip, context)) return false;
+    g_kytyFaults.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void KytyGpuReportCounters() {
+    if (!KytyGpuEnabled()) return;
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    const auto maps = take(g_maps);
+    const auto mib = take(g_mapBytes) >> 20u;
+    const auto unmaps = take(g_unmaps);
+    const auto protects = take(g_protects);
+    const auto released = take(g_trackedPages[0]);
+    const auto readOnly = take(g_trackedPages[1]);
+    const auto noAccess = take(g_trackedPages[2]);
+    std::fprintf(stderr, "[hib-mem] 10 s: on_map %llu (%llu MiB), on_unmap %llu, on_protect %llu; host pages the Kyty GPU protected %llu read-only, %llu no-access, %llu released; faults it handled %llu\n", maps, mib, unmaps, protects, readOnly, noAccess, released, take(g_kytyFaults));
 }
 
 #else
@@ -218,6 +243,8 @@ void KytyGpuReapplyProtection(std::uintptr_t, std::size_t) {}
 bool KytyGpuProtectHost(std::uint64_t, std::uint64_t, std::uint32_t) {
     return false;
 }
+void KytyGpuReportCounters() {}
+
 bool KytyGpuHandleFault(std::uintptr_t, std::uint32_t, std::uint64_t, void*) {
     return false;
 }

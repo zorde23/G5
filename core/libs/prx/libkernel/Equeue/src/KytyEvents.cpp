@@ -1,5 +1,8 @@
 #include "prx/libkernel/Equeue/Equeue.hpp"
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <x86intrin.h>
 
 namespace {
@@ -53,6 +56,26 @@ void TriggerVideoOut(KernelEqueueEvent* event, void* triggerData) {
     event->triggered = true;
 }
 
+std::atomic<std::uint64_t> g_graphics{0}, g_videoOut{0}, g_other{0}, g_refused{0};
+std::atomic<std::int64_t> g_periodStart{0};
+
+void NoteTrigger(std::int16_t filter, int result) {
+    if (result != 0) g_refused.fetch_add(1, std::memory_order_relaxed);
+    else if (filter == -14) g_graphics.fetch_add(1, std::memory_order_relaxed);
+    else if (filter == -13) g_videoOut.fetch_add(1, std::memory_order_relaxed);
+    else g_other.fetch_add(1, std::memory_order_relaxed);
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto start = g_periodStart.load(std::memory_order_relaxed);
+    if (start == 0) g_periodStart.compare_exchange_strong(start, now, std::memory_order_relaxed);
+    else if (now - start >= 10 && g_periodStart.compare_exchange_strong(start, now, std::memory_order_relaxed)) {
+        const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+        const auto graphics = take(g_graphics);
+        const auto videoOut = take(g_videoOut);
+        const auto other = take(g_other);
+        std::fprintf(stderr, "[hib-eq] %lld s: %llu graphics, %llu video out, %llu other triggers; %llu refused\n", static_cast<long long>(now - start), graphics, videoOut, other, take(g_refused));
+    }
+}
+
 }
 
 extern "C" {
@@ -75,7 +98,9 @@ int KytyGpuDeleteEvent_nid_no_patch(KernelEqueue eq, std::uint64_t ident, std::i
 }
 
 int KytyGpuTriggerEvent_nid_no_patch(KernelEqueue eq, std::uint64_t ident, std::int16_t filter, void* triggerData) {
-    return EqueueTriggerEvent_nid_postfix(eq, static_cast<uintptr_t>(ident), filter, triggerData);
+    const int result = EqueueTriggerEvent_nid_postfix(eq, static_cast<uintptr_t>(ident), filter, triggerData);
+    NoteTrigger(filter, result);
+    return result;
 }
 
 }
