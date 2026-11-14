@@ -2,8 +2,6 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
-#include <stdlib.h>
 
 namespace {
 
@@ -24,9 +22,6 @@ int Original() {
 
 int main() {
     void* const original = reinterpret_cast<void*>(&Original);
-    _putenv("APS5_TRACE_CALLS=");
-    _putenv("APS5_KYTY_GPU=1");
-    _putenv("APS5_KYTY_GPU_DLL=kyty_gpu_fake.dll");
     Expect(TraceImport_nid_no_patch(original, "kytyHasThis", "libSceAgcDriver.prx") == reinterpret_cast<void*>(std::uintptr_t{0x1234500}), "a NID Kyty has binds to Kyty");
     Expect(TraceImport_nid_no_patch(original, "kytyHasThis#C#D", "libScePad") == reinterpret_cast<void*>(std::uintptr_t{0x1234500}), "a routed library without .prx, and a NID with its library suffix, bind to Kyty");
     void* const missing = TraceImport_nid_no_patch(original, "kytyLacksThis", "libSceVideoOut.prx");
