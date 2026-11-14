@@ -279,6 +279,57 @@ void NoteWorkerWaits(const std::array<std::uint64_t, static_cast<std::size_t>(Th
     AgcDriver::ProfilePrint_nid_no_patch("[w-waits] 10 s (queue 0 worker, inside executing), ms: guest memory waits %.1f, rendering waits %.1f, waiting for a draw finisher slot %.1f\n", guest, rendering, slot);
 }
 
+namespace {
+
+std::uint64_t CommitterLoopSampleEvery() {
+    static const std::uint64_t every = [] {
+        const char* value = std::getenv("APS5_C_LOOP");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+struct CommitterLoop {
+    std::uint64_t every = CommitterLoopSampleEvery();
+    std::uint64_t seen = 0;
+    std::uint64_t items = 0;
+    std::uint64_t draws = 0;
+    std::uint64_t bodyNs = 0;
+    std::uint64_t sampled = 0;
+    std::uint64_t idleNs = 0;
+    std::uint64_t sampledBodyNs = 0;
+    std::uint64_t gpuWaitNs = 0;
+    std::uint64_t afterNs = 0;
+    std::array<std::uint64_t, 0x100> opcodeNs{};
+    std::array<std::uint64_t, 0x100> opcodeItems{};
+    std::array<std::uint64_t, 2> kindNs{};
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+
+    void Report(std::chrono::steady_clock::time_point now) {
+        const auto wall = static_cast<double>(elapsedNs(since)) / 1e6;
+        const auto scale = static_cast<double>(every) / 1e6;
+        const auto busy = static_cast<double>(bodyNs) / 1e6;
+        const auto idle = static_cast<double>(idleNs) * scale;
+        const auto body = static_cast<double>(sampledBodyNs) * scale;
+        const auto after = static_cast<double>(afterNs) * scale;
+        std::string opcodes;
+        for (int shown = 0; shown < 8; ++shown) {
+            const auto top = std::max_element(opcodeNs.begin(), opcodeNs.end());
+            if (*top == 0) break;
+            const auto index = static_cast<std::size_t>(top - opcodeNs.begin());
+            char text[64];
+            std::snprintf(text, sizeof(text), " 0x%02zx %.1f (%llu)", index, static_cast<double>(*top) * scale, static_cast<unsigned long long>(opcodeItems[index] * every));
+            opcodes += text;
+            *top = 0;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[c-loop] 10 s (draw committer, 1 in %llu items timed, ms scaled): wall %.1f; %llu items (%llu draws), bodies %.1f measured; idle and pop %.1f, bodies %.1f (draws %.1f, other %.1f), GpuMutex acquisitions inside bodies %.1f, after the body %.1f, covered %.1f%% of wall; bodies by opcode:%s\n", static_cast<unsigned long long>(every), wall, static_cast<unsigned long long>(items), static_cast<unsigned long long>(draws), busy, idle, body, static_cast<double>(kindNs[1]) * scale, static_cast<double>(kindNs[0]) * scale, static_cast<double>(gpuWaitNs) * scale, after, wall == 0 ? 0.0 : (idle + body + after) * 100.0 / wall, opcodes.c_str());
+        *this = CommitterLoop{};
+        since = now;
+    }
+};
+
+}
+
 void DrawFinisher::run() {
     PerformanceTrace::BindThread("draw finisher");
     const bool phased = ThreadPhasesProfiled();
@@ -501,9 +552,13 @@ void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
     const bool reservedCore = PinCommitterThread();
     StartCommitterSampler();
+    CommitterLoop loop;
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
+        std::uint32_t opcode = 0;
+        const bool timed = loop.every != 0 && loop.seen++ % loop.every == 0;
+        const auto top = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
@@ -513,8 +568,11 @@ void DrawPipeline::run() {
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
+            opcode = items.front().opcode;
         }
         const auto start = std::chrono::steady_clock::now();
+        std::uint64_t gpuWait = 0;
+        auto* outerSink = timed ? GuestMemory::SetGpuLockWaitSink(&gpuWait) : nullptr;
         if (reservedCore) NoteCommitterCore(start);
         std::exception_ptr fatal;
         bool failed = false;
@@ -532,6 +590,7 @@ void DrawPipeline::run() {
             fatal = std::current_exception();
         }
         const auto spent = elapsedNs(start);
+        if (timed) GuestMemory::SetGpuLockWaitSink(outerSink);
         if (fatal != nullptr && !stopped) {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
@@ -549,6 +608,22 @@ void DrawPipeline::run() {
         if (retireWaiters != 0 || (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) || (fullWaiters != 0 && (items.size() <= Depth() / 2 || failure != nullptr))) {
             ++idleNotifies;
             idle.notify_all();
+        }
+        if (loop.every == 0) continue;
+        ++loop.items;
+        if (isDraw) ++loop.draws;
+        loop.bodyNs += spent;
+        if (timed) {
+            ++loop.sampled;
+            loop.idleNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(start - top).count());
+            loop.sampledBodyNs += spent;
+            loop.gpuWaitNs += gpuWait;
+            loop.kindNs[isDraw ? 1 : 0] += spent;
+            loop.opcodeNs[opcode & 0xff] += spent;
+            ++loop.opcodeItems[opcode & 0xff];
+            const auto now = std::chrono::steady_clock::now();
+            loop.afterNs += elapsedNs(start) - spent;
+            if (now - loop.since >= std::chrono::seconds(10)) loop.Report(now);
         }
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);

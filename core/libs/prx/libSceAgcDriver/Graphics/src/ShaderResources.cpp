@@ -3256,7 +3256,9 @@ struct ShaderResources::ProofLaps {
     static constexpr std::size_t count = 12;
     std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
     std::array<std::uint64_t, count> ns{};
-    std::uint64_t queries = 0, pending = 0, serialLoops = 0;
+    std::uint64_t queries = 0, pending = 0, serialLoops = 0, collectNs = 0, imageBytes = 0;
+    std::size_t walkReason = static_cast<std::size_t>(FastFail::Count);
+    bool spurious = false;
 };
 
 namespace {
@@ -3268,8 +3270,9 @@ void lapProof(ShaderResources::ProofLaps* laps, std::size_t part) {
     laps->last = now;
 }
 
-void countProofQueries(ShaderResources::ProofLaps& laps, std::size_t queries, std::size_t pending) {
-    laps.queries += queries;
+void countProofQueries(ShaderResources::ProofLaps& laps, std::span<const GuestMemory::UnchangedQuery> queries, std::size_t pending) {
+    for (const auto& query : queries) laps.imageBytes += query.bytes;
+    laps.queries += queries.size();
     laps.pending += pending;
 }
 
@@ -3277,8 +3280,18 @@ struct ProofLapTotals {
     AgcDriver::Mutex mutex;
     std::uint64_t proofs = 0, textures = 0, storage = 0, regions = 0, ranges = 0, queries = 0, pending = 0, serialLoops = 0;
     std::array<std::uint64_t, ShaderResources::ProofLaps::count> ns{};
+    std::uint64_t collectNs = 0, imageBytes = 0, regionBytes = 0, rangeBytes = 0;
+    std::array<std::uint64_t, FastFailNames.size()> walks{}, walkNs{}, spurious{};
     std::int64_t reportedAt = 0;
 };
+
+std::uint64_t timedCollect(ShaderResources::ProofLaps* laps, std::uint64_t address, std::size_t bytes) {
+    if (laps == nullptr) return GuestMemory::CollectWrites(address, bytes);
+    const auto start = std::chrono::steady_clock::now();
+    const auto generation = GuestMemory::CollectWrites(address, bytes);
+    laps->collectNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    return generation;
+}
 
 }
 
@@ -3342,7 +3355,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         if (!FlushDepthPlanes(address, bytes).empty()) return fail(FastFail::Changed);
-        surface.collected = GuestMemory::CollectWrites(address, bytes);
+        surface.collected = timedCollect(proofLaps, address, bytes);
         if (surface.collected == 0) return fail(FastFail::Collect);
         const auto* source = surface.source;
         if (!keyProofs) {
@@ -3400,7 +3413,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
             return fail(FastFail::Depth);
         }
-        if (GuestMemory::CollectWrites(address, bytes) == 0) return fail(FastFail::Collect);
+        if (timedCollect(proofLaps, address, bytes) == 0) return fail(FastFail::Collect);
         if (own.dccAddress != 0) {
             // Refresh's unchanged branch (its key compare against the keys the content was
             // uploaded under, through the image's proof; the memory query below), minus its
@@ -3449,7 +3462,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         Revalidations().serialSkips.fetch_add(1, std::memory_order_relaxed);
     }
     lapProof(proofLaps, 4);
-    if (proofLaps != nullptr) countProofQueries(*proofLaps, queries.size(), pending.size());
+    if (proofLaps != nullptr) countProofQueries(*proofLaps, queries, pending.size());
     if (!GuestMemory::UnchangedSinceAll(queries)) return fail(FastFail::Changed);
     lapProof(proofLaps, 5);
     if (!StorageImagesCached(context, images)) return fail(FastFail::Evicted);
@@ -3754,11 +3767,24 @@ ShaderResources::ProofLapsScope::ProofLapsScope(ShaderResources& owner) : owner(
 ShaderResources::ProofLapsScope::~ProofLapsScope() {
     if (laps == nullptr) return;
     owner.proofLaps = nullptr;
-    if (!fastPath || !passed) return;
+    const bool walked = laps->walkReason < FastFailNames.size();
+    if (!(fastPath && passed) && !walked) return;
     lapProof(laps.get(), 11);
     static ProofLapTotals totals;
     std::lock_guard lock(totals.mutex);
+    if (!(fastPath && passed)) {
+        std::uint64_t spent = 0;
+        for (const auto part : laps->ns) spent += part;
+        ++totals.walks[laps->walkReason];
+        totals.walkNs[laps->walkReason] += spent;
+        if (laps->spurious) ++totals.spurious[laps->walkReason];
+        return;
+    }
     ++totals.proofs;
+    totals.collectNs += laps->collectNs;
+    totals.imageBytes += laps->imageBytes;
+    for (const auto& region : owner.directRegions) totals.regionBytes += region.end - region.begin;
+    for (const auto& range : owner.describedRanges) totals.rangeBytes += range.bytes;
     totals.textures += owner.textures.size();
     totals.storage += owner.storageTextures.size();
     totals.regions += owner.directRegions.size();
@@ -3781,7 +3807,24 @@ ShaderResources::ProofLapsScope::~ProofLapsScope() {
     char counts[384];
     std::snprintf(counts, sizeof(counts), " per proof: textures %.1f, storage images %.1f, direct regions %.1f, described ranges %.1f, unchanged queries %.1f, pending queries %.1f, import serial loops %.2f", per(totals.textures), per(totals.storage), per(totals.regions), per(totals.ranges), per(totals.queries), per(totals.pending), per(totals.serialLoops));
     line += counts;
+    char collects[80];
+    std::snprintf(collects, sizeof(collects), "; write collects inside textures and storage images %.2f us", per(totals.collectNs) / 1000.0);
+    line += collects;
+    char pages[160];
+    std::snprintf(pages, sizeof(pages), "; 4 KiB pages per proof: images (unchanged queries) %.1f, direct regions %.1f, described ranges %.1f", per(totals.imageBytes) / 4096.0, per(totals.regionBytes) / 4096.0, per(totals.rangeBytes) / 4096.0);
+    line += pages;
+    line += "; full walks sampled by reason (walks, us each, found nothing changed):";
+    for (std::size_t why = 0; why < FastFailNames.size(); ++why) {
+        if (totals.walks[why] == 0) continue;
+        char text[96];
+        std::snprintf(text, sizeof(text), " %s %llu %.2f %llu;", FastFailNames[why], static_cast<unsigned long long>(totals.walks[why]), static_cast<double>(totals.walkNs[why]) / 1000.0 / static_cast<double>(totals.walks[why]), static_cast<unsigned long long>(totals.spurious[why]));
+        line += text;
+    }
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
+    totals.collectNs = totals.imageBytes = totals.regionBytes = totals.rangeBytes = 0;
+    totals.walks = {};
+    totals.walkNs = {};
+    totals.spurious = {};
     totals.proofs = totals.textures = totals.storage = totals.regions = totals.ranges = totals.queries = totals.pending = totals.serialLoops = 0;
     totals.ns = {};
 }
@@ -3966,7 +4009,14 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     if (!fast) {
         countFullWalk(reason);
         if (report != nullptr) report->walkReason = reason;
-        if (!fullWalk()) {
+        if (proofLaps != nullptr) proofLaps->walkReason = static_cast<std::size_t>(reason);
+        const auto walk = [&] {
+            if (proofLaps == nullptr || reason != FastFail::Changed) return fullWalk();
+            std::size_t movedAt = 0;
+            proofLaps->spurious = walkAgrees(movedAt);
+            return proofLaps->spurious || movedAt != SIZE_MAX;
+        };
+        if (!walk()) {
             const auto failure = [&] {
                 switch (reason) {
                     case FastFail::Pending: return ProofFailure::Pending;

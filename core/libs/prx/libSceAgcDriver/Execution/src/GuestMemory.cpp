@@ -2702,7 +2702,23 @@ void AssertGpuLockHeld(const char* where) {
     std::abort();
 }
 
+namespace {
+thread_local std::uint64_t* gpuWaitSink = nullptr;
+}
+
+std::uint64_t* SetGpuLockWaitSink(std::uint64_t* sink) {
+    return std::exchange(gpuWaitSink, sink);
+}
+
 void GpuMutexType::lock() {
+    if (gpuWaitSink != nullptr && !HeldByThisThread()) {
+        auto* sink = std::exchange(gpuWaitSink, nullptr);
+        const auto start = std::chrono::steady_clock::now();
+        lock();
+        *sink += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        gpuWaitSink = sink;
+        return;
+    }
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr) {
