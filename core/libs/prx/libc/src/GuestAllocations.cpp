@@ -156,7 +156,7 @@ void* GuestAllocationsBegin_nid_postfix() {
 void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     auto* state = static_cast<MutationState*>(mutation);
     for (const auto& [address, bytes] : state->unpinned) renewBacking(address, bytes);
-    const auto ended = generation.fetch_add(1, std::memory_order_release) + 1;
+    const auto ended = generation.fetch_add(1, std::memory_order_seq_cst) + 1;
     if (const auto callback = invalidator.load(std::memory_order_acquire)) {
         for (const auto& [address, bytes] : state->changed) callback(address, bytes);
     }
@@ -195,7 +195,7 @@ void GuestAllocationsSetInvalidator_nid_postfix(void (*callback)(std::uintptr_t,
 }
 
 void GuestAllocationsInvalidate_nid_postfix(std::uintptr_t address, std::size_t bytes) {
-    generation.fetch_add(1, std::memory_order_release);
+    generation.fetch_add(1, std::memory_order_seq_cst);
     if (const auto callback = invalidator.load(std::memory_order_acquire)) callback(address, bytes);
 }
 

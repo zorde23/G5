@@ -504,6 +504,7 @@ struct PageStates {
             const auto first = std::max(base, span->base);
             const auto last = std::min(regionEnd, span->base + span->size);
             span->store(first, last, value);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
             if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation || accessSerial.load(std::memory_order_acquire) != access) span->forget(first, static_cast<std::size_t>(last - first));
         }
     }
@@ -549,7 +550,7 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
 }
 
 void ForgetInaccessiblePages(std::uintptr_t address, std::size_t bytes) {
-    Pages().accessSerial.fetch_add(1, std::memory_order_acq_rel);
+    Pages().accessSerial.fetch_add(1, std::memory_order_seq_cst);
     Pages().forgetInaccessible(address, bytes);
 }
 
