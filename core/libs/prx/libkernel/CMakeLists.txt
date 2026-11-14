@@ -8,6 +8,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/DescriptorControl.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Equeue/src/FileEvent.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Equeue/src/Kqueue.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Equeue/src/KytyEvents.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/DirectoryDescriptor.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/FileLock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/File/src/NativeStat.cpp
@@ -1707,6 +1708,16 @@ if(BUILD_TESTING)
     set_tests_properties(guest_dup PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(guest_dup PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    add_test_executable(kyty_events_tests ${LIBS_INCLUDE_DIR}/tests/KytyEvents.cpp)
+    target_include_directories(kyty_events_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(kyty_events_tests PRIVATE libkernel libc)
+    configure_windows_unwind(kyty_events_tests)
+    add_test(NAME kyty_events COMMAND kyty_events_tests)
+    set_tests_properties(kyty_events PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(kyty_events PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_kqueue_tests ${LIBS_INCLUDE_DIR}/tests/GuestKqueue.cpp)

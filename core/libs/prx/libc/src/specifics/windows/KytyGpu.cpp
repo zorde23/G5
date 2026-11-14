@@ -19,7 +19,17 @@ namespace {
 struct Aps5Host {
     std::uint32_t version;
     bool (*protectHost)(std::uint64_t address, std::uint64_t bytes, std::uint32_t tracker);
+    std::uint64_t (*resolve)(const char* nid);
 };
+
+std::uint64_t ResolveHostExport(const char* nid) {
+    for (const char* library : {"libkernel.prx", "libc.prx", "libScePad.prx"}) {
+        if (const auto module = GetModuleHandleA(library)) {
+            if (const auto address = GetProcAddress(module, nid)) return reinterpret_cast<std::uint64_t>(address);
+        }
+    }
+    return 0;
+}
 
 struct Kyty {
     std::uint64_t (*resolve)(const char* nid);
@@ -62,7 +72,7 @@ const Kyty& Dll() {
         Load(module, path, "kyty_gpu_on_section_closed", loaded.onSectionClosed);
         Load(module, path, "kyty_gpu_handle_fault", loaded.handleFault);
         Load(module, path, "kyty_gpu_prepare_host_write", loaded.prepareHostWrite);
-        static const Aps5Host host{1, &KytyGpuProtectHost};
+        static const Aps5Host host{2, &KytyGpuProtectHost, &ResolveHostExport};
         loaded.init(&host);
         return loaded;
     }();

@@ -8,6 +8,7 @@ namespace {
 struct Aps5Host {
     std::uint32_t version;
     bool (*protectHost)(std::uint64_t address, std::uint64_t bytes, std::uint32_t tracker);
+    std::uint64_t (*resolve)(const char* nid);
 };
 
 const Aps5Host* g_host = nullptr;
@@ -62,7 +63,11 @@ extern "C" void kyty_gpu_init(const Aps5Host* host) {
 }
 
 extern "C" bool kyty_fake_protect(std::uint64_t address, std::uint64_t bytes, std::uint32_t tracker) {
-    return g_host != nullptr && g_host->version == 1 && g_host->protectHost(address, bytes, tracker);
+    return g_host != nullptr && g_host->version == 2 && g_host->protectHost(address, bytes, tracker);
+}
+
+extern "C" std::uint64_t kyty_fake_resolve(const char* nid) {
+    return g_host != nullptr && g_host->version == 2 ? g_host->resolve(nid) : 0;
 }
 
 extern "C" void kyty_fake_counts(std::uint64_t* counts) {

@@ -58,6 +58,8 @@ void CheckEffectiveProtection(void* block) {
     Require(KytyProtect(bytes, BlockBytes, 0), "aps5_protect_host refused to clear the tracker");
     Require(Protection(bytes) == PAGE_READWRITE && Protection(bytes + 0x4000) == PAGE_READWRITE, "clearing the tracker did not restore the game's protection");
     Require(!KytyProtect(bytes + BlockBytes, 0x1000, 1), "aps5_protect_host accepted a page that is not donated");
+    const auto resolve = reinterpret_cast<std::uint64_t (*)(const char*)>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("kyty_gpu_fake.dll"), "kyty_fake_resolve")));
+    Require(resolve != nullptr && resolve("no such export") == 0, "the host resolver answered a name no library exports");
 }
 
 void MapDirect(void* block, HANDLE section) {
