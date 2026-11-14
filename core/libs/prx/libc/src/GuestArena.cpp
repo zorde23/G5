@@ -365,6 +365,7 @@ static_assert(std::size(CommitEpochOriginNames) == CommitEpochOrigins);
 
 struct CommitEpochState {
     std::atomic<std::uint64_t> epoch{0};
+    std::atomic<std::uint64_t> changing{0};
     std::array<std::atomic<std::uint64_t>, CommitEpochBuckets> buckets{};
     std::array<std::atomic<std::uint64_t>, CommitEpochOrigins> counts{};
     std::atomic<void (*)(std::uintptr_t, std::size_t)> forget{nullptr};
@@ -438,6 +439,18 @@ bool GuestArenaCommitEpochEnabled_nid_no_patch() {
 
 std::uint64_t GuestArenaCommitEpoch_nid_no_patch() {
     return commitEpochState().epoch.load(std::memory_order_seq_cst);
+}
+
+void GuestArenaCommitEpochBegin_nid_no_patch() {
+    if (commitEpochEnabled()) commitEpochState().changing.fetch_add(1, std::memory_order_seq_cst);
+}
+
+void GuestArenaCommitEpochEnd_nid_no_patch() {
+    if (commitEpochEnabled()) commitEpochState().changing.fetch_sub(1, std::memory_order_seq_cst);
+}
+
+std::uint64_t GuestArenaCommitEpochChanging_nid_no_patch() {
+    return commitEpochState().changing.load(std::memory_order_seq_cst);
 }
 
 std::uint64_t GuestArenaBucketEpochs_nid_no_patch(std::uintptr_t address, std::size_t bytes) {

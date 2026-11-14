@@ -92,6 +92,9 @@ void GuestArenaSetCommitEpochForget_nid_no_patch(void (*forget)(std::uintptr_t a
 void GuestArenaCommitEpochCounts_nid_no_patch(std::uint64_t* counts);
 std::size_t GuestArenaCommitEpochEvents_nid_no_patch(CommitEpochEvent* events, std::size_t count);
 void GuestArenaNoteCommitEpoch_nid_no_patch(std::uintptr_t address, std::size_t bytes, CommitEpochOrigin origin);
+void GuestArenaCommitEpochBegin_nid_no_patch();
+void GuestArenaCommitEpochEnd_nid_no_patch();
+std::uint64_t GuestArenaCommitEpochChanging_nid_no_patch();
 bool GuestArenaPrivateCovers_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 
 }
@@ -114,8 +117,11 @@ private:
 
 class CommitEpochNote {
 public:
-    CommitEpochNote(const void* pointer, std::size_t bytes, CommitEpochOrigin origin) : address(reinterpret_cast<std::uintptr_t>(pointer)), bytes(bytes), origin(origin) {}
-    ~CommitEpochNote() { GuestArenaNoteCommitEpoch_nid_no_patch(address, bytes, origin); }
+    CommitEpochNote(const void* pointer, std::size_t bytes, CommitEpochOrigin origin) : address(reinterpret_cast<std::uintptr_t>(pointer)), bytes(bytes), origin(origin) { GuestArenaCommitEpochBegin_nid_no_patch(); }
+    ~CommitEpochNote() {
+        GuestArenaNoteCommitEpoch_nid_no_patch(address, bytes, origin);
+        GuestArenaCommitEpochEnd_nid_no_patch();
+    }
     CommitEpochNote(const CommitEpochNote&) = delete;
     CommitEpochNote& operator=(const CommitEpochNote&) = delete;
 

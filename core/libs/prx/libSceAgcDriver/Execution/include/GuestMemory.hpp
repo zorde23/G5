@@ -30,6 +30,8 @@ struct Commitment {
     bool whole = false;
 };
 Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writable = false);
+Commitment DescribeCommittedCached(std::uint64_t address, std::size_t bytes, bool writable = false);
+std::uint64_t DescribeCacheServed();
 void CopyGuestBytes(void* destination, const void* source, std::size_t bytes);
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment = 1);
 // Variants for resources in heaps the guest commits on demand (partially resident textures, GPU
@@ -211,7 +213,7 @@ std::uint32_t GpuLockThreadTag();
 // as acquisitions; the hold they start is timed under "try". Holds are timed per site as well (the
 // outermost acquisition of a thread until its unlock; APS5_NO_HOLD_PROFILE=1 turns that off), so
 // the line shows who holds the mutex, not only who waits for it.
-enum class GpuLockSite : std::uint8_t { Other = 0, Dispatch, Indirect, Draw, Hook, Wait, Label, Flush, Present, Fill, Copy, End, Try, Count };
+enum class GpuLockSite : std::uint8_t { Other = 0, Dispatch, Indirect, Draw, Hook, Wait, Label, Flush, Present, Fill, Copy, End, Try, Pin, Map, Count };
 void TagGpuLockSite(GpuLockSite site);
 std::uint64_t* SetGpuLockWaitSink(std::uint64_t* sink);
 std::uint64_t* SetTrackerWaitSink(std::uint64_t* sink);

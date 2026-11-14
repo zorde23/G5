@@ -130,12 +130,39 @@ void CheckBoundaries() {
     Require(Accessible(block, Unit, true), "access observer did not invalidate inaccessible state after commit");
     std::puts("page-state boundaries, publication, holes and invalidation passed");
 }
+
+void CheckDescribeCache() {
+    Range range(ChunkGuestBytes);
+    auto* block = range.Commit(0);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    Require(DescribeCommittedCached(address, Unit, true).whole, "a committed block was not described whole");
+    const auto served = DescribeCacheServed();
+    Require(DescribeCommittedCached(address, Unit, true).whole, "a served description changed with nothing noted");
+    Require(DescribeCacheServed() > served, "an unchanged range was not served from the cache");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Protect(block, Unit, true, false, true, [&] {
+            DWORD previous = 0;
+            Require(VirtualProtect(block, Unit, PAGE_READONLY, &previous) != 0, "cannot protect the describe cache fixture");
+            GuestArena::GuestArenaSetProtection_nid_postfix(reinterpret_cast<std::uintptr_t>(block), Unit, PAGE_READONLY);
+        });
+    }
+    Require(DescribeCommittedCached(address, Unit, true).ranges.empty(), "a cached description kept a protection change");
+    Require(DescribeCommittedCached(address, Unit).whole, "a read-only block was not described readable");
+    GuestArena::GuestArenaReset_nid_postfix(block, Unit);
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(reinterpret_cast<std::uintptr_t>(block), Unit);
+    Require(!DescribeCommittedCached(address, Unit).whole, "a cached description kept a reset block");
+    GuestArena::GuestArenaCommit_nid_postfix(block, Unit, PAGE_READWRITE, Unit);
+    Require(DescribeCommittedCached(address, Unit, true).whole, "a cached description missed a new commit");
+    std::puts("describe cache keyed on the epochs, access serial and generation passed");
+}
 }
 
 int main(int argc, char** argv) {
     try {
         Require(GuestArena::GuestArenaAvailable_nid_postfix(), "page-state fixture needs the guest arena");
         if (argc == 2 && std::string_view(argv[1]) == "--metadata") CheckMetadata();
+        else if (argc == 2 && std::string_view(argv[1]) == "--describe-cache") CheckDescribeCache();
         else CheckBoundaries();
         return 0;
     } catch (const std::exception& error) {

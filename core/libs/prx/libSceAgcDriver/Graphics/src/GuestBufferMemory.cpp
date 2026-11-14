@@ -3029,7 +3029,7 @@ Pieces clipPieces(const Pieces& pieces, std::uint64_t begin, std::uint64_t end) 
 }
 
 bool refreshSparseMirror(ImageMirror& mirror, std::vector<RefreshBlock>& blocks) {
-    auto pieces = GuestMemory::DescribeCommitted(mirror.base, static_cast<std::size_t>(mirror.reserved)).ranges;
+    auto pieces = GuestMemory::DescribeCommittedCached(mirror.base, static_cast<std::size_t>(mirror.reserved)).ranges;
     if (!pieces.empty() && pieces.back().second > mirror.base + mirror.bytes) return false;
     syncRange(mirror.base, mirror.bytes);
     const auto generation = collectPieces(pieces);
@@ -3128,7 +3128,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     Pieces pieces;
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(selected.address), selected.bytes, range->writable && !heap)) {
         if (!heap || !sparseMirrorsEnabled()) return nullptr;
-        pieces = GuestMemory::DescribeCommitted(selected.address, selected.bytes).ranges;
+        pieces = GuestMemory::DescribeCommittedCached(selected.address, selected.bytes).ranges;
         if (pieces.empty()) return nullptr;
     }
     const bool sparse = !pieces.empty();
@@ -3418,6 +3418,8 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
     bool drained = false;
     bool retiredImport = false;
     bool droppedAddressSpace = false;
+    double gpuWaitMs = 0;
+    bool waitedUnlocked = false;
     // A range pinned only by the cached address space is released by dropping the cache's
     // reference: no GPU wait, no device lock (the mutating thread may be a driver thread holding
     // it). The registry rescans; a range still pinned by a build or a batch holding the space comes
@@ -3484,6 +3486,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
         }
         if (retiredImport && recorder != nullptr) recorder->FlushDeferredReleases();
     } else {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Pin);
         std::lock_guard lock(GuestMemory::GpuMutex());
         auto& state = Leases();
         auto* recorder = Recorder::Active();
@@ -3491,12 +3494,20 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
         if (recorder != nullptr && recorder == state.leaseRecorder && target > state.finishedLeaseSerial) {
             Recorder::CountSync(4);
             recorder->Submit();
-            recorder->FinishUpTo(target);
-            state.finishedLeaseSerial = target;
+            const auto waitStart = std::chrono::steady_clock::now();
+            static const bool unlockedWait = std::getenv("APS5_PIN_WAIT_UNLOCKED") != nullptr;
+            const auto finished = unlockedWait ? recorder->FinishUpToUnlocked(target) : Recorder::UnlockedFinish::Refused;
+            if (finished == Recorder::UnlockedFinish::Refused) recorder->FinishUpTo(target);
+            gpuWaitMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+            waitedUnlocked = finished == Recorder::UnlockedFinish::Waited || finished == Recorder::UnlockedFinish::TornDown;
+            if (finished == Recorder::UnlockedFinish::TornDown) recorder = Recorder::Active();
+            else if (recorder == state.leaseRecorder && target > state.finishedLeaseSerial) state.finishedLeaseSerial = target;
             synced = true;
         } else if (recorder != nullptr && !recorder->Idle()) {
             Recorder::CountSync(4);
+            const auto waitStart = std::chrono::steady_clock::now();
             recorder->Sync();
+            gpuWaitMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
             synced = true;
             drained = true;
         } else {
@@ -3556,6 +3567,8 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
     if (droppedAddressSpace) ++state.stats.cacheDrops;
     if (synced) ++state.stats.contentionSyncs;
     if (drained) ++state.stats.contentionDrains;
+    state.stats.contentionGpuMs += gpuWaitMs;
+    if (waitedUnlocked) ++state.stats.contentionUnlocked;
     state.stats.contentionMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     return synced || retiredImport;
 }
@@ -3576,7 +3589,7 @@ bool SyncLeaseWork() {
 }
 
 void CountLeaseOutcome(bool synced, std::uint64_t batchSerial) {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_LOCK_PROFILE") != nullptr;
     auto& state = Leases();
     if (!synced) {
         // Serials grow with the submissions, so the newest noted one covers every earlier lease batch
@@ -3601,7 +3614,7 @@ void CountLeaseOutcome(bool synced, std::uint64_t batchSerial) {
     const auto& stats = state.stats;
     const auto table = BdaResources::TableCacheCounters();
     const auto& snapshots = Snapshots();
-    AgcDriver::ProfilePrint_nid_no_patch("[address-sync] leases: %llu released at completion, %llu synced at once; %llu pin-contention waits by guest threads (%llu finished the lease batch, %llu drained the recorder, %llu cache-only drops) %.1f s; BDA table cache %llu hits / %llu misses (%zu tables held); snapshot compares: %llu skipped (live-backed region), %llu made\n", static_cast<unsigned long long>(stats.deferred), static_cast<unsigned long long>(stats.synced), static_cast<unsigned long long>(stats.contentionWaits), static_cast<unsigned long long>(stats.contentionSyncs), static_cast<unsigned long long>(stats.contentionDrains), static_cast<unsigned long long>(stats.cacheDrops), stats.contentionMs / 1000, static_cast<unsigned long long>(table.hits), static_cast<unsigned long long>(table.misses), table.held, static_cast<unsigned long long>(snapshots.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.checked.load(std::memory_order_relaxed)));
+    AgcDriver::ProfilePrint_nid_no_patch("[address-sync] leases: %llu released at completion, %llu synced at once; %llu pin-contention waits by guest threads (%llu finished the lease batch, %llu drained the recorder, %llu cache-only drops) %.1f s, of which in the lease batch finish or recorder sync %.1f s (%llu of them waited for the GPU without the mutex); BDA table cache %llu hits / %llu misses (%zu tables held); snapshot compares: %llu skipped (live-backed region), %llu made\n", static_cast<unsigned long long>(stats.deferred), static_cast<unsigned long long>(stats.synced), static_cast<unsigned long long>(stats.contentionWaits), static_cast<unsigned long long>(stats.contentionSyncs), static_cast<unsigned long long>(stats.contentionDrains), static_cast<unsigned long long>(stats.cacheDrops), stats.contentionMs / 1000, stats.contentionGpuMs / 1000, static_cast<unsigned long long>(stats.contentionUnlocked), static_cast<unsigned long long>(table.hits), static_cast<unsigned long long>(table.misses), table.held, static_cast<unsigned long long>(snapshots.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.checked.load(std::memory_order_relaxed)));
 }
 
 void FinishLeaseWork() {
@@ -4712,7 +4725,7 @@ void GuestBufferMemory::addCopiedRange(const CopiedRange& range) {
     // cannot write them, so that equals a snapshot taken now without the extra copy. Reserved heaps
     // are registered whole while the guest commits pages on demand: committed pages only.
     region.hostBacked = !range.writable;
-    auto committed = GuestMemory::DescribeCommitted(range.begin, range.end - range.begin);
+    auto committed = GuestMemory::DescribeCommittedCached(range.begin, range.end - range.begin);
     if (!committed.whole) {
         region.sparse = true;
         region.backed = std::move(committed.ranges);
@@ -4816,7 +4829,7 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
                 dissolveSpace(false);
                 break;
             }
-            if (overlayCandidate(*inside, readOnly) && GuestMemory::DescribeCommitted(begin, static_cast<std::size_t>(end - begin)).whole) {
+            if (overlayCandidate(*inside, readOnly) && GuestMemory::DescribeCommittedCached(begin, static_cast<std::size_t>(end - begin)).whole) {
                 overlay = true;
                 break;
             }
@@ -4840,7 +4853,7 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
     region.swept = swept;
     region.lastView = begin;
     region.overlay = overlay;
-    auto committed = GuestMemory::DescribeCommitted(begin, static_cast<std::size_t>(end - begin));
+    auto committed = GuestMemory::DescribeCommittedCached(begin, static_cast<std::size_t>(end - begin));
     if (!committed.whole) {
         // A GPU heap bound whole while the guest commits its pages on demand, or a descriptor left
         region.sparse = true;

@@ -4363,6 +4363,33 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     return true;
 }
 
+Recorder::UnlockedFinish Recorder::FinishUpToUnlocked(std::uint64_t serial) {
+    auto& mutex = GuestMemory::GpuMutex();
+    if (timeline == VK_NULL_HANDLE || mutex.DepthOnThisThread() != 1) return UnlockedFinish::Refused;
+    if (!unsignaled(serial)) {
+        FinishUpTo(serial);
+        return UnlockedFinish::Signaled;
+    }
+    {
+        const auto myId = id;
+        const auto device = context.device;
+        const auto semaphore = timeline;
+        const auto waitSemaphores = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR");
+        VkResult result = VK_SUCCESS;
+        {
+            const UnlockedWaiter waiter{myId};
+            mutex.unlock();
+            result = WaitTimeline(device, semaphore, waitSemaphores, serial);
+        }
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Pin);
+        mutex.lock();
+        Check(result, "vkWaitSemaphoresKHR recorder");
+        if (!RecorderAlive(myId)) return UnlockedFinish::TornDown;
+    }
+    FinishUpTo(serial);
+    return UnlockedFinish::Waited;
+}
+
 bool Recorder::Reap() {
     PerformanceTimer frameTiming("Recorder.Reap");
     dropStaleHoldKept();

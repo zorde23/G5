@@ -796,7 +796,9 @@ if(BUILD_TESTING AND WIN32)
     configure_windows_unwind(agc_page_state_tests)
     add_test(NAME agc_page_states COMMAND agc_page_state_tests)
     add_test(NAME agc_page_state_metadata COMMAND agc_page_state_tests --metadata)
-    set_tests_properties(agc_page_states agc_page_state_metadata PROPERTIES
+    add_test(NAME agc_page_state_describe_cache COMMAND agc_page_state_tests --describe-cache)
+    set_tests_properties(agc_page_state_describe_cache PROPERTIES ENVIRONMENT "APS5_COMMIT_EPOCH=1;APS5_DESCRIBE_CACHE_BDA=1;APS5_DESCRIBE_CACHE_VERIFY=1")
+    set_tests_properties(agc_page_states agc_page_state_metadata agc_page_state_describe_cache PROPERTIES
         TIMEOUT 30 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
 endif()
 

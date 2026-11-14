@@ -862,6 +862,7 @@ struct CommitEpochSimulator {
     std::atomic<std::uint64_t> ineligible{0};
     std::atomic<std::uint64_t> shared{0};
     std::atomic<std::uint64_t> keyHits{0};
+    std::atomic<std::uint64_t> served{0};
     std::atomic<std::uint64_t> divergences{0};
     std::atomic<std::uint64_t> inFlight{0};
     std::atomic<std::int64_t> reportedAt{0};
@@ -895,7 +896,7 @@ void reportCommitEpoch() {
     }
     simulator.reportedCounts = counts;
     char tail[512];
-    std::snprintf(tail, sizeof(tail), " (total %llu); queries %llu, global hits %llu, bucket hits %llu, ineligible %llu, shared eligible %llu, key hits (bucket epoch, access serial and allocation generation) %llu, divergences %llu, in flight %llu\n", static_cast<unsigned long long>(bumps), static_cast<unsigned long long>(simulator.queries.exchange(0)), static_cast<unsigned long long>(simulator.globalHits.exchange(0)), static_cast<unsigned long long>(simulator.bucketHits.exchange(0)), static_cast<unsigned long long>(simulator.ineligible.exchange(0)), static_cast<unsigned long long>(simulator.shared.exchange(0)), static_cast<unsigned long long>(simulator.keyHits.exchange(0)), static_cast<unsigned long long>(simulator.divergences.exchange(0)), static_cast<unsigned long long>(simulator.inFlight.exchange(0)));
+    std::snprintf(tail, sizeof(tail), " (total %llu); queries %llu, global hits %llu, bucket hits %llu, ineligible %llu, shared eligible %llu, key hits (bucket epoch, access serial and allocation generation) %llu, divergences %llu, in flight %llu, served %llu\n", static_cast<unsigned long long>(bumps), static_cast<unsigned long long>(simulator.queries.exchange(0)), static_cast<unsigned long long>(simulator.globalHits.exchange(0)), static_cast<unsigned long long>(simulator.bucketHits.exchange(0)), static_cast<unsigned long long>(simulator.ineligible.exchange(0)), static_cast<unsigned long long>(simulator.shared.exchange(0)), static_cast<unsigned long long>(simulator.keyHits.exchange(0)), static_cast<unsigned long long>(simulator.divergences.exchange(0)), static_cast<unsigned long long>(simulator.inFlight.exchange(0)), static_cast<unsigned long long>(simulator.served.exchange(0)));
     text += tail;
     AgcDriver::ProfilePrint_nid_no_patch("%s", text.c_str());
 }
@@ -996,22 +997,28 @@ std::uint64_t ForgetSerial() {
     return forgetSerial.load(std::memory_order_acquire);
 }
 
+namespace {
+
+Commitment describeFresh(std::uint64_t address, std::size_t bytes, bool writable) {
+    Commitment result;
+    const bool queried = describePages(static_cast<std::uintptr_t>(address), bytes, [&](const PageRun& run) {
+        if (run.readable && (!writable || run.writable)) {
+            if (!result.ranges.empty() && result.ranges.back().second == run.begin) result.ranges.back().second = run.end;
+            else result.ranges.emplace_back(run.begin, run.end);
+        }
+        return true;
+    });
+    require(queried, "cannot query guest memory");
+    result.whole = bytes == 0 || (result.ranges.size() == 1 && result.ranges.front().first == address && result.ranges.front().second == address + bytes);
+    return result;
+}
+
+}
+
 Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writable) {
     require(bytes <= std::numeric_limits<std::uint64_t>::max() - address, "address range overflow");
     const TimedAccess timed(CounterVerify, bytes);
-    const auto describe = [&] {
-        Commitment result;
-        const bool queried = describePages(static_cast<std::uintptr_t>(address), bytes, [&](const PageRun& run) {
-            if (run.readable && (!writable || run.writable)) {
-                if (!result.ranges.empty() && result.ranges.back().second == run.begin) result.ranges.back().second = run.end;
-                else result.ranges.emplace_back(run.begin, run.end);
-            }
-            return true;
-        });
-        require(queried, "cannot query guest memory");
-        result.whole = bytes == 0 || (result.ranges.size() == 1 && result.ranges.front().first == address && result.ranges.front().second == address + bytes);
-        return result;
-    };
+    const auto describe = [&] { return describeFresh(address, bytes, writable); };
     static const bool commitEpoch = GuestArena::GuestArenaCommitEpochEnabled_nid_no_patch();
     if (!commitEpoch) return describe();
     const auto global = GuestArena::GuestArenaCommitEpoch_nid_no_patch();
@@ -1027,6 +1034,42 @@ Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writ
     auto result = describe();
     simulateCommitEpoch(address, bytes, writable, global, bucket, access, generation, eligible, result, describe);
     return result;
+}
+
+namespace {
+std::atomic<std::uint64_t> describeCacheServed{0};
+}
+
+std::uint64_t DescribeCacheServed() {
+    return describeCacheServed.load(std::memory_order_relaxed);
+}
+
+Commitment DescribeCommittedCached(std::uint64_t address, std::size_t bytes, bool writable) {
+    static const bool serve = GuestArena::GuestArenaCommitEpochEnabled_nid_no_patch() && std::getenv("APS5_DESCRIBE_CACHE_BDA") != nullptr;
+    if (!serve || bytes == 0 || GuestArena::GuestArenaCommitEpochChanging_nid_no_patch() != 0 || !GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(address), bytes)) return DescribeCommitted(address, bytes, writable);
+    static const bool verify = std::getenv("APS5_DESCRIBE_CACHE_VERIFY") != nullptr;
+    const auto global = GuestArena::GuestArenaCommitEpoch_nid_no_patch();
+    const auto bucket = GuestArena::GuestArenaBucketEpochs_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+    const auto access = Pages().accessSerial.load(std::memory_order_acquire);
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    auto& simulator = commitEpochSimulator();
+    std::optional<Commitment> stored;
+    {
+        std::lock_guard lock(simulator.mutex);
+        if (const auto found = simulator.entries.find(CommitEpochKey{address, bytes, writable}); found != simulator.entries.end() && found->second.global == global && found->second.bucket == bucket && found->second.access == access && found->second.generation == generation) stored = found->second.result;
+    }
+    if (!stored || GuestArena::GuestArenaCommitEpochChanging_nid_no_patch() != 0 || GuestArena::GuestArenaCommitEpoch_nid_no_patch() != global) return DescribeCommitted(address, bytes, writable);
+    simulator.served.fetch_add(1, std::memory_order_relaxed);
+    describeCacheServed.fetch_add(1, std::memory_order_relaxed);
+    if (verify) {
+        const auto fresh = describeFresh(address, bytes, writable);
+        if (!sameCommitment(*stored, fresh) && GuestArena::GuestArenaCommitEpochChanging_nid_no_patch() == 0 && GuestArena::GuestArenaCommitEpoch_nid_no_patch() == global && GuestArena::GuestArenaBucketEpochs_nid_no_patch(static_cast<std::uintptr_t>(address), bytes) == bucket && Pages().accessSerial.load(std::memory_order_acquire) == access && GuestAllocations::GuestAllocationsGeneration_nid_postfix() == generation) {
+            std::fprintf(stderr, "[describe-cache] APS5_DESCRIBE_CACHE_VERIFY: a served description of 0x%llx+0x%zx writable %d diverged at an unchanged key (stored %zu ranges whole %d, fresh %zu ranges whole %d)\n", static_cast<unsigned long long>(address), bytes, writable ? 1 : 0, stored->ranges.size(), stored->whole ? 1 : 0, fresh.ranges.size(), fresh.whole ? 1 : 0);
+            std::fflush(stderr);
+            std::abort();
+        }
+    }
+    return *stored;
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> CommittedRanges(std::uint64_t address, std::size_t bytes, bool writable) {
@@ -2491,7 +2534,7 @@ namespace {
 // Per-thread GpuMutex wait accounting (APS5_PROFILE_DRAW): a queue worker tags its thread, other
 // threads (the presenter) report untagged.
 constexpr std::size_t GpuLockSiteCount = static_cast<std::size_t>(GpuLockSite::Count);
-constexpr const char* GpuLockSiteNames[GpuLockSiteCount] = {"other", "dispatch", "indirect", "draw", "hook", "wait", "label", "flush", "present", "fill", "copy", "end", "try"};
+constexpr const char* GpuLockSiteNames[GpuLockSiteCount] = {"other", "dispatch", "indirect", "draw", "hook", "wait", "label", "flush", "present", "fill", "copy", "end", "try", "pin", "map"};
 
 // Hold-side holder matrix: nanoseconds held per (holder thread, site), added by EndHold. Column 0
 // is every untagged thread (the presenter, game threads); the queue workers take a column each on
