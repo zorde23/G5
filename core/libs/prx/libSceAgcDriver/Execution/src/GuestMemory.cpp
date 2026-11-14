@@ -806,7 +806,7 @@ bool readableWithoutQuery(std::uintptr_t address, std::size_t bytes) {
 
 // Checks that [address, address + bytes) is mapped with read (and, if asked, write) access. Returns
 // an empty string when it is, otherwise why it is not.
-std::string verify(std::uintptr_t address, std::size_t bytes, bool writable) {
+std::string verify(std::uintptr_t address, std::size_t bytes, bool writable, std::uintptr_t* unreadable = nullptr) {
     const TimedAccess timed(CounterVerify, bytes);
     if (onOwnLiveStack(address, bytes)) return {};
 #ifdef __linux__
@@ -818,6 +818,7 @@ std::string verify(std::uintptr_t address, std::size_t bytes, bool writable) {
             char text[128];
             std::snprintf(text, sizeof(text), "guest memory is not readable at 0x%llx (range 0x%llx+0x%zx)", static_cast<unsigned long long>(run.begin), static_cast<unsigned long long>(address), bytes);
             reason = text;
+            if (unreadable != nullptr) *unreadable = run.begin;
         } else if (writable && !run.writable) {
             reason = "guest memory has no write permission";
         }
@@ -979,13 +980,30 @@ void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, b
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     require(address != 0 && address % alignment == 0, "null or misaligned address");
     require(bytes <= std::numeric_limits<std::uintptr_t>::max() - address, "address range overflow");
-    const auto reason = verify(address, bytes, writable);
+    std::uintptr_t unreadable = 0;
+    const auto reason = verify(address, bytes, writable, &unreadable);
     if (!reason.empty()) {
+        if (unreadable != 0) ReportUnreadable(unreadable, reason.c_str());
         // Debug aid: APS5_TRACE_UNREADABLE names the code that checked an inaccessible range.
         static const bool trace = std::getenv("APS5_TRACE_UNREADABLE") != nullptr;
         if (trace) std::fprintf(stderr, "[unreadable] %s from +0x%llx\n", reason.c_str(), ModuleOffset(__builtin_return_address(0)));
         require(false, reason.c_str());
     }
+}
+
+void ReportUnreadable(std::uintptr_t address, const char* reason) {
+    // Some callers recover from the throw: one report per 64 KiB block, for the first 64 blocks.
+    static std::mutex reportMutex;
+    static std::array<std::uintptr_t, 64> reported{};
+    static std::size_t reportedCount = 0;
+    {
+        const std::lock_guard lock(reportMutex);
+        const auto block = address & ~static_cast<std::uintptr_t>(0xffff);
+        if (reportedCount == reported.size() || std::find(reported.begin(), reported.begin() + reportedCount, block) != reported.begin() + reportedCount) return;
+        reported[reportedCount++] = block;
+    }
+    std::fprintf(stderr, "[unreadable] %s\n", reason);
+    GuestArena::GuestArenaReportProtections_nid_no_patch(address, [](const char* text) { std::fputs(text, stderr); });
 }
 
 bool Accessible(const void* pointer, std::size_t bytes, bool writable) {

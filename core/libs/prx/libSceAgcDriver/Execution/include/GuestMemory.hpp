@@ -17,6 +17,9 @@ namespace AgcDriver::GuestMemory {
 std::string WriteTrackerMemoryText();
 
 void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable = false);
+// Prints `reason` and the guest mapping changes behind the unreadable `address` (the red-zone guard's
+// ring) to stderr, for a check that is about to throw. Once per 64 KiB block, for the first 64 blocks.
+void ReportUnreadable(std::uintptr_t address, const char* reason);
 // CheckRange without throwing: whether the whole range is mapped with the requested access.
 bool Accessible(const void* pointer, std::size_t bytes, bool writable = false);
 // The accessible parts [begin, end) of a range, in address order. GPU heaps are often bound whole while

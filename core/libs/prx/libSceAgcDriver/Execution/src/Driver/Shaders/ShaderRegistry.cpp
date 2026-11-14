@@ -982,7 +982,11 @@ std::vector<std::uint32_t> ReadUserDataCallee(std::uint64_t address, std::uint32
     while (words.size() < limitWords) {
         const auto next = address + words.size() * 4u;
         const auto bytes = static_cast<std::size_t>(page - next % page);
-        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(next)), bytes)) throw std::runtime_error("its callee at " + hexText(address) + " is not readable at " + hexText(next));
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(next)), bytes)) {
+            const auto reason = "its callee at " + hexText(address) + " is not readable at " + hexText(next);
+            GuestMemory::ReportUnreadable(static_cast<std::uintptr_t>(next), reason.c_str());
+            throw std::runtime_error(reason);
+        }
         const auto old = words.size();
         words.resize(old + bytes / 4u);
         GuestMemory::Read(next, std::as_writable_bytes(std::span(words).subspan(old)));
@@ -996,7 +1000,9 @@ std::vector<std::uint32_t> ReadUserDataCallee(std::uint64_t address, std::uint32
 
 std::vector<std::uint8_t> ReadGuestBytes(std::uint64_t address, std::uint64_t bytes, const char* what) {
     if (address > UINTPTR_MAX - bytes || !GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), static_cast<std::size_t>(bytes))) {
-        throw std::runtime_error(std::string("its ") + what + " at " + hexText(address) + " + " + hexText(bytes) + " is not readable");
+        const auto reason = std::string("its ") + what + " at " + hexText(address) + " + " + hexText(bytes) + " is not readable";
+        GuestMemory::ReportUnreadable(static_cast<std::uintptr_t>(address), reason.c_str());
+        throw std::runtime_error(reason);
     }
     std::vector<std::uint8_t> data(static_cast<std::size_t>(bytes));
     GuestMemory::Read(address, std::as_writable_bytes(std::span(data)));

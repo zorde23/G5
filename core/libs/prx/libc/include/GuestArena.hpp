@@ -96,6 +96,10 @@ void GuestArenaCommitEpochBegin_nid_no_patch();
 void GuestArenaCommitEpochEnd_nid_no_patch();
 std::uint64_t GuestArenaCommitEpochChanging_nid_no_patch();
 bool GuestArenaPrivateCovers_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+// The red-zone guard's report for a host check that found guest memory unreadable: the page state of
+// `address` and the latest guest mapping changes in its 64 KiB, one text per call of `line` (Windows;
+// nothing elsewhere).
+void GuestArenaReportProtections_nid_no_patch(std::uintptr_t address, void (*line)(const char* text));
 
 }
 

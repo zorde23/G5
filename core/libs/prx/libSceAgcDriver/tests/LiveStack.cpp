@@ -5,6 +5,11 @@
 #include <exception>
 #include <stdexcept>
 #include <string>
+#if defined(_WIN32)
+#include <cstdio>
+#include <io.h>
+#include <windows.h>
+#endif
 #if defined(__linux__)
 #include <pthread.h>
 #include <sys/mman.h>
@@ -46,6 +51,38 @@ void RunLiveStackAccessTests() {
         const auto committed = GuestMemory::CommittedRanges(address, 4, false);
         Require(committed.empty(), "an address above the user address space reports committed bytes");
     }
+    char path[MAX_PATH] = {};
+    char folder[MAX_PATH] = {};
+    Require(GetTempPathA(MAX_PATH, folder) != 0 && GetTempFileNameA(folder, "unr", 0, path) != 0, "cannot name a stderr capture file");
+    void* reserved = VirtualAlloc(nullptr, 65536, MEM_RESERVE, PAGE_NOACCESS);
+    std::fflush(stderr);
+    const int saved = _dup(_fileno(stderr));
+    std::FILE* capture = std::fopen(path, "w+");
+    const bool captured = reserved != nullptr && saved >= 0 && capture != nullptr && _dup2(_fileno(capture), _fileno(stderr)) == 0;
+    bool rejected = false;
+    if (captured) {
+        try {
+            GuestMemory::CheckRange(reserved, 64, 8);
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        std::fflush(stderr);
+        _dup2(saved, _fileno(stderr));
+    }
+    if (saved >= 0) _close(saved);
+    std::string text;
+    if (capture != nullptr) {
+        std::rewind(capture);
+        for (int c = std::fgetc(capture); c != EOF; c = std::fgetc(capture)) text += static_cast<char>(c);
+        std::fclose(capture);
+    }
+    DeleteFileA(path);
+    if (reserved != nullptr) VirtualFree(reserved, 0, MEM_RELEASE);
+    Require(captured, "cannot reserve an inaccessible range or capture stderr");
+    char expected[64];
+    std::snprintf(expected, sizeof(expected), "[unreadable] guest memory is not readable at 0x%llx", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(reserved)));
+    Require(rejected, "CheckRange accepted an inaccessible range");
+    Require(text.find(expected) != std::string::npos && text.find("latest protection changes and unmaps of its 64 KiB") != std::string::npos, "an unreadable CheckRange did not print the mapping changes (or an earlier report took its 64 KiB block or the last of the 64 slots):\n" + text);
 #endif
 #if defined(__linux__)
     const auto page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));

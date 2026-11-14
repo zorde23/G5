@@ -497,6 +497,15 @@ void GuestArenaNoteCommitEpoch_nid_no_patch(std::uintptr_t address, std::size_t 
     state.nextEvent = (state.nextEvent + 1) % CommitEpochEvents;
 }
 
+void GuestArenaReportProtections_nid_no_patch(std::uintptr_t address, void (*line)(const char* text)) {
+#ifdef _WIN32
+    WindowsMappings::ReportProtections(address, line);
+#else
+    (void)address;
+    (void)line;
+#endif
+}
+
 bool GuestArenaPrivateCovers_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
 #ifdef _WIN32
     return bytes != 0 && Arena::Get().Contains(reinterpret_cast<const void*>(address), bytes) && WindowsMappings::Get().PrivateCovers(address, bytes);
