@@ -1,7 +1,10 @@
 #include "prx/libc/include/KytyGpu.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/WindowsMappings.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include <algorithm>
 #include <atomic>
+#include <iterator>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -13,8 +16,14 @@
 
 namespace {
 
+struct Aps5Host {
+    std::uint32_t version;
+    bool (*protectHost)(std::uint64_t address, std::uint64_t bytes, std::uint32_t tracker);
+};
+
 struct Kyty {
     std::uint64_t (*resolve)(const char* nid);
+    void (*init)(const Aps5Host* host);
     void (*onMap)(std::uint64_t address, std::uint64_t bytes, std::uint32_t protection, void* section, std::uint64_t offset);
     void (*onUnmap)(std::uint64_t address, std::uint64_t bytes);
     void (*onProtect)(std::uint64_t address, std::uint64_t bytes, std::uint32_t protection);
@@ -46,12 +55,15 @@ const Kyty& Dll() {
         HMODULE module = LoadLibraryA(path);
         Kyty loaded{};
         Load(module, path, "kyty_gpu_resolve", loaded.resolve);
+        Load(module, path, "kyty_gpu_init", loaded.init);
         Load(module, path, "kyty_gpu_on_map", loaded.onMap);
         Load(module, path, "kyty_gpu_on_unmap", loaded.onUnmap);
         Load(module, path, "kyty_gpu_on_protect", loaded.onProtect);
         Load(module, path, "kyty_gpu_on_section_closed", loaded.onSectionClosed);
         Load(module, path, "kyty_gpu_handle_fault", loaded.handleFault);
         Load(module, path, "kyty_gpu_prepare_host_write", loaded.prepareHostWrite);
+        static const Aps5Host host{1, &KytyGpuProtectHost};
+        loaded.init(&host);
         return loaded;
     }();
     return kyty;
@@ -101,6 +113,68 @@ void KytyGpuOnSectionClosed(void* section) {
     if (KytyGpuEnabled()) Dll().onSectionClosed(section);
 }
 
+namespace {
+
+constexpr std::uint8_t TrackerMask = 0x03;
+constexpr std::uint8_t GameShift = 2;
+constexpr std::uint8_t GameMask = 0x1c;
+constexpr DWORD GameProtections[] = {PAGE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE};
+
+std::uint8_t GameClass(std::uint32_t protection) {
+    for (std::uint8_t index = 1; index < std::size(GameProtections); ++index) {
+        if (GameProtections[index] == (protection & 0xff)) return index;
+    }
+    return 0;
+}
+
+DWORD Effective(std::uint8_t state) {
+    const auto game = GameProtections[std::min<std::size_t>((state & GameMask) >> GameShift, std::size(GameProtections) - 1)];
+    switch (state & TrackerMask) {
+    case 1:
+        if (game == PAGE_READWRITE) return PAGE_READONLY;
+        if (game == PAGE_EXECUTE_READWRITE) return PAGE_EXECUTE_READ;
+        return game;
+    case 2: return PAGE_NOACCESS;
+    default: return game;
+    }
+}
+
+bool ApplyEffective(std::uintptr_t address, std::size_t bytes, bool trackedOnly) {
+    bool applied = true;
+    for (auto page = address & ~static_cast<std::uintptr_t>(GuestArena::HostPageBytes - 1); page < address + bytes; page += GuestArena::HostPageBytes) {
+        for (auto state = GuestArena::GuestArenaHostPageState_nid_no_patch(page);;) {
+            if (trackedOnly && (state & TrackerMask) == 0) break;
+            DWORD previous = 0;
+            GuestArena::WindowsMappings::RecordProtection(page, GuestArena::HostPageBytes, Effective(state), "protect a page the Kyty GPU tracks");
+            applied = VirtualProtect(reinterpret_cast<void*>(page), GuestArena::HostPageBytes, Effective(state), &previous) != 0 && applied;
+            const auto now = GuestArena::GuestArenaHostPageState_nid_no_patch(page);
+            if (now == state) break;
+            state = now;
+        }
+    }
+    return applied;
+}
+
+}
+
+void KytyGpuNoteGameProtection(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
+    if (!KytyGpuEnabled() || !GuestArena::GuestArenaDonatedAny_nid_no_patch(address, bytes)) return;
+    GuestArena::GuestArenaSetHostPageState_nid_no_patch(address, bytes, GameMask, static_cast<std::uint8_t>(GameClass(protection) << GameShift));
+    ApplyEffective(address, bytes, true);
+}
+
+void KytyGpuReapplyProtection(std::uintptr_t address, std::size_t bytes) {
+    if (KytyGpuEnabled() && GuestArena::GuestArenaDonatedAny_nid_no_patch(address, bytes)) ApplyEffective(address, bytes, true);
+}
+
+bool KytyGpuProtectHost(std::uint64_t address, std::uint64_t bytes, std::uint32_t tracker) {
+    if (tracker > 2 || bytes == 0 || address + bytes < address) return false;
+    for (auto page = address & ~std::uint64_t{GuestArena::HostPageBytes - 1}; page < address + bytes; page += GuestArena::HostPageBytes) {
+        if (!GuestArena::GuestArenaDonated_nid_no_patch(page)) return false;
+    }
+    return GuestArena::GuestArenaSetHostPageState_nid_no_patch(address, bytes, TrackerMask, static_cast<std::uint8_t>(tracker)) && ApplyEffective(address, bytes, false);
+}
+
 void KytyGpuPrepareHostWrite(std::uintptr_t address, std::size_t bytes) {
     if (KytyGpuEnabled() && GuestArena::GuestArenaDonatedAny_nid_no_patch(address, bytes)) Dll().prepareHostWrite(address, bytes);
 }
@@ -116,6 +190,11 @@ void KytyGpuOnUnmap(std::uintptr_t, std::size_t) {}
 void KytyGpuOnProtect(std::uintptr_t, std::size_t, std::uint32_t) {}
 void KytyGpuOnSectionClosed(void*) {}
 void KytyGpuPrepareHostWrite(std::uintptr_t, std::size_t) {}
+void KytyGpuNoteGameProtection(std::uintptr_t, std::size_t, std::uint32_t) {}
+void KytyGpuReapplyProtection(std::uintptr_t, std::size_t) {}
+bool KytyGpuProtectHost(std::uint64_t, std::uint64_t, std::uint32_t) {
+    return false;
+}
 bool KytyGpuHandleFault(std::uintptr_t, std::uint32_t, std::uint64_t, void*) {
     return false;
 }

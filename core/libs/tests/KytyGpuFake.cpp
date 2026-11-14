@@ -5,6 +5,12 @@
 
 namespace {
 
+struct Aps5Host {
+    std::uint32_t version;
+    bool (*protectHost)(std::uint64_t address, std::uint64_t bytes, std::uint32_t tracker);
+};
+
+const Aps5Host* g_host = nullptr;
 std::atomic<std::uint64_t> g_maps{0};
 std::atomic<std::uint64_t> g_unmaps{0};
 std::atomic<std::uint64_t> g_unmapsAfterTheSystem{0};
@@ -49,6 +55,14 @@ extern "C" void kyty_gpu_prepare_host_write(std::uint64_t address, std::uint64_t
     const auto first = address & ~std::uint64_t{0xfff};
     VirtualProtect(reinterpret_cast<void*>(first), ((address + bytes + 0xfff) & ~std::uint64_t{0xfff}) - first, PAGE_READWRITE, &previous);
     g_hostWrites.fetch_add(1);
+}
+
+extern "C" void kyty_gpu_init(const Aps5Host* host) {
+    g_host = host;
+}
+
+extern "C" bool kyty_fake_protect(std::uint64_t address, std::uint64_t bytes, std::uint32_t tracker) {
+    return g_host != nullptr && g_host->version == 1 && g_host->protectHost(address, bytes, tracker);
 }
 
 extern "C" void kyty_fake_counts(std::uint64_t* counts) {

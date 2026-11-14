@@ -3,6 +3,7 @@
 #endif
 #include "prx/libc/include/GuestArena.hpp"
 #include <windows.h>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -29,6 +30,34 @@ Counts FakeCounts() {
     std::uint64_t values[7]{};
     read(values);
     return Counts{values[0], values[1], values[2], values[3], values[4], values[5], values[6]};
+}
+
+DWORD Protection(const void* pointer) {
+    MEMORY_BASIC_INFORMATION memory{};
+    Require(VirtualQuery(pointer, &memory, sizeof(memory)) == sizeof(memory), "VirtualQuery failed");
+    return memory.Protect;
+}
+
+bool KytyProtect(const void* pointer, std::uint64_t bytes, std::uint32_t tracker) {
+    const auto protect = reinterpret_cast<bool (*)(std::uint64_t, std::uint64_t, std::uint32_t)>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("kyty_gpu_fake.dll"), "kyty_fake_protect")));
+    Require(protect != nullptr, "the fake Kyty GPU DLL has no kyty_fake_protect");
+    return protect(reinterpret_cast<std::uintptr_t>(pointer), bytes, tracker);
+}
+
+void CheckEffectiveProtection(void* block) {
+    auto* bytes = static_cast<std::byte*>(block);
+    Require(KytyProtect(bytes, 0x1000, 1), "aps5_protect_host refused a donated page");
+    Require(Protection(bytes) == PAGE_READONLY && Protection(bytes + 0x1000) == PAGE_READWRITE, "aps5_protect_host did not make exactly the tracked page read-only");
+    GuestArena::GuestArenaSetProtection_nid_postfix(reinterpret_cast<std::uintptr_t>(block), BlockBytes, PAGE_READWRITE);
+    DWORD previous = 0;
+    Require(VirtualProtect(block, BlockBytes, PAGE_READWRITE, &previous) != 0, "cannot protect the block as libkernel's mprotect does");
+    GuestArena::GuestArenaReapplyHostProtection_nid_no_patch(reinterpret_cast<std::uintptr_t>(block), BlockBytes);
+    Require(Protection(bytes) == PAGE_READONLY && Protection(bytes + 0x1000) == PAGE_READWRITE, "a game mprotect lifted the tracker's protection instead of keeping the stricter one");
+    Require(KytyProtect(bytes + 0x3000, 0x2000, 2), "aps5_protect_host refused a range across two 16 KiB views");
+    Require(Protection(bytes + 0x3000) == PAGE_NOACCESS && Protection(bytes + 0x4000) == PAGE_NOACCESS, "a protection across two views did not reach both pages");
+    Require(KytyProtect(bytes, BlockBytes, 0), "aps5_protect_host refused to clear the tracker");
+    Require(Protection(bytes) == PAGE_READWRITE && Protection(bytes + 0x4000) == PAGE_READWRITE, "clearing the tracker did not restore the game's protection");
+    Require(!KytyProtect(bytes + BlockBytes, 0x1000, 1), "aps5_protect_host accepted a page that is not donated");
 }
 
 void MapDirect(void* block, HANDLE section) {
@@ -61,6 +90,7 @@ void Check(bool kyty) {
         GuestArena::GuestArenaEndHostWrite_nid_postfix(block, 16);
         const auto afterHostWrite = FakeCounts();
         Require(afterHostWrite.hostWrites == 1 && afterHostWrite.faults == 1 && *static_cast<volatile std::uint32_t*>(block) == 0x7c7c7c7c, "a host write to a page Kyty protects was not prepared by Kyty before it landed");
+        CheckEffectiveProtection(block);
     }
     GuestArena::GuestArenaSetProtection_nid_postfix(address, BlockBytes, PAGE_READONLY);
     GuestArena::GuestArenaSetProtection_nid_postfix(address, BlockBytes, PAGE_READWRITE);
@@ -75,7 +105,7 @@ void Check(bool kyty) {
         Require(counts.maps == 2, "Kyty was not told about each of the 2 direct mappings");
         Require(counts.unmaps == 2, "Kyty was not told about each of the 2 times a donated range left (mapped over, reset)");
         Require(counts.unmapsAfterTheSystem == 0, "Kyty was told about an unmap after the system had unmapped the range");
-        Require(counts.protects == 3, "Kyty was not told about each protection change of the donated range (2 protects and the commit)");
+        Require(counts.protects == 4, "Kyty was not told about each protection change of the donated range (3 protects and the commit)");
     } else {
         Require(GetModuleHandleA("kyty_gpu_fake.dll") == nullptr, "the Kyty GPU DLL was loaded without APS5_KYTY_GPU");
     }

@@ -105,6 +105,10 @@ bool GuestArenaDonate_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 void GuestArenaWithdraw_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 bool GuestArenaDonated_nid_no_patch(std::uintptr_t address);
 bool GuestArenaDonatedAny_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+inline constexpr std::size_t HostPageBytes = 4096;
+bool GuestArenaSetHostPageState_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint8_t mask, std::uint8_t value);
+std::uint8_t GuestArenaHostPageState_nid_no_patch(std::uintptr_t address);
+void GuestArenaReapplyHostProtection_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 
 }
 

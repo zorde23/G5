@@ -182,6 +182,7 @@ static int mprotect(void* addr, size_t len, int prot) {
         }
         cursor = regionEnd;
     }
+    GuestArena::GuestArenaReapplyHostProtection_nid_no_patch(reinterpret_cast<std::uintptr_t>(addr), len);
     return 0;
 }
 #endif
