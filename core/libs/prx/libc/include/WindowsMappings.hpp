@@ -24,6 +24,57 @@ namespace GuestArena {
 
 class WindowsMappings {
 public:
+    static void RecordProtection(std::uintptr_t address, std::size_t bytes, DWORD protection, const char* operation) {
+        const auto sequence = protectionCursor().fetch_add(1, std::memory_order_relaxed) + 1;
+        auto& note = protectionNotes()[sequence % ProtectionNoteCount];
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        note.sequence.store(0, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        note.address.store(address, std::memory_order_relaxed);
+        note.bytes.store(bytes, std::memory_order_relaxed);
+        note.protection.store(protection, std::memory_order_relaxed);
+        note.thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        note.ticks.store(now.QuadPart, std::memory_order_relaxed);
+        note.operation.store(operation, std::memory_order_relaxed);
+        note.sequence.store(sequence, std::memory_order_release);
+    }
+
+    static void ReportProtections(std::uintptr_t address, void (*line)(const char* text)) {
+        MEMORY_BASIC_INFORMATION memory{};
+        char text[256];
+        if (VirtualQuery(reinterpret_cast<const void*>(address), &memory, sizeof(memory)) == sizeof(memory))
+            std::snprintf(text, sizeof(text), "[red-zone-guard] page of 0x%llx after the handler: state 0x%lx protect 0x%lx type 0x%lx; latest protection changes and unmaps of its 64 KiB:\n", static_cast<unsigned long long>(address), memory.State, memory.Protect, memory.Type);
+        else
+            std::snprintf(text, sizeof(text), "[red-zone-guard] page of 0x%llx cannot be queried; latest protection changes and unmaps of its 64 KiB:\n", static_cast<unsigned long long>(address));
+        line(text);
+        LARGE_INTEGER now{}, frequency{};
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&frequency);
+        const auto block = address & ~static_cast<std::uintptr_t>(0xffff);
+        const auto cursor = protectionCursor().load(std::memory_order_relaxed);
+        int shown = 0;
+        for (std::uint64_t back = 0; back < ProtectionNoteCount && back < cursor && shown < 6; ++back) {
+            const auto sequence = cursor - back;
+            auto& note = protectionNotes()[sequence % ProtectionNoteCount];
+            if (note.sequence.load(std::memory_order_acquire) != sequence) continue;
+            const auto* operation = note.operation.load(std::memory_order_relaxed);
+            const auto begin = note.address.load(std::memory_order_relaxed);
+            const auto bytes = note.bytes.load(std::memory_order_relaxed);
+            const auto protection = note.protection.load(std::memory_order_relaxed);
+            const auto thread = note.thread.load(std::memory_order_relaxed);
+            const auto ticks = note.ticks.load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (note.sequence.load(std::memory_order_relaxed) != sequence || operation == nullptr) continue;
+            if (begin + bytes <= block || begin >= block + 0x10000) continue;
+            const auto age = static_cast<double>(now.QuadPart - ticks) * 1e6 / static_cast<double>(frequency.QuadPart);
+            std::snprintf(text, sizeof(text), "[red-zone-guard]   %s 0x%llx+0x%llx protect 0x%lx by thread %lu, %.0f us before this line\n", operation, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(bytes), protection, thread, age);
+            line(text);
+            ++shown;
+        }
+        if (shown == 0) line("[red-zone-guard]   none among the last 256 changes\n");
+    }
+
     static std::uint64_t SavedCommittedBytes() { return Saved::committedBytes.load(std::memory_order_relaxed); }
     enum class Collection { All, Armed, Fresh };
 
@@ -58,6 +109,7 @@ public:
         collectableRanges.clear();
         const DWORD flags = MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | (watched ? MEM_WRITE_WATCH : 0);
         const auto cut = [](std::uintptr_t at, std::size_t size, const char* operation) {
+            RecordProtection(reinterpret_cast<std::uintptr_t>(at), size, 0, operation);
             if (!VirtualFree(reinterpret_cast<void*>(at), size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail(operation);
         };
         const auto replace = [&](std::uintptr_t at, std::size_t size) {
@@ -105,6 +157,7 @@ public:
                     invalidate(mapped->first, mapped->second);
                 }
                 DWORD previous;
+                RecordProtection(reinterpret_cast<std::uintptr_t>(cursor), stop - cursor, protection, "protect guest memory");
                 if (!VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
                 cursor = stop;
             }
@@ -178,6 +231,7 @@ public:
                 forgetClean(base, base + runBytes);
                 remember(freshRanges, base, base + runBytes);
                 DWORD previous;
+                if (protection != PAGE_READWRITE) RecordProtection(base, runBytes, protection, "protect resident guest pages");
                 if (protection != PAGE_READWRITE && !VirtualProtect(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect resident guest pages");
                 done += runBytes;
                 continue;
@@ -214,6 +268,7 @@ public:
             split(base, runBytes);
             mapRun(base, runBytes, section, offset + done);
             DWORD previous;
+            RecordProtection(reinterpret_cast<std::uintptr_t>(base), runBytes, protection, "protect shared guest pages");
             if (!VirtualProtect(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect shared guest pages");
             collectableRanges.clear();
             for (std::size_t at = 0; at < runBytes; at += pageBytes) {
@@ -853,17 +908,21 @@ private:
         void* page = reinterpret_cast<void*>(base);
         const auto viewBytes = hostPages(sectionBytes);
         if (viewBytes != pageBytes) split(base, viewBytes);
+        RecordProtection(reinterpret_cast<std::uintptr_t>(page), sectionBytes, viewProtection, "map shared guest page");
         if (!map(section, GetCurrentProcess(), page, offset, sectionBytes, MEM_REPLACE_PLACEHOLDER, viewProtection, nullptr, 0)) fail("map shared guest page");
         if (!committed && query(base).State == MEM_RESERVE && !VirtualAlloc(page, viewBytes, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) fail("commit shared guest page");
         DWORD previous;
+        RecordProtection(reinterpret_cast<std::uintptr_t>(page), viewBytes, protection, "protect shared guest page");
         if (!VirtualProtect(page, viewBytes, protection, &previous)) fail("protect shared guest page");
         if (viewBytes == pageBytes) return;
         void* zeros = reinterpret_cast<void*>(base + viewBytes);
         if (!allocate(GetCurrentProcess(), zeros, pageBytes - viewBytes, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) fail("replace guest placeholder past the end of a file with zero pages");
+        RecordProtection(reinterpret_cast<std::uintptr_t>(zeros), pageBytes - viewBytes, protection, "protect guest pages past the end of a file");
         if (!VirtualProtect(zeros, pageBytes - viewBytes, protection, &previous)) fail("protect guest pages past the end of a file");
     }
 
     void mapRun(std::uintptr_t base, std::size_t bytes, HANDLE section, std::uint64_t offset) {
+        RecordProtection(base, bytes, PAGE_EXECUTE_READWRITE, "map a run of shared guest pages");
         if (!map(section, GetCurrentProcess(), reinterpret_cast<void*>(base), offset, bytes, MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0)) fail("map a run of shared guest pages");
     }
 
@@ -891,6 +950,7 @@ private:
         }
         const auto section = first->second.section;
         const auto offset = first->second.offset;
+        RecordProtection(start, stop - start, 0, "unmap a run of shared guest pages to split it");
         if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(start), MEM_PRESERVE_PLACEHOLDER)) fail("unmap a run of shared guest pages to split it");
         split(start, at - start);
         mapRun(start, at - start, section->handle, offset);
@@ -899,6 +959,7 @@ private:
             if (!part.committed) continue;
             for (const auto [from, to] : {std::pair{part.base, std::min(part.end, at)}, std::pair{std::max(part.base, at), part.end}}) {
                 DWORD previous;
+                if (from < to) RecordProtection(from, to - from, part.protection, "protect a split run of shared guest pages");
                 if (from < to && !VirtualProtect(reinterpret_cast<void*>(from), to - from, part.protection, &previous)) fail("protect a split run of shared guest pages");
             }
         }
@@ -946,12 +1007,14 @@ private:
             created.emplace_back(std::move(shared), std::move(slot));
         }
         DWORD previous;
+        RecordProtection(reinterpret_cast<std::uintptr_t>(start), stop - start, PAGE_READONLY, "fence resident guest pages");
         if (!VirtualProtect(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("fence resident guest pages");
         const auto section = views.at(start).section;
         auto window = open(section->handle, views.at(start).offset, stop - start);
         if (query(reinterpret_cast<std::uintptr_t>(window.bytes)).State == MEM_RESERVE && !VirtualAlloc(window.bytes, stop - start, MEM_COMMIT, PAGE_READWRITE)) fail("commit direct memory pages");
         std::memcpy(window.bytes, reinterpret_cast<const void*>(start), stop - start);
         close(window);
+        RecordProtection(reinterpret_cast<std::uintptr_t>(start), stop - start, 0, "release resident guest pages");
         if (!VirtualFree(reinterpret_cast<void*>(start), stop - start, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("release resident guest pages");
         physical.merge(staged);
         for (auto& [key, slot] : staged) physical.find(key)->second = std::move(slot);
@@ -989,6 +1052,7 @@ private:
         const auto start = run->first;
         const auto stop = run->second.end;
         DWORD previous;
+        RecordProtection(reinterpret_cast<std::uintptr_t>(start), stop - start, PAGE_READONLY, "open resident guest pages");
         if (!VirtualProtect(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("open resident guest pages");
         const auto entry = indexEntry(run);
         const bool indexed = entry != residentIndex.end();
@@ -1105,6 +1169,7 @@ private:
             auto stop = sub + 1;
             while (stop < subpages && (mask & (1u << stop)) != 0 && stop * subpageBytes != viewBytes) ++stop;
             DWORD previous;
+            RecordProtection(reinterpret_cast<std::uintptr_t>(base + sub * subpageBytes), (stop - sub) * subpageBytes, protection, operation);
             if (!VirtualProtect(reinterpret_cast<void*>(base + sub * subpageBytes), (stop - sub) * subpageBytes, protection, &previous)) fail(operation);
             sub = stop;
         }
@@ -1135,6 +1200,27 @@ private:
         granularity = system.dwAllocationGranularity;
     }
 
+    static constexpr std::size_t ProtectionNoteCount = 256;
+    struct ProtectionNote {
+        std::atomic<std::uintptr_t> address{0};
+        std::atomic<std::size_t> bytes{0};
+        std::atomic<DWORD> protection{0};
+        std::atomic<DWORD> thread{0};
+        std::atomic<LONGLONG> ticks{0};
+        std::atomic<const char*> operation{nullptr};
+        std::atomic<std::uint64_t> sequence{0};
+    };
+
+    static std::array<ProtectionNote, ProtectionNoteCount>& protectionNotes() {
+        static std::array<ProtectionNote, ProtectionNoteCount> notes;
+        return notes;
+    }
+
+    static std::atomic<std::uint64_t>& protectionCursor() {
+        static std::atomic<std::uint64_t> cursor{0};
+        return cursor;
+    }
+
     [[noreturn]] static void fail(const char* operation) {
         throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), operation);
     }
@@ -1154,10 +1240,12 @@ private:
         if (memory.State != MEM_RESERVE) throw std::runtime_error("guest mapping requires a placeholder");
         const auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
         if (address != base) {
+            RecordProtection(reinterpret_cast<std::uintptr_t>(base), address - base, 0, "split guest placeholder prefix");
             if (!VirtualFree(reinterpret_cast<void*>(base), address - base, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("split guest placeholder prefix");
             memory = query(address);
         }
         if (memory.RegionSize < bytes) throw std::runtime_error("guest placeholder is too small");
+        if (memory.RegionSize != bytes) RecordProtection(address, bytes, 0, "split guest placeholder suffix");
         if (memory.RegionSize != bytes && !VirtualFree(reinterpret_cast<void*>(address), bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("split guest placeholder suffix");
         return address + memory.RegionSize;
     }
@@ -1183,6 +1271,7 @@ private:
             } while (allocationEnd < end);
             if (allocationEnd != end || query(end).AllocationBase == memory.AllocationBase) throw std::runtime_error("guest release truncates a host allocation");
             evict(run);
+            RecordProtection(reinterpret_cast<std::uintptr_t>(address), bytes, 0, "release private guest memory");
             if (!VirtualFree(reinterpret_cast<void*>(address), bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("release private guest memory");
             return;
         }
@@ -1201,6 +1290,7 @@ private:
             } while (allocationEnd < end);
             if (allocationEnd > end || query(allocationEnd).AllocationBase == memory.AllocationBase) throw std::runtime_error("guest release truncates a host allocation");
             if (memory.Type == MEM_MAPPED) {
+                RecordProtection(cursor, allocationEnd - cursor, 0, "unmap shared guest page");
                 if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(cursor), MEM_PRESERVE_PLACEHOLDER)) fail("unmap shared guest page");
                 for (auto found = views.lower_bound(cursor); found != views.end() && found->first < allocationEnd;) {
                     if (found->second.page != nullptr) std::erase(found->second.page->aliases, found->first);
@@ -1209,6 +1299,7 @@ private:
                 forget(freshRanges, cursor, allocationEnd);
             } else if (memory.Type == MEM_PRIVATE) {
                 if (const auto run = residentRuns.find(cursor); run != residentRuns.end()) evict(run);
+                RecordProtection(reinterpret_cast<std::uintptr_t>(cursor), allocationEnd - cursor, 0, "release private guest memory");
                 if (!VirtualFree(reinterpret_cast<void*>(cursor), allocationEnd - cursor, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("release private guest memory");
             } else {
                 throw std::runtime_error("unsupported guest mapping type");
@@ -1237,6 +1328,7 @@ private:
                     run += pageBytes;
                 }
                 split(base + done, run);
+                RecordProtection(base + done, run, PAGE_READWRITE, "map a run of a read-write alias of shared guest memory");
                 if (!map(first.section->handle, GetCurrentProcess(), reinterpret_cast<void*>(base + done), first.offset, run, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) fail("map a run of a read-write alias of shared guest memory");
                 done += run;
             }

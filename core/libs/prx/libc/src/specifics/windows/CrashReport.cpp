@@ -5,6 +5,7 @@
 #include "prx/libc/include/FailureReport.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/Shutdown.hpp"
+#include "prx/libc/include/WindowsMappings.hpp"
 #include "prx/libc/include/CrashText.hpp"
 #include <algorithm>
 #include <atomic>
@@ -490,6 +491,7 @@ void GuardRedZone(const EXCEPTION_POINTERS* info) {
     if (tabled && hit == nullptr) g_outsideFaults.fetch_add(1, std::memory_order_relaxed);
     if (hit != nullptr && !hit->Uncovered) {
         Report("[red-zone-guard] %s fault at %ls+0x%llx resumed inside a red-zone leaf without a frame [0x%llx, 0x%llx) (%s): its values below RSP were overwritten; terminating\n", access == 1 ? "write" : access == 0 ? "read" : "other", path, static_cast<unsigned long long>(rva), static_cast<unsigned long long>(hit->Begin), static_cast<unsigned long long>(hit->End), hit->Reason);
+        GuestArena::WindowsMappings::ReportProtections(static_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionInformation[1]), [](const char* text) { Report("%s", text); });
         TerminateProcess(GetCurrentProcess(), 0xC0000409u);
     }
     auto& slot = g_redZoneLogged[(rip * 0x9e3779b97f4a7c15ull) >> 54];

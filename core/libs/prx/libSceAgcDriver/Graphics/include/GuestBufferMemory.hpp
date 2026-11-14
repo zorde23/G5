@@ -220,6 +220,8 @@ struct LeaseStats {
     double contentionMs = 0;
     double contentionGpuMs = 0;
     std::array<double, 7> contentionPhaseMs{};
+    std::array<double, 7> contentionPhaseMaxMs{};
+    double contentionHoldMaxMs = 0;
     std::uint64_t contentionUnlocked = 0;
 };
 LeaseStats LeaseCounters();
