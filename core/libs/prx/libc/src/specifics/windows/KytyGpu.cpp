@@ -1,4 +1,5 @@
 #include "prx/libc/include/KytyGpu.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <atomic>
 #include <cstdint>
@@ -18,6 +19,7 @@ struct Kyty {
     void (*onUnmap)(std::uint64_t address, std::uint64_t bytes);
     void (*onProtect)(std::uint64_t address, std::uint64_t bytes, std::uint32_t protection);
     void (*onSectionClosed)(void* section);
+    bool (*handleFault)(std::uint64_t address, std::uint32_t access, std::uint64_t rip, void* context);
 };
 
 bool Routed(std::string_view library) {
@@ -47,6 +49,7 @@ const Kyty& Dll() {
         Load(module, path, "kyty_gpu_on_unmap", loaded.onUnmap);
         Load(module, path, "kyty_gpu_on_protect", loaded.onProtect);
         Load(module, path, "kyty_gpu_on_section_closed", loaded.onSectionClosed);
+        Load(module, path, "kyty_gpu_handle_fault", loaded.handleFault);
         return loaded;
     }();
     return kyty;
@@ -96,12 +99,19 @@ void KytyGpuOnSectionClosed(void* section) {
     if (KytyGpuEnabled()) Dll().onSectionClosed(section);
 }
 
+bool KytyGpuHandleFault(std::uintptr_t address, std::uint32_t access, std::uint64_t rip, void* context) {
+    return KytyGpuEnabled() && GuestArena::GuestArenaDonated_nid_no_patch(address) && Dll().handleFault(address, access, rip, context);
+}
+
 #else
 
 void KytyGpuOnMap(std::uintptr_t, std::size_t, std::uint32_t, void*, std::uint64_t) {}
 void KytyGpuOnUnmap(std::uintptr_t, std::size_t) {}
 void KytyGpuOnProtect(std::uintptr_t, std::size_t, std::uint32_t) {}
 void KytyGpuOnSectionClosed(void*) {}
+bool KytyGpuHandleFault(std::uintptr_t, std::uint32_t, std::uint64_t, void*) {
+    return false;
+}
 
 bool KytyGpuEnabled() {
     return false;

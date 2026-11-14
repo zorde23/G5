@@ -4,6 +4,7 @@
 #include "prx/libc/include/CallTrace.hpp"
 #include "prx/libc/include/FailureReport.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/KytyGpu.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libc/include/WindowsMappings.hpp"
 #include "prx/libc/include/CrashText.hpp"
@@ -451,7 +452,7 @@ void LoadRedZoneTables(const std::filesystem::path& directory, std::vector<RedZo
 
 void InstallRedZoneGuard() {
     const char* guard = std::getenv("APS5_RED_ZONE_GUARD");
-    const bool armed = std::getenv("APS5_ARM_SHARED_IMPORTS") != nullptr;
+    const bool armed = std::getenv("APS5_ARM_SHARED_IMPORTS") != nullptr || KytyGpuEnabled();
     if (guard != nullptr && std::strcmp(guard, "0") == 0) {
         if (armed) Report("[red-zone-guard] WARNING: APS5_ARM_SHARED_IMPORTS arms shared guest pages with the guard turned off by APS5_RED_ZONE_GUARD=0; a fault resumed in an unframed red-zone leaf corrupts its stack silently\n");
         return;
@@ -468,6 +469,14 @@ void InstallRedZoneGuard() {
     for (const auto& table : *tables) ranges += table.Ranges.size();
     Report("[red-zone-guard] %zu tables, %zu ranges%s\n", tables->size(), ranges, exeCovered ? "" : "; INERT for the executable: it has no .redzone.txt (convert with --frame-red-zone)");
     g_redZoneTables = tables;
+    if (KytyGpuEnabled()) {
+        CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+            for (;;) {
+                Sleep(10000);
+                LibcReportRedZoneFaults_nid_no_patch();
+            }
+        }, nullptr, 0, nullptr);
+    }
 }
 
 void GuardRedZone(const EXCEPTION_POINTERS* info) {
@@ -504,6 +513,11 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
     const auto* fault = info->ExceptionRecord;
     const auto entered = g_redZoneStats && fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ? handlerTicks() : 0;
+    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && KytyGpuHandleFault(fault->ExceptionInformation[1], static_cast<std::uint32_t>(fault->ExceptionInformation[0]), info->ContextRecord->Rip, info->ContextRecord)) {
+        GuardRedZone(info);
+        noteResumedFault(info, entered);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) {
         GuardRedZone(info);
         noteResumedFault(info, entered);

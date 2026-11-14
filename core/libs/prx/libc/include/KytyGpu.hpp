@@ -11,5 +11,6 @@ void KytyGpuOnMap(std::uintptr_t address, std::size_t bytes, std::uint32_t prote
 void KytyGpuOnUnmap(std::uintptr_t address, std::size_t bytes);
 void KytyGpuOnProtect(std::uintptr_t address, std::size_t bytes, std::uint32_t protection);
 void KytyGpuOnSectionClosed(void* section);
+bool KytyGpuHandleFault(std::uintptr_t address, std::uint32_t access, std::uint64_t rip, void* context);
 
 #endif

@@ -18,7 +18,7 @@ void Require(bool condition, const std::string& message) {
 }
 
 struct Counts {
-    std::uint64_t maps = 0, unmaps = 0, unmapsAfterTheSystem = 0, protects = 0, sectionsClosed = 0;
+    std::uint64_t maps = 0, unmaps = 0, unmapsAfterTheSystem = 0, protects = 0, sectionsClosed = 0, faults = 0;
 };
 
 Counts FakeCounts() {
@@ -26,9 +26,9 @@ Counts FakeCounts() {
     const auto module = GetModuleHandleA("kyty_gpu_fake.dll");
     if (module == nullptr) return counts;
     const auto read = reinterpret_cast<void (*)(std::uint64_t*)>(reinterpret_cast<void*>(GetProcAddress(module, "kyty_fake_counts")));
-    std::uint64_t values[5]{};
+    std::uint64_t values[6]{};
     read(values);
-    return Counts{values[0], values[1], values[2], values[3], values[4]};
+    return Counts{values[0], values[1], values[2], values[3], values[4], values[5]};
 }
 
 void MapDirect(void* block, HANDLE section) {
@@ -49,6 +49,12 @@ void Check(bool kyty) {
     }
     *static_cast<volatile std::uint32_t*>(block) = 0x5a5a5a5a;
     Require(*static_cast<volatile std::uint32_t*>(block) == 0x5a5a5a5a, "the direct mapping does not hold a store");
+    if (kyty) {
+        DWORD previous = 0;
+        Require(VirtualProtect(block, 0x1000, PAGE_READONLY, &previous) != 0, "cannot write-protect a donated page as the Kyty tracker does");
+        *static_cast<volatile std::uint32_t*>(block) = 0x6b6b6b6b;
+        Require(*static_cast<volatile std::uint32_t*>(block) == 0x6b6b6b6b && FakeCounts().faults == 1, "a write to a page Kyty protects did not reach Kyty's fault handler once and resume");
+    }
     GuestArena::GuestArenaSetProtection_nid_postfix(address, BlockBytes, PAGE_READONLY);
     GuestArena::GuestArenaSetProtection_nid_postfix(address, BlockBytes, PAGE_READWRITE);
     GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
