@@ -1,4 +1,5 @@
 #include <codegen/x86/RedZoneFramer.hpp>
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
@@ -1173,6 +1174,57 @@ void countsAFramePointerLeafsAllocationOverItsOwnStubsWhenAsked() {
     require(vexGeneral.RedZoneFunctions == 1 && vexGeneral.Leaves.size() == 1, "a leaf with a VEX move into a general register left the table");
 }
 
+void killsRedZoneSlotsOnlyWithWholeStoresWhenAsked() {
+    const std::vector<std::uint8_t> other{0x89, 0x06};
+    const std::vector<std::uint8_t> store8{0x48, 0x89, 0x44, 0x24, 0xf8};
+    const std::vector<std::uint8_t> read8{0x48, 0x8b, 0x4c, 0x24, 0xf8};
+    const std::vector<std::uint8_t> store4{0x89, 0x44, 0x24, 0xf8};
+    const std::vector<std::uint8_t> vstore4{0xc5, 0xfa, 0x11, 0x44, 0x24, 0xf8};
+    const std::vector<std::uint8_t> loopBack{0x85, 0xd2, 0x75, 0xf0};
+    const auto join = [](std::initializer_list<std::vector<std::uint8_t>> parts) {
+        std::vector<std::uint8_t> bytes;
+        for (const auto& part : parts) append(bytes, part);
+        return bytes;
+    };
+    const std::vector<std::vector<std::uint8_t>> leaves{
+        join({other, store8, read8, {0xc3}}),
+        join({other, store4, read8, {0xc3}}),
+        join({other, store8, read8, loopBack, {0xc3}}),
+        join({other, read8, store8, loopBack, {0xc3}}),
+        join({{0x53}, other, store8, read8, {0x5b, 0x41, 0xff, 0x63, 0xf0}}),
+        join({{0x53}, other, store8, read8, {0x41, 0xff, 0x63, 0xf0}}),
+        join({other, vstore4, read8, {0xc3}}),
+        join({{0x53}, other, store8, read8, {0x5b, 0xff, 0xe0}}),
+        join({{0x53}, other, store8, read8, {0x5b, 0x41, 0xff, 0x24, 0xc3}}),
+        join({{0x53}, other, store8, {0x5b, 0x41, 0xff, 0x63, 0xf0}, read8, {0xc3}}),
+        join({other, {0x64}, store8, read8, {0xc3}}),
+        join({other, {0x64}, vstore4, read8, {0xc3}}),
+        join({other, {0x67}, store8, read8, {0xc3}}),
+    };
+    const auto input = image(leaves);
+    const auto ranges = [&](const bool kills) { return Codegen::FindRedZoneDeadRanges(input.bytes, input.segments, input.functions, kills); };
+    const auto killed = ranges(true);
+    const auto plain = ranges(false);
+    const auto deadAt = [&](const std::vector<Codegen::RedZoneDeadRange>& dead, const std::uint64_t address) {
+        return std::any_of(dead.begin(), dead.end(), [&](const auto& range) { return range.Begin <= address && address < range.End; });
+    };
+    const auto first = [&](const std::size_t leaf) { return input.functions[leaf].Begin; };
+    require(deadAt(killed[0], first(0)) && !deadAt(plain[0], first(0)), "a slot an 8-byte store writes before every read was not dead before the store only with kills");
+    require(!deadAt(killed[0], first(0) + 2 + 5), "the slot between its store and its read was called dead");
+    require(!deadAt(killed[1], first(1)), "a 4-byte store killed an 8-byte read of its slot");
+    require(deadAt(killed[2], first(2)), "a loop that stores its slot before reading it kept the slot live at its head");
+    require(!deadAt(killed[3], first(3)), "a loop that reads its slot before storing it had its head called dead");
+    require(deadAt(killed[4], first(4) + 1) && plain[4].empty(), "a tail call through memory after the pops was not an exit only with kills");
+    require(killed[5].empty(), "an indirect jump with the pushes still on the stack was treated as an exit");
+    require(!deadAt(killed[6], first(6)), "a 4-byte vmovss store killed an 8-byte read of its slot");
+    require(killed[7].empty(), "a jump through a register, which a switch may use, was treated as an exit");
+    require(killed[8].empty(), "an indexed jump through memory was treated as an exit");
+    require(killed[9].empty(), "a leaf with code reached only past its tail call had instructions called dead");
+    require(!deadAt(killed[10], first(10)), "a store through fs killed a stack slot");
+    require(!deadAt(killed[11], first(11)), "a VEX store through fs killed a stack slot");
+    require(!deadAt(killed[12], first(12)), "a store with a 32-bit address killed a stack slot");
+}
+
 int main() {
     try {
         framesRedZoneLeaf();
@@ -1221,6 +1273,7 @@ int main() {
         tellsPopsWithoutRexFromXop();
         countsAFramePointerLeafsAllocationOnlyWhenAsked();
         countsAFramePointerLeafsAllocationOverItsOwnStubsWhenAsked();
+        killsRedZoneSlotsOnlyWithWholeStoresWhenAsked();
         listsFramePointerLeavesWithUnanalyzedInstructionsWhenAsked();
         std::cout << "red-zone framer tests passed\n";
         return 0;

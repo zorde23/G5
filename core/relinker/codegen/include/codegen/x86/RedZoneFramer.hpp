@@ -47,7 +47,8 @@ struct RedZoneDeadRange {
 std::vector<std::vector<RedZoneDeadRange>> FindRedZoneDeadRanges(
     const std::vector<std::uint8_t>& fileBytes,
     const std::vector<Domain::ProgramHeader>& codeSegments,
-    const std::vector<RedZoneFunction>& leaves
+    const std::vector<RedZoneFunction>& leaves,
+    bool killStores = false
 );
 
 struct RedZoneDisplacement {

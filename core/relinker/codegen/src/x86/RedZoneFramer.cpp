@@ -2,6 +2,7 @@
 #include <codegen/IInstructionScanner.hpp>
 #include <codegen/x86/X64InstructionDecoder.hpp>
 #include <algorithm>
+#include <bitset>
 #include <cstring>
 #include <iterator>
 #include <limits>
@@ -889,7 +890,49 @@ void frameSegment(
     }
 }
 
-std::vector<RedZoneDeadRange> deadRanges(const std::vector<std::uint8_t>& seg, const std::uint64_t base, const std::vector<BranchSite>& branches, const std::size_t start, const std::size_t limit) {
+std::size_t pureStoreWidth(const std::uint8_t* code, const Insn& insn) {
+    const auto& info = insn.Info;
+    const auto at = info.OpcodeOffset;
+    const auto modrm = info.ModRmByte;
+    if (!info.HasModRm || (modrm >> 6) == 3) return 0;
+    for (std::size_t prefix = 0; prefix < at; ++prefix)
+        if (code[prefix] == 0x64 || code[prefix] == 0x65 || code[prefix] == 0x67) return 0;
+    const auto lead = code[at];
+    if (info.RexPrefix == 0 && (lead == 0xc4 || lead == 0xc5)) {
+        if (lead == 0xc4 && (at + 3 >= insn.Length || (code[at + 1] & 0x1f) != 1)) return 0;
+        const auto payload = code[at + (lead == 0xc5 ? 1 : 2)];
+        const auto op = code[at + (lead == 0xc5 ? 2 : 3)];
+        const auto pp = payload & 3u;
+        const std::size_t vector = (payload & 4u) != 0 ? 32 : 16;
+        if (op == 0x11) return pp == 2 ? 4 : pp == 3 ? 8 : vector;
+        if (op == 0x29 || (op == 0x7f && (pp == 1 || pp == 2))) return vector;
+        return 0;
+    }
+    if (lead == 0x62 || lead == 0x8f) return 0;
+    bool operand16 = false;
+    bool f3 = false;
+    bool f2 = false;
+    for (std::size_t prefix = 0; prefix < at; ++prefix) {
+        if (code[prefix] == 0x66) operand16 = true;
+        else if (code[prefix] == 0xf3) f3 = true;
+        else if (code[prefix] == 0xf2) f2 = true;
+    }
+    const bool wide = (info.RexPrefix & 8) != 0;
+    const auto op = info.Opcode;
+    const auto digit = (modrm >> 3) & 7;
+    if (!info.IsTwoByteOpcode) {
+        if (op == 0x88 || (op == 0xc6 && digit == 0)) return 1;
+        if (op == 0x89 || (op == 0xc7 && digit == 0)) return wide ? 8 : operand16 ? 2 : 4;
+        return 0;
+    }
+    if (op == 0x11) return f3 ? 4 : f2 ? 8 : 16;
+    if (op == 0x29 || (op == 0x7f && (operand16 || f3))) return 16;
+    if ((op == 0x13 || op == 0x17) && !f3 && !f2) return 8;
+    if (op == 0xd6 && operand16) return 8;
+    return 0;
+}
+
+std::vector<RedZoneDeadRange> deadRanges(const std::vector<std::uint8_t>& seg, const std::uint64_t base, const std::vector<BranchSite>& branches, const std::size_t start, const std::size_t limit, const bool killStores) {
     if (enteredFromOutside(branches, start, limit, true)) return {};
     const auto scanner = MakeInstructionScanner();
     const X64InstructionDecoder decoder;
@@ -907,9 +950,21 @@ std::vector<RedZoneDeadRange> deadRanges(const std::vector<std::uint8_t>& seg, c
     std::vector<std::vector<std::size_t>> next(count);
     std::vector<std::int64_t> effect(count, 0);
     std::vector<std::optional<std::int64_t>> reads(count);
+    std::vector<std::optional<std::int64_t>> stores(count);
+    std::vector<std::size_t> storeWidth(count, 0);
+    std::vector<std::size_t> exits;
     for (std::size_t k = 0; k < count; ++k) {
         const auto& insn = body[k];
         const auto flow = insn.Info.FlowKind;
+        if (killStores && flow == ControlFlowKind::IndirectJump) {
+            const auto use = memoryUse(at(k), insn);
+            const auto modrm = insn.Info.ModRmByte;
+            const bool sibIndexed = (modrm & 7) == 4 && insn.Info.ModRmOffset + 1 < insn.Length && (((at(k)[insn.Info.ModRmOffset + 1] >> 3) & 7) != 4 || (insn.Info.RexPrefix & 2) != 0);
+            const bool throughMemory = insn.Info.HasModRm && (modrm >> 6) != 3 && !sibIndexed && !use.Indexed;
+            if (!throughMemory || use.RspBased || use.UsesRsp || usesRspOutsideOperands(at(k), insn)) return {};
+            exits.push_back(k);
+            continue;
+        }
         if (flow == ControlFlowKind::Call || flow == ControlFlowKind::IndirectCall || flow == ControlFlowKind::IndirectJump) return {};
         if (const auto adjustment = rspAdjustment(at(k), insn)) {
             effect[k] = *adjustment;
@@ -920,7 +975,13 @@ std::vector<RedZoneDeadRange> deadRanges(const std::vector<std::uint8_t>& seg, c
             if (pushedRegister(at(k), insn)) effect[k] = -8;
             else if (poppedRegister(at(k), insn)) { effect[k] = 8; reads[k] = 0; }
             else if (pushesOrPops(at(k), insn)) return {};
-            if (use.RspBased) reads[k] = reads[k] ? std::min(*reads[k], use.RspDisp) : use.RspDisp;
+            const auto width = killStores && use.RspBased ? pureStoreWidth(at(k), insn) : 0;
+            if (width != 0) {
+                stores[k] = use.RspDisp;
+                storeWidth[k] = width;
+            } else if (use.RspBased) {
+                reads[k] = reads[k] ? std::min(*reads[k], use.RspDisp) : use.RspDisp;
+            }
         }
         if (flow == ControlFlowKind::Return) { reads[k] = reads[k] ? std::min(*reads[k], std::int64_t{0}) : 0; continue; }
         if (flow == ControlFlowKind::UnconditionalJump || flow == ControlFlowKind::ConditionalBranch) {
@@ -949,6 +1010,44 @@ std::vector<RedZoneDeadRange> deadRanges(const std::vector<std::uint8_t>& seg, c
             else if (*depth[s] != value) return {};
         }
     }
+    for (const auto k : exits)
+        if (depth[k] && *depth[k] != 0) return {};
+    if (!exits.empty())
+        for (std::size_t k = 0; k < count; ++k)
+            if (!depth[k] && !(body[k].Info.FlowKind == ControlFlowKind::Sequential && (at(k)[body[k].Info.OpcodeOffset] == 0x90 || (body[k].Info.IsTwoByteOpcode && body[k].Info.Opcode == 0x1f)))) return {};
+    if (killStores) {
+        constexpr std::int64_t kSpan = 1024;
+        using Bytes = std::bitset<static_cast<std::size_t>(kSpan)>;
+        const auto mark = [](Bytes& bytes, const std::int64_t from, const std::int64_t to, const bool value) {
+            for (auto offset = std::max(from, -kSpan); offset < std::min(to, std::int64_t{0}); ++offset) bytes.set(static_cast<std::size_t>(offset + kSpan), value);
+        };
+        for (std::size_t k = 0; k < count; ++k)
+            if (depth[k] && (*depth[k] < -kSpan / 2 || (reads[k] && *depth[k] + *reads[k] < -kSpan / 2) || (stores[k] && *depth[k] + *stores[k] < -kSpan / 2))) return {};
+        std::vector<Bytes> live(count);
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (std::size_t k = count; k-- > 0;) {
+                if (!depth[k]) continue;
+                Bytes in;
+                for (const auto s : next[k]) in |= live[s];
+                if (stores[k]) mark(in, *depth[k] + *stores[k], *depth[k] + *stores[k] + static_cast<std::int64_t>(storeWidth[k]), false);
+                if (reads[k]) mark(in, *depth[k] + *reads[k], 0, true);
+                if (in != live[k]) { live[k] = in; changed = true; }
+            }
+        }
+        std::vector<RedZoneDeadRange> dead;
+        for (std::size_t k = 0; k < count; ++k) {
+            if (!depth[k]) continue;
+            bool below = false;
+            for (auto offset = -kSpan; offset < *depth[k] && !below; ++offset) below = live[k].test(static_cast<std::size_t>(offset + kSpan));
+            if (below) continue;
+            const auto begin = base + body[k].Offset;
+            const auto end = begin + body[k].Length;
+            if (!dead.empty() && dead.back().End == begin) dead.back().End = end;
+            else dead.push_back({begin, end});
+        }
+        return dead;
+    }
     constexpr auto kNone = std::numeric_limits<std::int64_t>::max();
     std::vector<std::int64_t> lowest(count, kNone);
     for (std::size_t k = 0; k < count; ++k)
@@ -975,7 +1074,8 @@ std::vector<RedZoneDeadRange> deadRanges(const std::vector<std::uint8_t>& seg, c
 std::vector<std::vector<RedZoneDeadRange>> FindRedZoneDeadRanges(
     const std::vector<std::uint8_t>& fileBytes,
     const std::vector<Domain::ProgramHeader>& codeSegments,
-    const std::vector<RedZoneFunction>& leaves
+    const std::vector<RedZoneFunction>& leaves,
+    const bool killStores
 ) {
     std::vector<std::vector<RedZoneDeadRange>> result(leaves.size());
     for (const auto& ph : codeSegments) {
@@ -999,7 +1099,7 @@ std::vector<std::vector<RedZoneDeadRange>> FindRedZoneDeadRanges(
                 }
                 std::sort(branches->begin(), branches->end(), [](const BranchSite& left, const BranchSite& right) { return left.Target < right.Target; });
             }
-            result[index] = deadRanges(seg, ph.MappedAddress, *branches, static_cast<std::size_t>(leaf.Begin - ph.MappedAddress), static_cast<std::size_t>(leaf.End - ph.MappedAddress));
+            result[index] = deadRanges(seg, ph.MappedAddress, *branches, static_cast<std::size_t>(leaf.Begin - ph.MappedAddress), static_cast<std::size_t>(leaf.End - ph.MappedAddress), killStores);
         }
     }
     return result;

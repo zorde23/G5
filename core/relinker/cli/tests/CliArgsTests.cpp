@@ -219,6 +219,9 @@ void frameRedZoneRequiresWindows() {
     expectThrows({"--windows", "--frame-red-zone", "--frame-pointer-stub-jumps", "input.elf", "output.elf"}, "--frame-pointer-stub-jumps requires --frame-pointer-allocation");
     const auto stubs = parse({"--windows", "--frame-red-zone", "--frame-pointer-allocation", "--frame-pointer-stub-jumps", "input.elf", "output.elf"});
     require(stubs.framePointerStubJumps && !counted.framePointerStubJumps, "--frame-pointer-stub-jumps was not parsed");
+    expectThrows({"--windows", "--frame-red-zone", "--precise-red-zone-kills", "input.elf", "output.elf"}, "--precise-red-zone-kills requires --precise-red-zone-guard");
+    const auto kills = parse({"--windows", "--frame-red-zone", "--precise-red-zone-guard", "--precise-red-zone-kills", "input.elf", "output.elf"});
+    require(kills.preciseRedZoneKills && !stubs.preciseRedZoneKills, "--precise-red-zone-kills was not parsed");
     expectThrows({"--windows", "--suspect-frame-pointer-leaves", "input.elf", "output.elf"}, "--suspect-frame-pointer-leaves requires --frame-red-zone");
     const auto suspect = parse({"--windows", "--frame-red-zone", "--suspect-frame-pointer-leaves", "input.elf", "output.elf"});
     require(suspect.suspectFramePointerLeaves && !ok.suspectFramePointerLeaves, "--suspect-frame-pointer-leaves was not parsed");
