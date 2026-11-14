@@ -22,6 +22,7 @@ struct Args {
     bool preciseRedZoneGuard = false;
     bool framePointerAllocation = false;
     bool suspectFramePointerLeaves = false;
+    bool framePointerStubJumps = false;
     bool writeRegistry = false;
     bool toWindows = false;
     bool toMacos = false;

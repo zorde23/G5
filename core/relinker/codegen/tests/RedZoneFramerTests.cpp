@@ -1131,6 +1131,39 @@ void listsFramePointerLeavesWithUnanalyzedInstructionsWhenAsked() {
     require(leaveExit.RedZoneFunctions == 0 && leaveExit.Leaves.empty(), "a frame-pointer leaf that ends with leave; ret was listed as a suspect");
 }
 
+void countsAFramePointerLeafsAllocationOverItsOwnStubsWhenAsked() {
+    const std::vector<std::uint8_t> insideAllocation{0x48, 0x89, 0x7d, 0xe0, 0x8b, 0x45, 0xdc};
+    const std::vector<std::uint8_t> stubJump{0xe9, 0x00, 0x10, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+    const std::vector<std::uint8_t> tlsLoad{0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00};
+    const auto report = [&](const std::vector<std::uint8_t>& slots, const bool site, const bool stubJumps, const std::vector<std::uint8_t>& siteBytes) {
+        std::vector<std::uint8_t> body = slots;
+        const auto siteAt = AllocatingPrologue.size() + body.size();
+        append(body, siteBytes);
+        const auto input = image({allocatingLeaf(body, FreeingExit)});
+        std::vector<Codegen::TrampolineSite> existing;
+        if (site) {
+            Codegen::TrampolineSite stub{};
+            stub.Address = input.functions[0].Begin + siteAt;
+            stub.Length = siteBytes.size();
+            existing.push_back(stub);
+        }
+        Codegen::RedZoneFrameReport result;
+        std::vector<Codegen::RedZoneDisplacement> displacements;
+        Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, existing, result, displacements, false, true, false, stubJumps);
+        return result;
+    };
+    const auto counted = report(insideAllocation, true, true, stubJump);
+    require(counted.RedZoneFunctions == 0 && counted.Leaves.empty(), "a frame-pointer leaf whose only jump out is its own stub stayed a red-zone leaf");
+    const auto uncounted = report(insideAllocation, true, false, stubJump);
+    require(uncounted.RedZoneFunctions == 1 && uncounted.Leaves.size() == 1, "without --frame-pointer-stub-jumps a leaf with a stub jump left the table");
+    const auto foreign = report(insideAllocation, false, true, stubJump);
+    require(foreign.RedZoneFunctions == 1 && foreign.Leaves.size() == 1, "a jump out of the function that is not a stub site left the table");
+    const auto below = report({0x48, 0x89, 0x7d, 0xd0}, true, true, stubJump);
+    require(below.RedZoneFunctions == 1 && below.Leaves.size() == 1, "a slot below the allocation left the table because of a stub jump");
+    const auto original = report(insideAllocation, true, true, tlsLoad);
+    require(original.RedZoneFunctions == 0 && original.Leaves.empty(), "a frame-pointer leaf whose TLS load a stub replaces stayed a red-zone leaf before the stub was written");
+}
+
 int main() {
     try {
         framesRedZoneLeaf();
@@ -1178,6 +1211,7 @@ int main() {
         listsEachRedZoneLeafWithWhyItWasNotFramed();
         tellsPopsWithoutRexFromXop();
         countsAFramePointerLeafsAllocationOnlyWhenAsked();
+        countsAFramePointerLeafsAllocationOverItsOwnStubsWhenAsked();
         listsFramePointerLeavesWithUnanalyzedInstructionsWhenAsked();
         std::cout << "red-zone framer tests passed\n";
         return 0;

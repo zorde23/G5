@@ -123,7 +123,7 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
         for (const auto& region : Relinker::UnusedNidFilter::ReadExceptionFunctions(sourceBytes, headers, {}, {})) functions.push_back({region.Begin, region.End});
         if (functions.empty()) throw Domain::RelinkerException("Red-zone framing needs function bounds from the executable's .eh_frame, and it has none");
         Codegen::RedZoneFrameReport report;
-        auto framed = Codegen::FrameRedZoneFunctions(sourceBytes, codeSegments, functions, trampolines, report, displacements, options.FrameShrinkWrapped, options.FramePointerAllocation, options.SuspectFramePointerLeaves);
+        auto framed = Codegen::FrameRedZoneFunctions(sourceBytes, codeSegments, functions, trampolines, report, displacements, options.FrameShrinkWrapped, options.FramePointerAllocation, options.SuspectFramePointerLeaves, options.FramePointerStubJumps);
         for (const auto& moved : displacements) {
             if (moved.Offset > sourceBytes.size() || moved.Bytes.size() > sourceBytes.size() - moved.Offset)
                 throw Domain::RelinkerException("Red-zone displacement exceeds source image", moved.Offset);
@@ -153,7 +153,7 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
 
     std::vector<Relinker::GuestArtifact> guestArtifacts;
     if (!input.Modules.empty()) {
-        guestArtifacts = Relinker::GuestModuleBuilder(options.FrameRedZone, options.FramePointerAllocation, options.SuspectFramePointerLeaves).Build(input.InputPath, input.OutputPath, result.DynamicSection, windows, macos, options.ToIntel, options.ToRosetta, *syscallScanner, options.LazyBinding, options.RunPath, options.ExcludedModules, input.ModuleRoot, input.RuntimeDirectories, std::move(input.Modules), inputProgress);
+        guestArtifacts = Relinker::GuestModuleBuilder(options.FrameRedZone, options.FramePointerAllocation, options.SuspectFramePointerLeaves, options.FramePointerStubJumps).Build(input.InputPath, input.OutputPath, result.DynamicSection, windows, macos, options.ToIntel, options.ToRosetta, *syscallScanner, options.LazyBinding, options.RunPath, options.ExcludedModules, input.ModuleRoot, input.RuntimeDirectories, std::move(input.Modules), inputProgress);
     }
 
     auto byteWriter = std::make_shared<Io::ByteWriter>();
