@@ -1162,6 +1162,15 @@ void countsAFramePointerLeafsAllocationOverItsOwnStubsWhenAsked() {
     require(below.RedZoneFunctions == 1 && below.Leaves.size() == 1, "a slot below the allocation left the table because of a stub jump");
     const auto original = report(insideAllocation, true, true, tlsLoad);
     require(original.RedZoneFunctions == 0 && original.Leaves.empty(), "a frame-pointer leaf whose TLS load a stub replaces stayed a red-zone leaf before the stub was written");
+    const std::vector<std::uint8_t> vexSlots{0xc5, 0xfa, 0x11, 0x45, 0xe0, 0xc5, 0xfa, 0x10, 0x4d, 0xe4, 0xc4, 0xe1, 0x7a, 0x11, 0x55, 0xe8};
+    const auto vex = report(vexSlots, false, true, {0x90});
+    require(vex.RedZoneFunctions == 0 && vex.Leaves.empty(), "a frame-pointer leaf whose slots inside its allocation are VEX loads and stores stayed a red-zone leaf");
+    const auto vexUncounted = report(vexSlots, false, false, {0x90});
+    require(vexUncounted.RedZoneFunctions == 1 && vexUncounted.Leaves.size() == 1, "without --frame-pointer-stub-jumps a leaf with VEX slot accesses left the table");
+    const auto vexBelow = report({0xc5, 0xfa, 0x11, 0x45, 0xd0}, false, true, {0x90});
+    require(vexBelow.RedZoneFunctions == 1 && vexBelow.Leaves.size() == 1, "a VEX store below the allocation left the table");
+    const auto vexGeneral = report({0xc5, 0xfa, 0x11, 0x45, 0xe0, 0xc5, 0xf9, 0x7e, 0xe8}, false, true, {0x90});
+    require(vexGeneral.RedZoneFunctions == 1 && vexGeneral.Leaves.size() == 1, "a leaf with a VEX move into a general register left the table");
 }
 
 int main() {
