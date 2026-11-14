@@ -21,6 +21,7 @@
 #include <unistd.h>
 #endif
 #include "prx/libc/include/CallTrace.hpp"
+#include "prx/libc/include/KytyGpu.hpp"
 #include "prx/libc/include/general/AsmMacros.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <algorithm>
@@ -434,6 +435,7 @@ void APS5_VABI CallTraceRecord_nid_no_patch(const void* record, std::uint64_t re
 }
 
 void* TraceImport_nid_no_patch(void* target, const char* name, const char* library) {
+    target = KytyGpuImport(target, name, library);
     if (target == nullptr || name == nullptr || library == nullptr || !Selected(library)) return target;
     std::lock_guard lock(g_mutex);
     if (g_ring.load(std::memory_order_relaxed) == nullptr) {

@@ -2,6 +2,7 @@
 
 ### Silent stubs
 
+- [Kyty GPU import binding](../../../core/libs/prx/libc/src/specifics/windows/KytyGpu.cpp) (libc, `APS5_KYTY_GPU=1` only): a function import of libSceAgc, libSceAgcDriver, libSceVideoOut or libScePad whose NID the Kyty GPU DLL does not resolve is bound to a stub that returns 0, listed with a `[kyty-gpu]` line at startup and reported once when called, instead of failing at startup; in one title's runs under Kyty none of those 97 NIDs was called. The binding happens in `TraceImport_nid_no_patch`, which the relinker's entry stub calls (with `--trace-imports`) only for imports a g5 library already resolved, with no addend, not weak and with a library name: a NID that Kyty has and no g5 library exports still fails at startup, and data imports keep the g5 export. Closes when: the entry stub asks the Kyty DLL before the g5 libraries, and a NID neither has fails at startup.
 - [_Mtx_current_owns](../../../core/libs/prx/libc/src/Threads.cpp) (libSceLibcInternal, implemented in libc, NID `VYQwFs4CC4Y`) returns 1 and ignores its argument. This follows the PS5 12.00 body reading reported in [PR8859](https://github.com/boykopovar/AnyPS5/pull/8859), rather than inspecting host mutex ownership. The firmware observation is attributed to that contributor; other firmware versions and the argument's console type remain unverified.
 
 ### Unknown function info

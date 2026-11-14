@@ -54,6 +54,7 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/gcc/StackGuard.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/CrashReport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/x86_64/CallTrace.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/KytyGpu.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/linux/DlIteratePhdr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/macos/GuestImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Strings.cpp
@@ -865,6 +866,17 @@ if(BUILD_TESTING)
             add_test(NAME guest_call_trace_fixed_base_abort COMMAND guest_call_trace_fixed_base_tests abort)
             set_tests_properties(guest_call_trace_fixed_base_abort PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION
                 "#1 thread [0-9]+ libTraced.prx Integers from 0x00000000004[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f] guest_call_trace_fixed_base_tests\\+0x[0-9a-f]?[0-9a-f]?[0-9a-f]?[0-9a-f]?[0-9a-f][^0-9a-f]")
+        endif()
+        if(WIN32)
+            add_library(kyty_gpu_fake SHARED ${LIBS_INCLUDE_DIR}/tests/KytyGpuFake.cpp)
+            set_target_properties(kyty_gpu_fake PROPERTIES PREFIX "" RUNTIME_OUTPUT_DIRECTORY "$<1:${ANYPS5_TEST_OUTPUT_DIRECTORY}>")
+            add_test_executable(kyty_gpu_import_tests ${LIBS_INCLUDE_DIR}/tests/KytyGpuImport.cpp)
+            target_include_directories(kyty_gpu_import_tests PRIVATE ${LIBS_INCLUDE_DIR})
+            target_link_libraries(kyty_gpu_import_tests PRIVATE libc)
+            configure_windows_unwind(kyty_gpu_import_tests)
+            add_dependencies(kyty_gpu_import_tests kyty_gpu_fake)
+            add_test(NAME kyty_gpu_import COMMAND kyty_gpu_import_tests)
+            set_tests_properties(kyty_gpu_import PROPERTIES TIMEOUT 20 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endif()
     add_test_executable(guest_syslog_tests ${LIBS_INCLUDE_DIR}/tests/GuestSyslog.cpp)
