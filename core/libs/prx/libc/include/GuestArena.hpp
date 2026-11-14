@@ -14,6 +14,17 @@ inline constexpr std::uintptr_t GuestAddressOffset = 0x0000100000000000ull;
 inline constexpr std::uintptr_t GuestAddressOffset = 0;
 #endif
 
+enum class CommitEpochOrigin : std::uint32_t { Mutation, Invalidate, Commit, Reset, Map, MapDirect, MapFile, SetProtection, KernelProtect, KernelStack, HeapAbandon, Count };
+inline constexpr const char* CommitEpochOriginNames[] = {"mutation", "invalidate", "commit", "reset", "map", "map-direct", "map-file", "set-protection", "kernel-protect", "kernel-stack", "heap-abandon"};
+inline constexpr std::uintptr_t CommitEpochBucketBytes = std::uintptr_t{1} << 30;
+
+struct CommitEpochEvent {
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t epoch = 0;
+    CommitEpochOrigin origin = CommitEpochOrigin::Count;
+};
+
 #ifndef _WIN32
 using SharedBackingResolver = bool (*)(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset);
 using SharedBackingWriter = bool (*)(std::uintptr_t address, const void* source, std::size_t bytes);
@@ -74,6 +85,14 @@ bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaSetHostReadHook_nid_no_patch(void (*hook)(std::uintptr_t address, std::size_t bytes));
 void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t bytes);
+bool GuestArenaCommitEpochEnabled_nid_no_patch();
+std::uint64_t GuestArenaCommitEpoch_nid_no_patch();
+std::uint64_t GuestArenaBucketEpochs_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+void GuestArenaSetCommitEpochForget_nid_no_patch(void (*forget)(std::uintptr_t address, std::size_t bytes));
+void GuestArenaCommitEpochCounts_nid_no_patch(std::uint64_t* counts);
+std::size_t GuestArenaCommitEpochEvents_nid_no_patch(CommitEpochEvent* events, std::size_t count);
+void GuestArenaNoteCommitEpoch_nid_no_patch(std::uintptr_t address, std::size_t bytes, CommitEpochOrigin origin);
+bool GuestArenaPrivateCovers_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 
 }
 
@@ -91,6 +110,19 @@ private:
     void* pointer;
     std::size_t bytes;
     bool open;
+};
+
+class CommitEpochNote {
+public:
+    CommitEpochNote(const void* pointer, std::size_t bytes, CommitEpochOrigin origin) : address(reinterpret_cast<std::uintptr_t>(pointer)), bytes(bytes), origin(origin) {}
+    ~CommitEpochNote() { GuestArenaNoteCommitEpoch_nid_no_patch(address, bytes, origin); }
+    CommitEpochNote(const CommitEpochNote&) = delete;
+    CommitEpochNote& operator=(const CommitEpochNote&) = delete;
+
+private:
+    std::uintptr_t address;
+    std::size_t bytes;
+    CommitEpochOrigin origin;
 };
 
 #ifdef _WIN32

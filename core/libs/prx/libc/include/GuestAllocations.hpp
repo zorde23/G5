@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBC_INCLUDE_GUESTALLOCATIONS_HPP
 #define CORE_LIBS_PRX_LIBC_INCLUDE_GUESTALLOCATIONS_HPP
 
+#include "prx/libc/include/GuestArena.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -78,6 +79,7 @@ std::uint64_t GuestAllocationsGeneration_nid_postfix();
 // range whose mapping or protection changed (registry mutations and guest heap decommits).
 void GuestAllocationsSetInvalidator_nid_postfix(void (*callback)(std::uintptr_t address, std::size_t bytes));
 void GuestAllocationsInvalidate_nid_postfix(std::uintptr_t address, std::size_t bytes);
+void GuestAllocationsInvalidateFrom_nid_no_patch(std::uintptr_t address, std::size_t bytes, GuestArena::CommitEpochOrigin origin);
 // A mutation of a range that GPU work still leases waits for the lease (RequireUnpinned). The
 // waiter, set by the GPU driver, is called on the mutating thread with the registry lock released
 // and finishes the GPU work that holds leases; it returns whether it finished any (a round that found

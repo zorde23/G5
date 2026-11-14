@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <map>
 #include <memory>
@@ -554,6 +555,11 @@ void ForgetInaccessiblePages(std::uintptr_t address, std::size_t bytes) {
     Pages().forgetInaccessible(address, bytes);
 }
 
+void ForgetForCommitEpoch(std::uintptr_t address, std::size_t bytes) {
+    Pages().accessSerial.fetch_add(1, std::memory_order_seq_cst);
+    Pages().forget(address, bytes);
+}
+
 #ifdef __linux__
 int mainImageExtent(dl_phdr_info* info, std::size_t, void* data) {
     constexpr auto mask = static_cast<std::uintptr_t>(PageBytes - 1);
@@ -606,6 +612,7 @@ void PageStates::initialize() {
         if (arenaCached || imageCached) {
             GuestAllocations::GuestAllocationsSetInvalidator_nid_postfix(&ForgetPages);
             GuestArena::GuestArenaSetAccessObserver_nid_postfix(&ForgetInaccessiblePages);
+            GuestArena::GuestArenaSetCommitEpochForget_nid_no_patch(&ForgetForCommitEpoch);
         }
     });
     ready.store(true, std::memory_order_release);
@@ -819,6 +826,144 @@ std::string verify(std::uintptr_t address, std::size_t bytes, bool writable) {
     return reason;
 }
 
+struct CommitEpochKey {
+    std::uint64_t address;
+    std::size_t bytes;
+    bool writable;
+    bool operator==(const CommitEpochKey&) const = default;
+};
+
+struct CommitEpochKeyHash {
+    std::size_t operator()(const CommitEpochKey& key) const {
+        return std::hash<std::uint64_t>{}(key.address ^ (static_cast<std::uint64_t>(key.bytes) << 1) ^ static_cast<std::uint64_t>(key.writable));
+    }
+};
+
+struct CommitEpochEntry {
+    std::uint64_t global;
+    std::uint64_t bucket;
+    Commitment result;
+    std::chrono::steady_clock::time_point filled;
+};
+
+constexpr std::size_t CommitEpochEntries = 4096;
+constexpr auto CommitEpochOrigins = static_cast<std::size_t>(GuestArena::CommitEpochOrigin::Count);
+
+struct CommitEpochSimulator {
+    AgcDriver::Mutex mutex;
+    std::unordered_map<CommitEpochKey, CommitEpochEntry, CommitEpochKeyHash> entries;
+    std::deque<CommitEpochKey> order;
+    std::atomic<std::uint64_t> queries{0};
+    std::atomic<std::uint64_t> globalHits{0};
+    std::atomic<std::uint64_t> bucketHits{0};
+    std::atomic<std::uint64_t> ineligible{0};
+    std::atomic<std::uint64_t> divergences{0};
+    std::atomic<std::uint64_t> inFlight{0};
+    std::atomic<std::int64_t> reportedAt{0};
+    std::array<std::uint64_t, CommitEpochOrigins> reportedCounts{};
+};
+
+CommitEpochSimulator& commitEpochSimulator() {
+    static auto* simulator = new CommitEpochSimulator;
+    return *simulator;
+}
+
+bool sameCommitment(const Commitment& left, const Commitment& right) {
+    return left.whole == right.whole && left.ranges == right.ranges;
+}
+
+void reportCommitEpoch() {
+    auto& simulator = commitEpochSimulator();
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (simulator.reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    std::array<std::uint64_t, CommitEpochOrigins> counts{};
+    GuestArena::GuestArenaCommitEpochCounts_nid_no_patch(counts.data());
+    std::string text = "[commit-epoch] (10 s) bumps:";
+    std::uint64_t bumps = 0;
+    for (std::size_t origin = 0; origin < CommitEpochOrigins; ++origin) {
+        const auto delta = counts[origin] - simulator.reportedCounts[origin];
+        bumps += delta;
+        text += ' ';
+        text += GuestArena::CommitEpochOriginNames[origin];
+        text += ' ';
+        text += std::to_string(delta);
+    }
+    simulator.reportedCounts = counts;
+    char tail[256];
+    std::snprintf(tail, sizeof(tail), " (total %llu); queries %llu, global hits %llu, bucket hits %llu, ineligible %llu, divergences %llu, in flight %llu\n", static_cast<unsigned long long>(bumps), static_cast<unsigned long long>(simulator.queries.exchange(0)), static_cast<unsigned long long>(simulator.globalHits.exchange(0)), static_cast<unsigned long long>(simulator.bucketHits.exchange(0)), static_cast<unsigned long long>(simulator.ineligible.exchange(0)), static_cast<unsigned long long>(simulator.divergences.exchange(0)), static_cast<unsigned long long>(simulator.inFlight.exchange(0)));
+    text += tail;
+    AgcDriver::ProfilePrint_nid_no_patch("%s", text.c_str());
+}
+
+void reportCommitEpochDivergence(const CommitEpochKey& key, const CommitEpochEntry& entry, const Commitment& fresh, std::uint64_t global, std::uint64_t bucket, const char* kind) {
+    const auto age = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - entry.filled).count();
+    std::string text;
+    char line[384];
+    std::snprintf(line, sizeof(line), "[commit-epoch-verify] %s hit diverged: 0x%llx+0x%zx writable %d, global epoch %llu (now %llu), bucket epoch %llu (now %llu), age %.1f ms, stored %zu ranges whole %d, fresh %zu ranges whole %d; last notes:", kind, static_cast<unsigned long long>(key.address), key.bytes, key.writable ? 1 : 0, static_cast<unsigned long long>(entry.global), static_cast<unsigned long long>(global), static_cast<unsigned long long>(entry.bucket), static_cast<unsigned long long>(bucket), age, entry.result.ranges.size(), entry.result.whole ? 1 : 0, fresh.ranges.size(), fresh.whole ? 1 : 0);
+    text = line;
+    std::array<GuestArena::CommitEpochEvent, 8> events{};
+    const auto count = GuestArena::GuestArenaCommitEpochEvents_nid_no_patch(events.data(), events.size());
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto& event = events[index];
+        std::snprintf(line, sizeof(line), " %s 0x%llx+0x%llx @%llu", GuestArena::CommitEpochOriginNames[static_cast<std::size_t>(event.origin)], static_cast<unsigned long long>(event.address), static_cast<unsigned long long>(event.bytes), static_cast<unsigned long long>(event.epoch));
+        text += line;
+    }
+    text += '\n';
+    std::fputs(text.c_str(), stderr);
+}
+
+template <class Describe>
+void simulateCommitEpoch(std::uint64_t address, std::size_t bytes, bool writable, std::uint64_t global, std::uint64_t bucket, bool eligible, const Commitment& fresh, Describe&& describe) {
+    auto& simulator = commitEpochSimulator();
+    simulator.queries.fetch_add(1, std::memory_order_relaxed);
+    const CommitEpochKey key{address, bytes, writable};
+    if (!eligible) {
+        simulator.ineligible.fetch_add(1, std::memory_order_relaxed);
+        reportCommitEpoch();
+        return;
+    }
+    std::optional<CommitEpochEntry> stored;
+    {
+        std::lock_guard lock(simulator.mutex);
+        if (const auto found = simulator.entries.find(key); found != simulator.entries.end()) stored = found->second;
+    }
+    bool keep = false;
+    if (stored) {
+        const bool globalHit = stored->global == global;
+        const bool bucketHit = stored->bucket == bucket;
+        if (globalHit) simulator.globalHits.fetch_add(1, std::memory_order_relaxed);
+        if (bucketHit) simulator.bucketHits.fetch_add(1, std::memory_order_relaxed);
+        keep = globalHit && bucketHit;
+        if ((globalHit || bucketHit) && !sameCommitment(stored->result, fresh)) {
+            keep = false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            const auto retried = describe();
+            const auto globalNow = GuestArena::GuestArenaCommitEpoch_nid_no_patch();
+            const auto bucketNow = GuestArena::GuestArenaBucketEpochs_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+            const bool stable = globalHit ? globalNow == global : bucketNow == bucket;
+            if (stable && !sameCommitment(stored->result, retried)) {
+                simulator.divergences.fetch_add(1, std::memory_order_relaxed);
+                reportCommitEpochDivergence(key, *stored, retried, globalNow, bucketNow, globalHit ? "global" : "bucket");
+            } else {
+                simulator.inFlight.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    if (!keep) {
+        std::lock_guard lock(simulator.mutex);
+        const auto [position, inserted] = simulator.entries.insert_or_assign(key, CommitEpochEntry{global, bucket, fresh, std::chrono::steady_clock::now()});
+        static_cast<void>(position);
+        if (inserted) {
+            simulator.order.push_back(key);
+            if (simulator.order.size() > CommitEpochEntries) {
+                simulator.entries.erase(simulator.order.front());
+                simulator.order.pop_front();
+            }
+        }
+    }
+    reportCommitEpoch();
+}
+
 }
 
 void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable) {
@@ -847,16 +992,26 @@ std::uint64_t ForgetSerial() {
 Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writable) {
     require(bytes <= std::numeric_limits<std::uint64_t>::max() - address, "address range overflow");
     const TimedAccess timed(CounterVerify, bytes);
-    Commitment result;
-    const bool queried = describePages(static_cast<std::uintptr_t>(address), bytes, [&](const PageRun& run) {
-        if (run.readable && (!writable || run.writable)) {
-            if (!result.ranges.empty() && result.ranges.back().second == run.begin) result.ranges.back().second = run.end;
-            else result.ranges.emplace_back(run.begin, run.end);
-        }
-        return true;
-    });
-    require(queried, "cannot query guest memory");
-    result.whole = bytes == 0 || (result.ranges.size() == 1 && result.ranges.front().first == address && result.ranges.front().second == address + bytes);
+    const auto describe = [&] {
+        Commitment result;
+        const bool queried = describePages(static_cast<std::uintptr_t>(address), bytes, [&](const PageRun& run) {
+            if (run.readable && (!writable || run.writable)) {
+                if (!result.ranges.empty() && result.ranges.back().second == run.begin) result.ranges.back().second = run.end;
+                else result.ranges.emplace_back(run.begin, run.end);
+            }
+            return true;
+        });
+        require(queried, "cannot query guest memory");
+        result.whole = bytes == 0 || (result.ranges.size() == 1 && result.ranges.front().first == address && result.ranges.front().second == address + bytes);
+        return result;
+    };
+    static const bool commitEpoch = GuestArena::GuestArenaCommitEpochEnabled_nid_no_patch();
+    if (!commitEpoch) return describe();
+    const auto global = GuestArena::GuestArenaCommitEpoch_nid_no_patch();
+    const auto bucket = GuestArena::GuestArenaBucketEpochs_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+    const bool eligible = GuestArena::GuestArenaPrivateCovers_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+    auto result = describe();
+    simulateCommitEpoch(address, bytes, writable, global, bucket, eligible, result, describe);
     return result;
 }
 

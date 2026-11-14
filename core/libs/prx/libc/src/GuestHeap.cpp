@@ -160,6 +160,7 @@ private:
 
     static void abandon(void* pointer, std::size_t bytes) {
         GuestArena::GuestArenaReset_nid_postfix(pointer, bytes);
+        if (GuestArena::GuestArenaCommitEpochEnabled_nid_no_patch()) GuestAllocations::GuestAllocationsInvalidateFrom_nid_no_patch(reinterpret_cast<std::uintptr_t>(pointer), bytes, GuestArena::CommitEpochOrigin::HeapAbandon);
         GuestArena::GuestArenaRelease_nid_postfix(pointer, bytes);
     }
 

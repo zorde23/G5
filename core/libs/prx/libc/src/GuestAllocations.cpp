@@ -160,6 +160,7 @@ void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     if (const auto callback = invalidator.load(std::memory_order_acquire)) {
         for (const auto& [address, bytes] : state->changed) callback(address, bytes);
     }
+    for (const auto& [address, bytes] : state->changed) GuestArena::GuestArenaNoteCommitEpoch_nid_no_patch(address, bytes, GuestArena::CommitEpochOrigin::Mutation);
     if (!state->gpuMapped.empty()) gpuMapObserverCalls.fetch_add(1);
     const auto observer = state->gpuMapped.empty() ? nullptr : gpuMapObserver.load();
     Lease::Ranges mapped;
@@ -195,8 +196,13 @@ void GuestAllocationsSetInvalidator_nid_postfix(void (*callback)(std::uintptr_t,
 }
 
 void GuestAllocationsInvalidate_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    GuestAllocationsInvalidateFrom_nid_no_patch(address, bytes, GuestArena::CommitEpochOrigin::Invalidate);
+}
+
+void GuestAllocationsInvalidateFrom_nid_no_patch(std::uintptr_t address, std::size_t bytes, GuestArena::CommitEpochOrigin origin) {
     generation.fetch_add(1, std::memory_order_seq_cst);
     if (const auto callback = invalidator.load(std::memory_order_acquire)) callback(address, bytes);
+    GuestArena::GuestArenaNoteCommitEpoch_nid_no_patch(address, bytes, origin);
 }
 
 void GuestAllocationsSetGpuMapObserver_nid_postfix(void (*callback)(const Mapped& ranges, std::uint64_t generation)) {

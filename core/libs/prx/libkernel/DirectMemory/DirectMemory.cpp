@@ -66,6 +66,14 @@ struct KernelArena {
     void Release(const void* pointer, size_t len) { GuestArena::GuestArenaRelease_nid_postfix(pointer, len); }
 };
 
+struct StackInvalidation {
+    std::uintptr_t start;
+    size_t len;
+    ~StackInvalidation() {
+        if (GuestArena::GuestArenaCommitEpochEnabled_nid_no_patch()) GuestAllocations::GuestAllocationsInvalidateFrom_nid_no_patch(start, len, GuestArena::CommitEpochOrigin::KernelStack);
+    }
+};
+
 static void CommitArenaRange(void* addr, size_t len, DWORD winProt) {
     GuestArena::GuestArenaCommit_nid_postfix(addr, len, winProt, PS5_PAGE_SIZE);
 }
@@ -155,6 +163,7 @@ static bool AtStackReserveBottom(std::uintptr_t start, std::uintptr_t end) {
 }
 
 static int mprotect(void* addr, size_t len, int prot) {
+    const GuestArena::CommitEpochNote note(addr, len, GuestArena::CommitEpochOrigin::KernelProtect);
     GuestArena::GuestArenaSetProtection_nid_postfix(reinterpret_cast<std::uintptr_t>(addr), len, WinProtFromPosix(prot));
     if (prot != PROT_NONE && KernelArena::Get().Owns(addr, len)) CommitArenaRange(addr, len, WinProtFromPosix(prot));
     auto cursor = reinterpret_cast<std::uintptr_t>(addr);
@@ -1113,6 +1122,7 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment, bo
             const auto recorded = replacement.emplace(start, ProtectedRange{start + len, ReportedProtection(prot)}).first;
             result = SCE_KERNEL_ERROR_ENOMEM;
             if (!VirtualFree(*addr, len, MEM_DECOMMIT)) return false;
+            const StackInvalidation invalidation{start, len};
             if (VirtualAlloc(*addr, len, MEM_COMMIT, WinProtFromPosix(LinuxProtFromSce(prot))) != *addr) {
                 const auto error = GetLastError();
                 recorded->second.prot = 0;

@@ -1179,6 +1179,18 @@ if(WIN32)
         set_tests_properties(guest_heap_rounding_overflow PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+
+    add_test_executable(guest_commit_epoch_tests EXCLUDE_FROM_ALL ${LIBS_INCLUDE_DIR}/tests/GuestCommitEpoch.cpp)
+    target_include_directories(guest_commit_epoch_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_commit_epoch_tests PRIVATE libc)
+    configure_windows_unwind(guest_commit_epoch_tests)
+    set_target_properties(guest_commit_epoch_tests PROPERTIES CXX_EXTENSIONS OFF)
+    if(BUILD_TESTING)
+        set_target_properties(guest_commit_epoch_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+        add_test(NAME guest_commit_epoch COMMAND guest_commit_epoch_tests)
+        set_tests_properties(guest_commit_epoch PROPERTIES TIMEOUT 30 ENVIRONMENT "APS5_COMMIT_EPOCH=1" ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 endif()
 
 if(NOT WIN32)

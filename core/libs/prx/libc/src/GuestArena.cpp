@@ -2,9 +2,13 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/WindowsMappings.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
+#include <limits>
+#include <mutex>
 #ifndef _WIN32
 #include <cerrno>
 #include <fstream>
@@ -354,6 +358,41 @@ public:
 
 const bool g_reserved = (Arena::Get(), true);
 
+constexpr std::size_t CommitEpochBuckets = (ApplicationAreaEnd - ArenaStart) / CommitEpochBucketBytes + 1;
+constexpr std::size_t CommitEpochEvents = 64;
+constexpr auto CommitEpochOrigins = static_cast<std::size_t>(CommitEpochOrigin::Count);
+static_assert(std::size(CommitEpochOriginNames) == CommitEpochOrigins);
+
+struct CommitEpochState {
+    std::atomic<std::uint64_t> epoch{0};
+    std::array<std::atomic<std::uint64_t>, CommitEpochBuckets> buckets{};
+    std::array<std::atomic<std::uint64_t>, CommitEpochOrigins> counts{};
+    std::atomic<void (*)(std::uintptr_t, std::size_t)> forget{nullptr};
+    std::mutex eventLock;
+    std::array<CommitEpochEvent, CommitEpochEvents> events{};
+    std::size_t nextEvent = 0;
+};
+
+CommitEpochState& commitEpochState() {
+    static auto* state = new CommitEpochState;
+    return *state;
+}
+
+bool commitEpochBucketRange(std::uintptr_t address, std::size_t bytes, std::size_t& first, std::size_t& last) {
+    const auto& arena = Arena::Get();
+    if (!arena.Available() || bytes == 0) return false;
+    const auto end = bytes > std::numeric_limits<std::uintptr_t>::max() - address ? std::numeric_limits<std::uintptr_t>::max() : address + bytes;
+    if (address >= arena.Base() + arena.Size() || end <= arena.Base()) return false;
+    first = std::min((std::max(address, arena.Base()) - arena.Base()) / CommitEpochBucketBytes, CommitEpochBuckets - 1);
+    last = std::min((std::min(end, arena.Base() + arena.Size()) - 1 - arena.Base()) / CommitEpochBucketBytes, CommitEpochBuckets - 1);
+    return true;
+}
+
+bool commitEpochEnabled() {
+    static const bool enabled = std::getenv("APS5_COMMIT_EPOCH") != nullptr;
+    return enabled;
+}
+
 }
 
 bool GuestArenaAvailable_nid_postfix() {
@@ -392,6 +431,68 @@ void GuestArenaRelease_nid_postfix(const void* pointer, std::size_t bytes) {
     Arena::Get().Release(pointer, bytes);
 }
 
+bool GuestArenaCommitEpochEnabled_nid_no_patch() {
+    return commitEpochEnabled();
+}
+
+std::uint64_t GuestArenaCommitEpoch_nid_no_patch() {
+    return commitEpochState().epoch.load(std::memory_order_seq_cst);
+}
+
+std::uint64_t GuestArenaBucketEpochs_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    auto& state = commitEpochState();
+    std::size_t first = 0, last = 0;
+    if (!commitEpochBucketRange(address, bytes, first, last)) return state.epoch.load(std::memory_order_seq_cst);
+    std::uint64_t sum = 0;
+    for (auto bucket = first; bucket <= last; ++bucket) sum += state.buckets[bucket].load(std::memory_order_seq_cst);
+    return sum;
+}
+
+void GuestArenaSetCommitEpochForget_nid_no_patch(void (*forget)(std::uintptr_t address, std::size_t bytes)) {
+    commitEpochState().forget.store(forget, std::memory_order_release);
+}
+
+void GuestArenaCommitEpochCounts_nid_no_patch(std::uint64_t* counts) {
+    for (std::size_t origin = 0; origin < CommitEpochOrigins; ++origin) counts[origin] = commitEpochState().counts[origin].load(std::memory_order_relaxed);
+}
+
+std::size_t GuestArenaCommitEpochEvents_nid_no_patch(CommitEpochEvent* events, std::size_t count) {
+    auto& state = commitEpochState();
+    std::lock_guard lock(state.eventLock);
+    std::size_t copied = 0;
+    for (; copied < count && copied < CommitEpochEvents; ++copied) {
+        const auto& event = state.events[(state.nextEvent + CommitEpochEvents - 1 - copied) % CommitEpochEvents];
+        if (event.origin == CommitEpochOrigin::Count) break;
+        events[copied] = event;
+    }
+    return copied;
+}
+
+void GuestArenaNoteCommitEpoch_nid_no_patch(std::uintptr_t address, std::size_t bytes, CommitEpochOrigin origin) {
+    if (!commitEpochEnabled()) return;
+    auto& state = commitEpochState();
+    if (const auto forget = state.forget.load(std::memory_order_acquire)) forget(address, bytes);
+    const auto epoch = state.epoch.fetch_add(1, std::memory_order_seq_cst) + 1;
+    std::size_t first = 0, last = 0;
+    if (commitEpochBucketRange(address, bytes, first, last)) {
+        for (auto bucket = first; bucket <= last; ++bucket) state.buckets[bucket].fetch_add(1, std::memory_order_seq_cst);
+    }
+    state.counts[static_cast<std::size_t>(origin)].fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard lock(state.eventLock);
+    state.events[state.nextEvent] = CommitEpochEvent{address, bytes, epoch, origin};
+    state.nextEvent = (state.nextEvent + 1) % CommitEpochEvents;
+}
+
+bool GuestArenaPrivateCovers_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+#ifdef _WIN32
+    return bytes != 0 && Arena::Get().Contains(reinterpret_cast<const void*>(address), bytes) && WindowsMappings::Get().PrivateCovers(address, bytes);
+#else
+    (void)address;
+    (void)bytes;
+    return false;
+#endif
+}
+
 void GuestArenaRange_nid_postfix(std::uintptr_t* base, std::size_t* bytes) {
     *base = Arena::Get().Base();
     *bytes = Arena::Get().Size();
@@ -409,6 +510,7 @@ std::invalid_argument OutsideArena(const char* operation, const void* pointer, s
 
 #ifdef _WIN32
 void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
+    const CommitEpochNote note(reinterpret_cast<const void*>(address), bytes, CommitEpochOrigin::SetProtection);
     WindowsMappings::Get().SetProtection(address, bytes, protection);
     noteAccess(reinterpret_cast<const void*>(address), bytes);
 }
@@ -461,6 +563,7 @@ void GuestArenaSetPrivateMappingObserver_nid_postfix(void (*callback)(std::uintp
 
 void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_t protection, std::size_t granule) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("commit", pointer, bytes);
+    const CommitEpochNote note(pointer, bytes, CommitEpochOrigin::Commit);
     const auto generation = commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
     const auto created = WindowsMappings::Get().Commit(pointer, bytes, protection, granule, Arena::Get().WriteWatched());
     if (const auto callback = privateMappingObserver.load(std::memory_order_acquire)) {
@@ -471,17 +574,20 @@ void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_
 
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("reset", pointer, bytes);
+    const CommitEpochNote note(pointer, bytes, CommitEpochOrigin::Reset);
     WindowsMappings::Get().Reset(pointer, bytes);
 }
 
 void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("shared mapping", pointer, bytes);
+    const CommitEpochNote note(pointer, bytes, CommitEpochOrigin::Map);
     WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), false);
     noteAccess(pointer, bytes);
 }
 
 void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("direct memory mapping", pointer, bytes);
+    const CommitEpochNote note(pointer, bytes, CommitEpochOrigin::MapDirect);
     const auto generation = commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
     std::vector<std::pair<std::uintptr_t, std::size_t>> created;
     std::exception_ptr failure;
@@ -504,6 +610,7 @@ void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* sec
 
 void GuestArenaMapFile_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection, std::uint32_t viewProtection, std::size_t sectionBytes) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("file mapping", pointer, bytes);
+    const CommitEpochNote note(pointer, bytes, CommitEpochOrigin::MapFile);
     WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), false, viewProtection, sectionBytes);
 }
 
@@ -572,6 +679,7 @@ void* PlaceAt(void* pointer, std::size_t bytes, std::uint32_t protection) {
 #if defined(__linux__) || defined(__APPLE__)
 void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
     if (!Arena::Get().Contains(reinterpret_cast<void*>(address), bytes)) throw OutsideArena("set protection", reinterpret_cast<void*>(address), bytes);
+    const CommitEpochNote note(reinterpret_cast<const void*>(address), bytes, CommitEpochOrigin::SetProtection);
     if (mprotect(reinterpret_cast<void*>(address), bytes, PosixProtection(protection)) != 0)
         throw std::system_error(errno, std::generic_category(), "guest arena protection failed");
     noteAccess(reinterpret_cast<const void*>(address), bytes);
@@ -580,6 +688,7 @@ void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t byt
 void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_t protection, std::size_t granule) {
     (void)granule;
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("commit", pointer, bytes);
+    const CommitEpochNote note(pointer, bytes, CommitEpochOrigin::Commit);
     const bool marked = Arena::Get().MarkUsedForCommit(pointer, bytes);
     try {
         if (PlaceAt(pointer, bytes, protection) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "guest arena commit failed");
@@ -592,6 +701,7 @@ void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_
 
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("reset", pointer, bytes);
+    const CommitEpochNote note(pointer, bytes, CommitEpochOrigin::Reset);
     if (PlaceAt(pointer, bytes, 0x01) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "guest arena reset failed");
 }
 #endif

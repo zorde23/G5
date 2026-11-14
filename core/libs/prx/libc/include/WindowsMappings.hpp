@@ -42,6 +42,15 @@ public:
         return allocate(GetCurrentProcess(), address, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
     }
 
+    bool PrivateCovers(std::uintptr_t address, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        for (auto cursor = address; cursor < address + bytes;) {
+            cursor = privateAllocationEnd(cursor);
+            if (cursor == 0) return false;
+        }
+        return true;
+    }
+
     std::vector<std::pair<std::uintptr_t, std::size_t>> Commit(void* address, std::size_t bytes, DWORD protection, std::size_t granule, bool watched) {
         if (granule == 0) throw std::invalid_argument("guest memory commit granule is zero");
         std::vector<std::pair<std::uintptr_t, std::size_t>> created;
