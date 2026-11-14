@@ -100,6 +100,10 @@ bool GuestArenaPrivateCovers_nid_no_patch(std::uintptr_t address, std::size_t by
 // `address` and the latest guest mapping changes in its 64 KiB, one text per call of `line` (Windows;
 // nothing elsewhere).
 void GuestArenaReportProtections_nid_no_patch(std::uintptr_t address, void (*line)(const char* text));
+inline constexpr std::size_t DonationPageBytes = 16 * 1024;
+bool GuestArenaDonate_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+void GuestArenaWithdraw_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+bool GuestArenaDonated_nid_no_patch(std::uintptr_t address);
 
 }
 

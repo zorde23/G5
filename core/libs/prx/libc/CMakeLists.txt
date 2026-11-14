@@ -85,6 +85,7 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/StreamPurge.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/GuestAllocations.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/GuestArena.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/GuestDonation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/GuestStacks.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/GuestWriteWatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Interfaces.cpp
@@ -1189,6 +1190,17 @@ if(WIN32)
         set_target_properties(guest_heap_rounding_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
         add_test(NAME guest_heap_rounding_overflow COMMAND guest_heap_rounding_tests)
         set_tests_properties(guest_heap_rounding_overflow PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(guest_donation_tests EXCLUDE_FROM_ALL ${LIBS_INCLUDE_DIR}/tests/GuestDonation.cpp)
+    target_include_directories(guest_donation_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_donation_tests PRIVATE libc)
+    configure_windows_unwind(guest_donation_tests)
+    if(BUILD_TESTING)
+        set_target_properties(guest_donation_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+        add_test(NAME guest_donation COMMAND guest_donation_tests)
+        set_tests_properties(guest_donation PROPERTIES TIMEOUT 30 ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
