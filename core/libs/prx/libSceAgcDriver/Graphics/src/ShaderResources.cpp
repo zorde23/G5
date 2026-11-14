@@ -3674,6 +3674,30 @@ bool AnyPendingCpuWrites(const Context& context) {
     return (context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || Recorder::PendingCompletionLabels() != 0;
 }
 
+namespace {
+
+void NoteCpuWriteSync(const bool writers, const bool skippable, const std::uint64_t nanoseconds) {
+    struct Totals {
+        std::array<std::atomic<std::uint64_t>, 3> syncs{}, waitedNs{};
+        std::atomic<std::int64_t> reportedAt{0};
+    };
+    static Totals totals;
+    const std::size_t kind = writers ? 0 : skippable ? 2 : 1;
+    totals.syncs[kind].fetch_add(1, std::memory_order_relaxed);
+    totals.waitedNs[kind].fetch_add(nanoseconds, std::memory_order_relaxed);
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (totals.reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    std::array<unsigned long long, 3> syncs{};
+    std::array<double, 3> ms{};
+    for (std::size_t i = 0; i < 3; ++i) {
+        syncs[i] = totals.syncs[i].exchange(0, std::memory_order_relaxed);
+        ms[i] = static_cast<double>(totals.waitedNs[i].exchange(0, std::memory_order_relaxed)) / 1e6;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[cpu-write-syncs] 10 s, resource reads that synced for pending GPU writes: %llu for copied or draw writers (%.1f ms), %llu for a completion label in range (%.1f ms), %llu for a label a completion-only check would skip (%.1f ms)\n", syncs[0], ms[0], syncs[1], ms[1], syncs[2], ms[2]);
+}
+
+}
+
 bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || Recorder::InCompletion()) return false;
     auto* recorder = Recorder::Active();
@@ -3685,9 +3709,14 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     const auto overlaps = [&](const auto& writers) {
         return std::any_of(writers.begin(), writers.end(), [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); });
     };
-    if ((context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->PendingLabelIn(address, bytes))) {
+    const bool writers = (context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters);
+    if (writers || (labels && recorder->PendingLabelIn(address, bytes))) {
+        static const bool counted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+        const bool skippable = counted && !writers && !recorder->CompletionLabelIn(address, bytes);
+        const auto start = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         Recorder::CountSync(4);
         recorder->SyncThrough(address, bytes);
+        if (counted) NoteCpuWriteSync(writers, skippable, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
         return true;
     }
     return false;

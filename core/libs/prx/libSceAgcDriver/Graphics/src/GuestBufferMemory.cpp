@@ -5492,6 +5492,25 @@ void GuestBufferMemory::completeSpaceWrites() const {
     }
 }
 
+namespace {
+
+void NoteHeapPublish(const std::uint64_t bytes, const bool published, const std::uint64_t nanoseconds) {
+    struct Totals {
+        std::atomic<std::uint64_t> calls{0}, publishing{0}, bytes{0}, ns{0};
+        std::atomic<std::int64_t> reportedAt{0};
+    };
+    static Totals totals;
+    totals.calls.fetch_add(1, std::memory_order_relaxed);
+    if (published) totals.publishing.fetch_add(1, std::memory_order_relaxed);
+    totals.bytes.fetch_add(bytes, std::memory_order_relaxed);
+    totals.ns.fetch_add(nanoseconds, std::memory_order_relaxed);
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (totals.reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[bda-heap-publish] 10 s, address-based builds publishing the unit shadows over their heaps: %llu calls (%llu published units), %.1f GiB of heap ranges, %.1f ms\n", static_cast<unsigned long long>(totals.calls.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(totals.publishing.exchange(0, std::memory_order_relaxed)), static_cast<double>(totals.bytes.exchange(0, std::memory_order_relaxed)) / 1073741824.0, static_cast<double>(totals.ns.exchange(0, std::memory_order_relaxed)) / 1e6);
+}
+
+}
+
 void GuestBufferMemory::UploadFinish(bool addressable) {
     Require(prepared && !uploaded, "guest memory upload was not prepared");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -5695,7 +5714,12 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         copyRegion(region, addressable);
         if (profile) copyUs += microsecondsSince(copyStart);
     }
-    if (heapsEnd > heapsBegin) StorageTexture::PublishShadowsOnly(heapsBegin, static_cast<std::size_t>(heapsEnd - heapsBegin), PublishScope::Whole, "address-based heaps");
+    if (heapsEnd > heapsBegin) {
+        static const bool counted = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+        const auto start = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool published = StorageTexture::PublishShadowsOnly(heapsBegin, static_cast<std::size_t>(heapsEnd - heapsBegin), PublishScope::Whole, "address-based heaps");
+        if (counted) NoteHeapPublish(heapsEnd - heapsBegin, published, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+    }
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
     takeHeapReferences();
     ResidentBuffer::FlushChanged(context);
