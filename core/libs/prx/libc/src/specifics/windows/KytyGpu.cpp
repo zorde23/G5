@@ -20,6 +20,7 @@ struct Kyty {
     void (*onProtect)(std::uint64_t address, std::uint64_t bytes, std::uint32_t protection);
     void (*onSectionClosed)(void* section);
     bool (*handleFault)(std::uint64_t address, std::uint32_t access, std::uint64_t rip, void* context);
+    void (*prepareHostWrite)(std::uint64_t address, std::uint64_t bytes);
 };
 
 bool Routed(std::string_view library) {
@@ -50,6 +51,7 @@ const Kyty& Dll() {
         Load(module, path, "kyty_gpu_on_protect", loaded.onProtect);
         Load(module, path, "kyty_gpu_on_section_closed", loaded.onSectionClosed);
         Load(module, path, "kyty_gpu_handle_fault", loaded.handleFault);
+        Load(module, path, "kyty_gpu_prepare_host_write", loaded.prepareHostWrite);
         return loaded;
     }();
     return kyty;
@@ -99,6 +101,10 @@ void KytyGpuOnSectionClosed(void* section) {
     if (KytyGpuEnabled()) Dll().onSectionClosed(section);
 }
 
+void KytyGpuPrepareHostWrite(std::uintptr_t address, std::size_t bytes) {
+    if (KytyGpuEnabled() && GuestArena::GuestArenaDonatedAny_nid_no_patch(address, bytes)) Dll().prepareHostWrite(address, bytes);
+}
+
 bool KytyGpuHandleFault(std::uintptr_t address, std::uint32_t access, std::uint64_t rip, void* context) {
     return KytyGpuEnabled() && GuestArena::GuestArenaDonated_nid_no_patch(address) && Dll().handleFault(address, access, rip, context);
 }
@@ -109,6 +115,7 @@ void KytyGpuOnMap(std::uintptr_t, std::size_t, std::uint32_t, void*, std::uint64
 void KytyGpuOnUnmap(std::uintptr_t, std::size_t) {}
 void KytyGpuOnProtect(std::uintptr_t, std::size_t, std::uint32_t) {}
 void KytyGpuOnSectionClosed(void*) {}
+void KytyGpuPrepareHostWrite(std::uintptr_t, std::size_t) {}
 bool KytyGpuHandleFault(std::uintptr_t, std::uint32_t, std::uint64_t, void*) {
     return false;
 }

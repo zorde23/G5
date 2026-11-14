@@ -11,6 +11,7 @@ std::atomic<std::uint64_t> g_unmapsAfterTheSystem{0};
 std::atomic<std::uint64_t> g_protects{0};
 std::atomic<std::uint64_t> g_sectionsClosed{0};
 std::atomic<std::uint64_t> g_faults{0};
+std::atomic<std::uint64_t> g_hostWrites{0};
 
 }
 
@@ -43,6 +44,13 @@ extern "C" bool kyty_gpu_handle_fault(std::uint64_t address, std::uint32_t acces
     return true;
 }
 
+extern "C" void kyty_gpu_prepare_host_write(std::uint64_t address, std::uint64_t bytes) {
+    DWORD previous = 0;
+    const auto first = address & ~std::uint64_t{0xfff};
+    VirtualProtect(reinterpret_cast<void*>(first), ((address + bytes + 0xfff) & ~std::uint64_t{0xfff}) - first, PAGE_READWRITE, &previous);
+    g_hostWrites.fetch_add(1);
+}
+
 extern "C" void kyty_fake_counts(std::uint64_t* counts) {
     counts[0] = g_maps.load();
     counts[1] = g_unmaps.load();
@@ -50,4 +58,5 @@ extern "C" void kyty_fake_counts(std::uint64_t* counts) {
     counts[3] = g_protects.load();
     counts[4] = g_sectionsClosed.load();
     counts[5] = g_faults.load();
+    counts[6] = g_hostWrites.load();
 }

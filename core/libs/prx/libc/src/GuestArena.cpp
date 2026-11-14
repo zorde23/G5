@@ -772,7 +772,9 @@ void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t byt
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 #ifdef _WIN32
     const CommitEpochNote note(pointer, bytes, CommitEpochOrigin::HostWrite);
-    return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+    if (!WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes)) return false;
+    KytyGpuPrepareHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+    return true;
 #else
     GuestWriteWatch::GuestWriteWatchBeginHostWrite_nid_postfix(pointer, bytes);
     return true;

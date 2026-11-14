@@ -454,7 +454,7 @@ void InstallRedZoneGuard() {
     const char* guard = std::getenv("APS5_RED_ZONE_GUARD");
     const bool armed = std::getenv("APS5_ARM_SHARED_IMPORTS") != nullptr || KytyGpuEnabled();
     if (guard != nullptr && std::strcmp(guard, "0") == 0) {
-        if (armed) Report("[red-zone-guard] WARNING: APS5_ARM_SHARED_IMPORTS arms shared guest pages with the guard turned off by APS5_RED_ZONE_GUARD=0; a fault resumed in an unframed red-zone leaf corrupts its stack silently\n");
+        if (armed) Report("[red-zone-guard] WARNING: %s with the guard turned off by APS5_RED_ZONE_GUARD=0; a fault resumed in an unframed red-zone leaf corrupts its stack silently\n", KytyGpuEnabled() ? "APS5_KYTY_GPU resumes faults on pages the Kyty GPU tracks" : "APS5_ARM_SHARED_IMPORTS arms shared guest pages");
         return;
     }
     g_redZoneStats = guard != nullptr || armed || std::getenv("APS5_PIPELINE_STATS") != nullptr;

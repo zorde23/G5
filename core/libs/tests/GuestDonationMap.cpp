@@ -18,7 +18,7 @@ void Require(bool condition, const std::string& message) {
 }
 
 struct Counts {
-    std::uint64_t maps = 0, unmaps = 0, unmapsAfterTheSystem = 0, protects = 0, sectionsClosed = 0, faults = 0;
+    std::uint64_t maps = 0, unmaps = 0, unmapsAfterTheSystem = 0, protects = 0, sectionsClosed = 0, faults = 0, hostWrites = 0;
 };
 
 Counts FakeCounts() {
@@ -26,9 +26,9 @@ Counts FakeCounts() {
     const auto module = GetModuleHandleA("kyty_gpu_fake.dll");
     if (module == nullptr) return counts;
     const auto read = reinterpret_cast<void (*)(std::uint64_t*)>(reinterpret_cast<void*>(GetProcAddress(module, "kyty_fake_counts")));
-    std::uint64_t values[6]{};
+    std::uint64_t values[7]{};
     read(values);
-    return Counts{values[0], values[1], values[2], values[3], values[4], values[5]};
+    return Counts{values[0], values[1], values[2], values[3], values[4], values[5], values[6]};
 }
 
 void MapDirect(void* block, HANDLE section) {
@@ -54,6 +54,13 @@ void Check(bool kyty) {
         Require(VirtualProtect(block, 0x1000, PAGE_READONLY, &previous) != 0, "cannot write-protect a donated page as the Kyty tracker does");
         *static_cast<volatile std::uint32_t*>(block) = 0x6b6b6b6b;
         Require(*static_cast<volatile std::uint32_t*>(block) == 0x6b6b6b6b && FakeCounts().faults == 1, "a write to a page Kyty protects did not reach Kyty's fault handler once and resume");
+        Require(VirtualProtect(block, 0x1000, PAGE_READONLY, &previous) != 0, "cannot write-protect a donated page again");
+        Require(GuestArena::GuestArenaBeginHostWrite_nid_postfix(block, 16), "a host write to a donated page was refused");
+        const std::uint32_t source = 0x7c7c7c7c;
+        std::memcpy(block, &source, sizeof(source));
+        GuestArena::GuestArenaEndHostWrite_nid_postfix(block, 16);
+        const auto afterHostWrite = FakeCounts();
+        Require(afterHostWrite.hostWrites == 1 && afterHostWrite.faults == 1 && *static_cast<volatile std::uint32_t*>(block) == 0x7c7c7c7c, "a host write to a page Kyty protects was not prepared by Kyty before it landed");
     }
     GuestArena::GuestArenaSetProtection_nid_postfix(address, BlockBytes, PAGE_READONLY);
     GuestArena::GuestArenaSetProtection_nid_postfix(address, BlockBytes, PAGE_READWRITE);
