@@ -1565,28 +1565,40 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     return done(InPlaceOutcome::Used, import);
 }
 
-void NoteIndexContent(std::uint64_t key, std::uint64_t version, std::span<const std::byte> range) {
+std::uint64_t NoteIndexRange(std::uint64_t key, Recorder::IndexRangeState state, std::span<const std::byte> range) {
     struct Seen {
-        std::uint64_t version = 0, hash = 0;
+        std::uint64_t epoch = 0, hash = 0;
     };
     struct Totals {
-        std::atomic<std::uint64_t> changed{0}, kept{0};
+        std::array<std::atomic<std::uint64_t>, 4> states{};
+        std::atomic<std::uint64_t> sampledWritten{0}, sameBytes{0};
         std::atomic<std::int64_t> reportedAt{0};
     };
     static Totals totals;
     thread_local std::unordered_map<std::uint64_t, Seen> seen;
-    const auto hash = std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(range.data()), range.size()));
-    if (const auto found = seen.find(key); found != seen.end() && found->second.version != version) {
-        totals.changed.fetch_add(1, std::memory_order_relaxed);
-        if (found->second.hash == hash) totals.kept.fetch_add(1, std::memory_order_relaxed);
-    }
+    totals.states[static_cast<std::size_t>(state)].fetch_add(1, std::memory_order_relaxed);
     if (seen.size() >= 4096) seen.clear();
-    seen[key] = {version, hash};
+    auto& entry = seen[key];
+    if (state != Recorder::IndexRangeState::Current) {
+        ++entry.epoch;
+        if ((key >> 2) % 64 == 0) {
+            const auto hash = std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(range.data()), range.size()));
+            if (state == Recorder::IndexRangeState::Written && entry.hash != 0) {
+                totals.sampledWritten.fetch_add(1, std::memory_order_relaxed);
+                if (entry.hash == hash) totals.sameBytes.fetch_add(1, std::memory_order_relaxed);
+            }
+            entry.hash = hash;
+        }
+    }
+    const auto epoch = entry.epoch;
     const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
-    if (totals.reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
-    const auto changed = totals.changed.exchange(0, std::memory_order_relaxed);
-    const auto kept = totals.kept.exchange(0, std::memory_order_relaxed);
-    AgcDriver::ProfilePrint_nid_no_patch("[index-content] 10 s, in-place index ranges of 1 in 64 keys: %llu calls with a new version, %llu of them with the same bytes\n", static_cast<unsigned long long>(changed), static_cast<unsigned long long>(kept));
+    if (totals.reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return epoch;
+    std::array<unsigned long long, 4> counts{};
+    for (std::size_t i = 0; i < counts.size(); ++i) counts[i] = totals.states[i].exchange(0, std::memory_order_relaxed);
+    const auto written = totals.sampledWritten.exchange(0, std::memory_order_relaxed);
+    const auto same = totals.sameBytes.exchange(0, std::memory_order_relaxed);
+    AgcDriver::ProfilePrint_nid_no_patch("[index-misses] 10 s, in-place index ranges past the scan threshold: %llu still known, %llu not kept, %llu dropped by an allocation change, %llu dropped by a write; of 1 in 64 keys, %llu dropped by a write with bytes hashed before, %llu of them with the same bytes\n", counts[0], counts[1], counts[2], counts[3], static_cast<unsigned long long>(written), static_cast<unsigned long long>(same));
+    return epoch;
 }
 
 InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart) {
@@ -1601,9 +1613,7 @@ InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std:
     const auto generation = GuestMemory::CollectWrites(address, bytes);
     if (generation != 0 && RepeatedInputsProfiled()) {
         const auto key = (address * 0x9e3779b97f4a7c15ull ^ bytes) * 4 + static_cast<std::uint64_t>(use);
-        const auto version = generation * 0x100000001b3ull ^ registryGeneration;
-        NoteRepeatedInput(RepeatedInput::IndexRange, key, version);
-        if ((key >> 2) % 64 == 0) NoteIndexContent(key, version, range);
+        NoteRepeatedInput(RepeatedInput::IndexRange, key, NoteIndexRange(key, recorder.IndexRangeStateOf(address, bytes, use), range));
     }
     if (generation != 0 && recorder.KnownHighestIndex(address, bytes, use, indices.highest)) {
         indices.reused = true;

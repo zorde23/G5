@@ -2946,6 +2946,14 @@ bool Recorder::KnownHighestIndex(std::uint64_t address, std::size_t bytes, Snaps
     return true;
 }
 
+Recorder::IndexRangeState Recorder::IndexRangeStateOf(std::uint64_t address, std::size_t bytes, SnapshotUse use) const {
+    const auto found = indexRanges.find({address, use, bytes});
+    if (found == indexRanges.end()) return IndexRangeState::Absent;
+    if (found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return IndexRangeState::Registry;
+    if (!GuestMemory::UnchangedSince(address, bytes, found->second.generation)) return IndexRangeState::Written;
+    return IndexRangeState::Current;
+}
+
 void Recorder::KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest) {
     Require(use != SnapshotUse::Storage && use != SnapshotUse::Vertex, "a highest index belongs to an index buffer");
     if (generation == 0) return;
