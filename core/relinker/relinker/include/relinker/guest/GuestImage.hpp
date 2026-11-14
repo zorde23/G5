@@ -86,12 +86,13 @@ std::vector<std::pair<std::filesystem::path, std::filesystem::path>> RemoveBacku
 class GuestModuleBuilder {
 public:
     GuestModuleBuilder() = default;
-    explicit GuestModuleBuilder(bool redZoneTables, bool countFramePointerAllocation = false, bool suspectFramePointerLeaves = false) : redZoneTables(redZoneTables), countFramePointerAllocation(countFramePointerAllocation), suspectFramePointerLeaves(suspectFramePointerLeaves) {}
+    explicit GuestModuleBuilder(bool redZoneTables, bool countFramePointerAllocation = false, bool suspectFramePointerLeaves = false, bool stubJumpsStayInBody = false) : redZoneTables(redZoneTables), countFramePointerAllocation(countFramePointerAllocation), suspectFramePointerLeaves(suspectFramePointerLeaves), stubJumpsStayInBody(stubJumpsStayInBody) {}
     std::vector<GuestArtifact> Build(const std::filesystem::path& inputPath, const std::filesystem::path& outputPath, Domain::SysVDynamicSection& dynamic, bool windows, bool macos, bool toIntel, bool toRosetta, ISyscallScanner& syscallScanner, bool lazyBinding, const std::string& runPath, const std::set<std::string>& excludedModules, const std::filesystem::path& root, const std::vector<std::filesystem::path>& runtimeDirectories, std::vector<GuestModuleInput> modules, Domain::IProgress& progress) const;
 private:
     bool redZoneTables = false;
     bool countFramePointerAllocation = false;
     bool suspectFramePointerLeaves = false;
+    bool stubJumpsStayInBody = false;
 };
 
 }

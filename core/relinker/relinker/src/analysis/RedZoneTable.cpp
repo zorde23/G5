@@ -38,7 +38,7 @@ void AddUncovered(const std::vector<std::uint8_t>& bytes, const Domain::ProgramH
 
 }
 
-std::string RedZoneGuardTable(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::vector<Codegen::TrampolineSite>& existing, const Codegen::RedZoneFrameReport* framed, const bool precise, RedZoneGuardStats* stats, const bool countFramePointerAllocation, const bool suspectFramePointerLeaves) {
+std::string RedZoneGuardTable(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::vector<Codegen::TrampolineSite>& existing, const Codegen::RedZoneFrameReport* framed, const bool precise, RedZoneGuardStats* stats, const bool countFramePointerAllocation, const bool suspectFramePointerLeaves, const bool stubJumpsStayInBody) {
     std::vector<Domain::ProgramHeader> codeSegments;
     std::uint64_t firstAddress = std::numeric_limits<std::uint64_t>::max();
     for (const auto& header : headers) {
@@ -61,7 +61,7 @@ std::string RedZoneGuardTable(const std::vector<std::uint8_t>& bytes, const std:
     Codegen::RedZoneFrameReport scanned;
     if (framed == nullptr) {
         std::vector<Codegen::RedZoneDisplacement> displacements;
-        Codegen::FrameRedZoneFunctions(bytes, codeSegments, functions, existing, scanned, displacements, false, countFramePointerAllocation, suspectFramePointerLeaves);
+        Codegen::FrameRedZoneFunctions(bytes, codeSegments, functions, existing, scanned, displacements, false, countFramePointerAllocation, suspectFramePointerLeaves, stubJumpsStayInBody);
     }
     std::vector<Codegen::RedZoneLeaf> listed;
     for (const auto& leaf : (framed != nullptr ? *framed : scanned).Leaves) {

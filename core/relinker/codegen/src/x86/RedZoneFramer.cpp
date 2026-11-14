@@ -366,7 +366,8 @@ void frameSegment(
     RedZoneFrameReport& report,
     const bool shrinkWrapped,
     const bool countFramePointerAllocation,
-    const bool suspectFramePointerLeaves
+    const bool suspectFramePointerLeaves,
+    const bool stubJumpsStayInBody
 ) {
     const auto segOffset = static_cast<std::size_t>(ph.Offset);
     const auto segSize = static_cast<std::size_t>(ph.FileSize);
@@ -392,8 +393,12 @@ void frameSegment(
         const auto at = static_cast<std::size_t>(site.Address - ph.MappedAddress);
         taken.emplace_back(at, at + site.Length);
     }
+    const auto existingSites = taken.size();
     const auto overlapsExisting = [&](const std::size_t begin, const std::size_t end) {
         return std::any_of(taken.begin(), taken.end(), [&](const auto& range) { return begin < range.second && range.first < end; });
+    };
+    const auto insideExistingSite = [&](const std::size_t begin, const std::size_t end) {
+        return std::any_of(taken.begin(), taken.begin() + static_cast<std::ptrdiff_t>(existingSites), [&](const auto& range) { return range.first <= begin && end <= range.second; });
     };
     const auto targetInside = [&](const std::size_t begin, const std::size_t end) {
         const auto hit = targets.upper_bound(begin);
@@ -637,6 +642,7 @@ void frameSegment(
                 for (std::size_t k = p + 1; k < body.size() && clean; ++k) {
                     if (epilogue.contains(k)) continue;
                     const auto& insn = body[k];
+                    if (stubJumpsStayInBody && insideExistingSite(insn.Offset, insn.Offset + insn.Length)) continue;
                     const auto use = memoryUse(at(k), insn);
                     if (!analyzedForAllocation(at(k), insn) || use.UsesRsp || pushesOrPops(at(k), insn) || (use.RbpBased && (use.Indexed || use.Address))) clean = false;
                     if (!branchStaysInBody(k)) clean = false;
@@ -1001,10 +1007,11 @@ std::vector<TrampolineSite> FrameRedZoneFunctions(
     std::vector<RedZoneDisplacement>& displacements,
     const bool shrinkWrapped,
     const bool countFramePointerAllocation,
-    const bool suspectFramePointerLeaves
+    const bool suspectFramePointerLeaves,
+    const bool stubJumpsStayInBody
 ) {
     std::vector<TrampolineSite> sites;
-    for (const auto& ph : codeSegments) frameSegment(fileBytes, ph, functions, existing, sites, displacements, report, shrinkWrapped, countFramePointerAllocation, suspectFramePointerLeaves);
+    for (const auto& ph : codeSegments) frameSegment(fileBytes, ph, functions, existing, sites, displacements, report, shrinkWrapped, countFramePointerAllocation, suspectFramePointerLeaves, stubJumpsStayInBody);
     return sites;
 }
 
