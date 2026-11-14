@@ -159,6 +159,7 @@ void Driver::run(std::uint32_t id) noexcept {
     auto& costs = submissionCosts(id);
     try {
         PerformanceTrace::BindThread(role);
+        auto workerLoopEnd = std::chrono::steady_clock::time_point{};
         for (;;) {
             submission = Submission{};
             struct Running {
@@ -276,7 +277,10 @@ void Driver::run(std::uint32_t id) noexcept {
                 running.Start();
                 if (profile && submission.enqueuedAt != std::chrono::steady_clock::time_point{}) costs.dequeueNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submission.enqueuedAt).count());
             }
+            const bool phased = id == 0 && ThreadPhasesProfiled();
+            const auto executeStart = phased ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             execute(submission);
+            const auto executeEnd = phased ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (submission.progress && submission.rewindTail == nullptr && !completionDeferred()) submitOpenWork(submission.progress);
             if (traceGpu) std::fprintf(stderr, "[gpu] %.1f done serial=%llu queue=0x%x\n", TraceMs(), static_cast<unsigned long long>(submission.serial), id);
             const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -297,6 +301,12 @@ void Driver::run(std::uint32_t id) noexcept {
             if (notify) changed.notify_all();
             else ++costs.notifiesSkipped;
             if (profile) costs.completeNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - completeStart).count());
+            if (phased) {
+                const auto now = std::chrono::steady_clock::now();
+                const auto ns = [](auto from, auto to) { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count()); };
+                if (workerLoopEnd != std::chrono::steady_clock::time_point{}) NoteThreadPhases(false, ns(workerLoopEnd, executeStart), ns(executeStart, executeEnd), ns(executeEnd, now));
+                workerLoopEnd = now;
+            }
         }
     } catch (const ProcessShutdown&) {
         submission = Submission{};

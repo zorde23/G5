@@ -136,6 +136,9 @@ private:
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
+bool ThreadPhasesProfiled();
+void NoteThreadPhases(bool finisher, std::uint64_t waitNs, std::uint64_t workNs, std::uint64_t afterNs);
+
 class DrawFinisher {
 public:
     using Job = std::function<void()>;

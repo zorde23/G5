@@ -234,8 +234,38 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     if (sleeping) wake.notify_one();
 }
 
+bool ThreadPhasesProfiled() {
+    static const bool enabled = std::getenv("APS5_THREAD_PHASES") != nullptr;
+    return enabled;
+}
+
+void NoteThreadPhases(bool finisher, std::uint64_t waitNs, std::uint64_t workNs, std::uint64_t afterNs) {
+    struct Phases {
+        std::atomic<std::uint64_t> wait{0}, work{0}, after{0}, items{0};
+        std::atomic<std::int64_t> reportedAt{0}, lastNs{0};
+    };
+    static std::array<Phases, 2> phases;
+    auto& own = phases[finisher ? 0 : 1];
+    own.wait.fetch_add(waitNs, std::memory_order_relaxed);
+    own.work.fetch_add(workNs, std::memory_order_relaxed);
+    own.after.fetch_add(afterNs, std::memory_order_relaxed);
+    own.items.fetch_add(1, std::memory_order_relaxed);
+    const auto nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    const auto tenSeconds = nowNs / 10'000'000'000ll;
+    if (own.reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    const auto previous = own.lastNs.exchange(nowNs, std::memory_order_relaxed);
+    const auto ms = [](std::atomic<std::uint64_t>& value) { return static_cast<double>(value.exchange(0, std::memory_order_relaxed)) / 1e6; };
+    const double wait = ms(own.wait), work = ms(own.work), after = ms(own.after);
+    const auto items = own.items.exchange(0, std::memory_order_relaxed);
+    if (previous == 0) return;
+    const double wall = static_cast<double>(nowNs - previous) / 1e6;
+    AgcDriver::ProfilePrint_nid_no_patch(finisher ? "[f-phases] 10 s (draw finisher threads, summed), ms: wall %.1f per thread; waiting for a job %.1f, job bodies %.1f (%llu jobs), bookkeeping after a job %.1f\n" : "[w-phases] 10 s (queue 0 worker), ms: wall %.1f; waiting for a submission %.1f, executing %.1f (%llu submissions), completion and the rest after it %.1f\n", wall, wait, work, static_cast<unsigned long long>(items), after);
+}
+
 void DrawFinisher::run() {
     PerformanceTrace::BindThread("draw finisher");
+    const bool phased = ThreadPhasesProfiled();
+    auto loopStart = phased ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (;;) {
         Job* job = nullptr;
         bool failed = false;
@@ -249,12 +279,26 @@ void DrawFinisher::run() {
             job = &jobs.front();
             failed = failure != nullptr;
         }
+        const auto picked = phased ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::exception_ptr error;
         try {
             if (!failed) (*job)();
         } catch (...) {
             error = std::current_exception();
         }
+        const auto worked = phased ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        struct PhaseNote {
+            bool phased;
+            std::chrono::steady_clock::time_point& loopStart;
+            std::chrono::steady_clock::time_point picked, worked;
+            ~PhaseNote() {
+                if (!phased) return;
+                const auto now = std::chrono::steady_clock::now();
+                const auto ns = [](auto from, auto to) { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count()); };
+                NoteThreadPhases(true, ns(loopStart, picked), ns(picked, worked), ns(worked, now));
+                loopStart = now;
+            }
+        } phaseNote{phased, loopStart, picked, worked};
         std::lock_guard lock(mutex);
         if (error != nullptr && failure == nullptr) failure = error;
         ran.push_back(std::move(jobs.front()));
