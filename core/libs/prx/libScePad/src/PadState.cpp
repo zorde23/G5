@@ -554,15 +554,20 @@ extern "C" void PadSetPortConnected_nid_postfix(int port, bool connected) {
     Pad::SetConnected(port, connected);
 }
 
+std::uint32_t KytyAutopressButtons();
+
 extern "C" bool KytyGpuPadInjection_nid_no_patch(int port, PadData* out, std::size_t bytes) {
     if (port != 0 || out == nullptr || bytes != sizeof(PadData)) return false;
     try {
         Pad::Initialize();
+        std::uint32_t autopress = 0;
         {
             std::lock_guard lock(stateMutex);
-            if (InjectedInput(sceKernelGetProcessTime()) == Pad::InputCommandFile::Input{}) return false;
+            autopress = KytyAutopressButtons();
+            if (autopress == 0 && InjectedInput(sceKernelGetProcessTime()) == Pad::InputCommandFile::Input{}) return false;
         }
         *out = Pad::ReadState(port);
+        out->buttons |= autopress;
         return true;
     } catch (const std::exception& error) {
         static std::atomic<bool> reported{false};

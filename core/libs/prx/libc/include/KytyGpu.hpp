@@ -16,5 +16,6 @@ void KytyGpuReapplyProtection(std::uintptr_t address, std::size_t bytes);
 bool KytyGpuProtectHost(std::uint64_t address, std::uint64_t bytes, std::uint32_t tracker);
 void KytyGpuPrepareHostWrite(std::uintptr_t address, std::size_t bytes);
 bool KytyGpuHandleFault(std::uintptr_t address, std::uint32_t access, std::uint64_t rip, void* context);
+void KytyGpuReportCounters();
 
 #endif

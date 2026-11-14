@@ -474,6 +474,7 @@ void InstallRedZoneGuard() {
             for (;;) {
                 Sleep(10000);
                 LibcReportRedZoneFaults_nid_no_patch();
+                KytyGpuReportCounters();
             }
         }, nullptr, 0, nullptr);
     }
