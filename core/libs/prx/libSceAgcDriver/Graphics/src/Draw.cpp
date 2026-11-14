@@ -41,6 +41,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -1564,6 +1565,30 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     return done(InPlaceOutcome::Used, import);
 }
 
+void NoteIndexContent(std::uint64_t key, std::uint64_t version, std::span<const std::byte> range) {
+    struct Seen {
+        std::uint64_t version = 0, hash = 0;
+    };
+    struct Totals {
+        std::atomic<std::uint64_t> changed{0}, kept{0};
+        std::atomic<std::int64_t> reportedAt{0};
+    };
+    static Totals totals;
+    thread_local std::unordered_map<std::uint64_t, Seen> seen;
+    const auto hash = std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(range.data()), range.size()));
+    if (const auto found = seen.find(key); found != seen.end() && found->second.version != version) {
+        totals.changed.fetch_add(1, std::memory_order_relaxed);
+        if (found->second.hash == hash) totals.kept.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (seen.size() >= 4096) seen.clear();
+    seen[key] = {version, hash};
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (totals.reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    const auto changed = totals.changed.exchange(0, std::memory_order_relaxed);
+    const auto kept = totals.kept.exchange(0, std::memory_order_relaxed);
+    AgcDriver::ProfilePrint_nid_no_patch("[index-content] 10 s, in-place index ranges of 1 in 64 keys: %llu calls with a new version, %llu of them with the same bytes\n", static_cast<unsigned long long>(changed), static_cast<unsigned long long>(kept));
+}
+
 InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart) {
     const std::span<const std::byte> range(reinterpret_cast<const std::byte*>(address), bytes);
     InPlaceIndices indices;
@@ -1574,7 +1599,12 @@ InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std:
     const auto use = indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
     const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const auto generation = GuestMemory::CollectWrites(address, bytes);
-    if (generation != 0 && RepeatedInputsProfiled()) NoteRepeatedInput(RepeatedInput::IndexRange, (address * 0x9e3779b97f4a7c15ull ^ bytes) * 4 + static_cast<std::uint64_t>(use), generation * 0x100000001b3ull ^ registryGeneration);
+    if (generation != 0 && RepeatedInputsProfiled()) {
+        const auto key = (address * 0x9e3779b97f4a7c15ull ^ bytes) * 4 + static_cast<std::uint64_t>(use);
+        const auto version = generation * 0x100000001b3ull ^ registryGeneration;
+        NoteRepeatedInput(RepeatedInput::IndexRange, key, version);
+        if ((key >> 2) % 64 == 0) NoteIndexContent(key, version, range);
+    }
     if (generation != 0 && recorder.KnownHighestIndex(address, bytes, use, indices.highest)) {
         indices.reused = true;
         return indices;

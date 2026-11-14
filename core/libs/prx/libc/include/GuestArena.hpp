@@ -14,8 +14,8 @@ inline constexpr std::uintptr_t GuestAddressOffset = 0x0000100000000000ull;
 inline constexpr std::uintptr_t GuestAddressOffset = 0;
 #endif
 
-enum class CommitEpochOrigin : std::uint32_t { Mutation, Invalidate, Commit, Reset, Map, MapDirect, MapFile, SetProtection, KernelProtect, KernelStack, HeapAbandon, Count };
-inline constexpr const char* CommitEpochOriginNames[] = {"mutation", "invalidate", "commit", "reset", "map", "map-direct", "map-file", "set-protection", "kernel-protect", "kernel-stack", "heap-abandon"};
+enum class CommitEpochOrigin : std::uint32_t { Mutation, Invalidate, Commit, Reset, Map, MapDirect, MapFile, SetProtection, KernelProtect, KernelStack, HeapAbandon, HostWrite, Release, Count };
+inline constexpr const char* CommitEpochOriginNames[] = {"mutation", "invalidate", "commit", "reset", "map", "map-direct", "map-file", "set-protection", "kernel-protect", "kernel-stack", "heap-abandon", "host-write", "release"};
 inline constexpr std::uintptr_t CommitEpochBucketBytes = std::uintptr_t{1} << 30;
 
 struct CommitEpochEvent {

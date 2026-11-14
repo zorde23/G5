@@ -428,6 +428,7 @@ void GuestArenaMarkUsed_nid_postfix(const void* pointer, std::size_t bytes) {
 }
 
 void GuestArenaRelease_nid_postfix(const void* pointer, std::size_t bytes) {
+    const CommitEpochNote note(pointer, bytes, CommitEpochOrigin::Release);
     Arena::Get().Release(pointer, bytes);
 }
 
@@ -726,6 +727,7 @@ void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t byt
 
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 #ifdef _WIN32
+    const CommitEpochNote note(pointer, bytes, CommitEpochOrigin::HostWrite);
     return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #else
     GuestWriteWatch::GuestWriteWatchBeginHostWrite_nid_postfix(pointer, bytes);
@@ -735,16 +737,19 @@ bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 
 #ifdef _WIN32
 bool GuestArenaBeginHostImport_nid_no_patch(void* pointer, std::size_t bytes) {
+    const CommitEpochNote note(pointer, bytes, CommitEpochOrigin::HostWrite);
     return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes, false);
 }
 
 void GuestArenaEndHostImport_nid_no_patch(void* pointer, std::size_t bytes) {
+    const CommitEpochNote note(pointer, bytes, CommitEpochOrigin::HostWrite);
     WindowsMappings::Get().EndHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes, false);
 }
 #endif
 
 void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 #ifdef _WIN32
+    const CommitEpochNote note(pointer, bytes, CommitEpochOrigin::HostWrite);
     WindowsMappings::Get().EndHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #else
     GuestWriteWatch::GuestWriteWatchEndHostWrite_nid_postfix(pointer, bytes);

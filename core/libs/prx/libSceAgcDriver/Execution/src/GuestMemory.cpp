@@ -843,6 +843,8 @@ struct CommitEpochKeyHash {
 struct CommitEpochEntry {
     std::uint64_t global;
     std::uint64_t bucket;
+    std::uint64_t access;
+    std::uint64_t generation;
     Commitment result;
     std::chrono::steady_clock::time_point filled;
 };
@@ -858,6 +860,8 @@ struct CommitEpochSimulator {
     std::atomic<std::uint64_t> globalHits{0};
     std::atomic<std::uint64_t> bucketHits{0};
     std::atomic<std::uint64_t> ineligible{0};
+    std::atomic<std::uint64_t> shared{0};
+    std::atomic<std::uint64_t> keyHits{0};
     std::atomic<std::uint64_t> divergences{0};
     std::atomic<std::uint64_t> inFlight{0};
     std::atomic<std::int64_t> reportedAt{0};
@@ -890,8 +894,8 @@ void reportCommitEpoch() {
         text += std::to_string(delta);
     }
     simulator.reportedCounts = counts;
-    char tail[256];
-    std::snprintf(tail, sizeof(tail), " (total %llu); queries %llu, global hits %llu, bucket hits %llu, ineligible %llu, divergences %llu, in flight %llu\n", static_cast<unsigned long long>(bumps), static_cast<unsigned long long>(simulator.queries.exchange(0)), static_cast<unsigned long long>(simulator.globalHits.exchange(0)), static_cast<unsigned long long>(simulator.bucketHits.exchange(0)), static_cast<unsigned long long>(simulator.ineligible.exchange(0)), static_cast<unsigned long long>(simulator.divergences.exchange(0)), static_cast<unsigned long long>(simulator.inFlight.exchange(0)));
+    char tail[512];
+    std::snprintf(tail, sizeof(tail), " (total %llu); queries %llu, global hits %llu, bucket hits %llu, ineligible %llu, shared eligible %llu, key hits (bucket epoch, access serial and allocation generation) %llu, divergences %llu, in flight %llu\n", static_cast<unsigned long long>(bumps), static_cast<unsigned long long>(simulator.queries.exchange(0)), static_cast<unsigned long long>(simulator.globalHits.exchange(0)), static_cast<unsigned long long>(simulator.bucketHits.exchange(0)), static_cast<unsigned long long>(simulator.ineligible.exchange(0)), static_cast<unsigned long long>(simulator.shared.exchange(0)), static_cast<unsigned long long>(simulator.keyHits.exchange(0)), static_cast<unsigned long long>(simulator.divergences.exchange(0)), static_cast<unsigned long long>(simulator.inFlight.exchange(0)));
     text += tail;
     AgcDriver::ProfilePrint_nid_no_patch("%s", text.c_str());
 }
@@ -914,7 +918,7 @@ void reportCommitEpochDivergence(const CommitEpochKey& key, const CommitEpochEnt
 }
 
 template <class Describe>
-void simulateCommitEpoch(std::uint64_t address, std::size_t bytes, bool writable, std::uint64_t global, std::uint64_t bucket, bool eligible, const Commitment& fresh, Describe&& describe) {
+void simulateCommitEpoch(std::uint64_t address, std::size_t bytes, bool writable, std::uint64_t global, std::uint64_t bucket, std::uint64_t access, std::uint64_t generation, bool eligible, const Commitment& fresh, Describe&& describe) {
     auto& simulator = commitEpochSimulator();
     simulator.queries.fetch_add(1, std::memory_order_relaxed);
     const CommitEpochKey key{address, bytes, writable};
@@ -932,9 +936,11 @@ void simulateCommitEpoch(std::uint64_t address, std::size_t bytes, bool writable
     if (stored) {
         const bool globalHit = stored->global == global;
         const bool bucketHit = stored->bucket == bucket;
+        const bool keyHit = bucketHit && stored->access == access && stored->generation == generation;
         if (globalHit) simulator.globalHits.fetch_add(1, std::memory_order_relaxed);
         if (bucketHit) simulator.bucketHits.fetch_add(1, std::memory_order_relaxed);
-        keep = globalHit && bucketHit;
+        if (keyHit) simulator.keyHits.fetch_add(1, std::memory_order_relaxed);
+        keep = globalHit && keyHit;
         if ((globalHit || bucketHit) && !sameCommitment(stored->result, fresh)) {
             keep = false;
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -952,7 +958,7 @@ void simulateCommitEpoch(std::uint64_t address, std::size_t bytes, bool writable
     }
     if (!keep) {
         std::lock_guard lock(simulator.mutex);
-        const auto [position, inserted] = simulator.entries.insert_or_assign(key, CommitEpochEntry{global, bucket, fresh, std::chrono::steady_clock::now()});
+        const auto [position, inserted] = simulator.entries.insert_or_assign(key, CommitEpochEntry{global, bucket, access, generation, fresh, std::chrono::steady_clock::now()});
         static_cast<void>(position);
         if (inserted) {
             simulator.order.push_back(key);
@@ -1010,9 +1016,16 @@ Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writ
     if (!commitEpoch) return describe();
     const auto global = GuestArena::GuestArenaCommitEpoch_nid_no_patch();
     const auto bucket = GuestArena::GuestArenaBucketEpochs_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
-    const bool eligible = GuestArena::GuestArenaPrivateCovers_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+    const auto access = Pages().accessSerial.load(std::memory_order_acquire);
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    static const bool sharedViews = std::getenv("APS5_COMMIT_EPOCH_SHARED") != nullptr;
+    bool eligible = GuestArena::GuestArenaPrivateCovers_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+    if (!eligible && sharedViews && bytes != 0 && GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(address), bytes)) {
+        eligible = true;
+        commitEpochSimulator().shared.fetch_add(1, std::memory_order_relaxed);
+    }
     auto result = describe();
-    simulateCommitEpoch(address, bytes, writable, global, bucket, eligible, result, describe);
+    simulateCommitEpoch(address, bytes, writable, global, bucket, access, generation, eligible, result, describe);
     return result;
 }
 
@@ -2542,6 +2555,7 @@ struct GpuLockStats {
     std::array<double, GpuLockSiteCount> siteHeldMs{};
     std::array<double, GpuLockSiteCount> siteMaxHeldMs{};
     std::size_t holdSite = 0;
+    const void* holdCaller = nullptr;
     std::chrono::steady_clock::time_point holdStart;
     // This thread's column of the holder matrix (-1 until its first hold), and what its contended
     // acquisitions waited behind: holds by (holder, site) that ended during the waits.
@@ -2578,9 +2592,47 @@ void BeginHold(std::size_t site) {
     stats.holdStart = std::chrono::steady_clock::now();
 }
 
+struct OtherHolds {
+    static constexpr std::size_t Slots = 64;
+    std::array<std::atomic<std::uintptr_t>, Slots> callers{};
+    std::array<std::atomic<std::uint64_t>, Slots> heldNs{};
+    void Add(const void* caller, std::uint64_t ns) {
+        const auto key = reinterpret_cast<std::uintptr_t>(caller);
+        for (std::size_t probe = 0; probe < Slots; ++probe) {
+            const auto slot = (key / 16 + probe) % Slots;
+            auto expected = std::uintptr_t{0};
+            if (callers[slot].load(std::memory_order_relaxed) == key || callers[slot].compare_exchange_strong(expected, key, std::memory_order_relaxed) || expected == key) {
+                heldNs[slot].fetch_add(ns, std::memory_order_relaxed);
+                return;
+            }
+        }
+    }
+    std::string Report() {
+        std::vector<std::pair<std::uint64_t, std::uintptr_t>> entries;
+        for (std::size_t slot = 0; slot < Slots; ++slot) {
+            const auto ns = heldNs[slot].exchange(0, std::memory_order_relaxed);
+            if (ns >= 1000000) entries.emplace_back(ns, callers[slot].load(std::memory_order_relaxed));
+        }
+        std::sort(entries.begin(), entries.end(), std::greater<>());
+        std::string report;
+        char text[64];
+        for (std::size_t i = 0; i < entries.size() && i < 8; ++i) {
+            std::snprintf(text, sizeof(text), " 0x%llx %.0f", CodeOffset(reinterpret_cast<const void*>(entries[i].second)), static_cast<double>(entries[i].first) / 1e6);
+            report += text;
+        }
+        return report;
+    }
+};
+
+OtherHolds& OtherHoldCallers() {
+    static OtherHolds holds;
+    return holds;
+}
+
 void EndHold() {
     auto& stats = LockStats();
     const auto heldNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - stats.holdStart).count();
+    if (stats.holdSite == static_cast<std::size_t>(GpuLockSite::Other) && stats.holdCaller != nullptr) OtherHoldCallers().Add(stats.holdCaller, static_cast<std::uint64_t>(heldNs));
     const auto heldMs = static_cast<double>(heldNs) / 1e6;
     ++stats.siteHolds[stats.holdSite];
     stats.siteHeldMs[stats.holdSite] += heldMs;
@@ -2751,6 +2803,7 @@ void GpuMutexType::lock() {
     auto& stats = LockStats();
     ++stats.acquisitions;
     const auto site = static_cast<std::size_t>(std::exchange(stats.nextSite, GpuLockSite::Other));
+    if (!HeldByThisThread()) stats.holdCaller = __builtin_return_address(0);
     ++stats.siteAcquisitions[site];
     // An uncontended (or recursive) acquisition costs no clock reads for the wait; only a wait is
     // timed. The hold timer (outermost acquisitions only) starts once the mutex is held.
@@ -2809,6 +2862,7 @@ void GpuMutexType::lock() {
                 holds += text;
             }
             holds += "; waited behind (holder/site ms):" + WaitedBehindReport(stats.waitedBehindNs);
+            holds += "; untagged holds by caller since the last line of any thread (driver offset, ms):" + OtherHoldCallers().Report();
         }
         char counts[160];
         std::snprintf(counts, sizeof(counts), "; lock() %llu / try %llu / try failed %llu; locked GPU waits %llu / %.0f ms", static_cast<unsigned long long>(stats.acquisitions), static_cast<unsigned long long>(stats.tries), static_cast<unsigned long long>(stats.triesFailed), static_cast<unsigned long long>(stats.lockedGpuWaits), stats.lockedGpuWaitMs);
