@@ -58,8 +58,19 @@ extern "C" void kyty_gpu_prepare_host_write(std::uint64_t address, std::uint64_t
     g_hostWrites.fetch_add(1);
 }
 
+std::atomic<std::uint64_t> g_inits{0};
+std::atomic<std::uint64_t> g_reentered{0};
+
 extern "C" void kyty_gpu_init(const Aps5Host* host) {
     g_host = host;
+    g_inits.fetch_add(1);
+    using TraceImport = void* (*)(void*, const char*, const char*);
+    const auto trace = reinterpret_cast<TraceImport>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("libc.prx"), "TraceImport_nid_no_patch")));
+    if (trace != nullptr && trace(nullptr, "kytyHasThis", "libSceAgc.prx") == reinterpret_cast<void*>(std::uintptr_t{0x1234500})) g_reentered.fetch_add(1);
+}
+
+extern "C" std::uint64_t kyty_fake_inits() {
+    return g_inits.load() * 10 + g_reentered.load();
 }
 
 extern "C" bool kyty_fake_protect(std::uint64_t address, std::uint64_t bytes, std::uint32_t tracker) {

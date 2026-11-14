@@ -1,3 +1,4 @@
+#include <windows.h>
 #include "prx/libc/include/CallTrace.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <cstdint>
@@ -29,6 +30,8 @@ int main() {
     using Stub = std::uint64_t(APS5_VABI*)();
     Expect(reinterpret_cast<Stub>(missing)() == 0, "the stub returns 0");
     Expect(TraceImport_nid_no_patch(original, "kytyHasThis", "libSceAudioOut.prx") == original, "a library that is not routed keeps the g5 export");
+    const auto inits = reinterpret_cast<std::uint64_t (*)()>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("kyty_gpu_fake.dll"), "kyty_fake_inits")));
+    Expect(inits != nullptr && inits() == 11, "the DLL's init did not run exactly once, or its call back into the import binding did not resolve");
     std::puts(failures == 0 ? "kyty gpu import: ok" : "kyty gpu import: failed");
     return failures == 0 ? 0 : 1;
 }

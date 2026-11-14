@@ -8,6 +8,8 @@ extern "C" {
 int KytyGpuAddEvent_nid_no_patch(KernelEqueue eq, std::uint64_t ident, std::int16_t filter, void* udata, int kind, int triggered, std::int64_t data);
 int KytyGpuDeleteEvent_nid_no_patch(KernelEqueue eq, std::uint64_t ident, std::int16_t filter);
 int KytyGpuTriggerEvent_nid_no_patch(KernelEqueue eq, std::uint64_t ident, std::int16_t filter, void* triggerData);
+int KytyGpuMapDriverMemory_nid_no_patch(std::uint64_t address, std::uint64_t bytes, std::int64_t* physical);
+int KytyGpuReleaseDriverMemory_nid_no_patch(std::int64_t physical, std::uint64_t bytes);
 }
 
 namespace {
@@ -45,6 +47,12 @@ int main() {
         Require(KytyGpuAddEvent_nid_no_patch(eq, 0, EvfiltVideoOut, nullptr, 1, 0, 0) == SceOk, "the video out event was refused");
         Require(KytyGpuTriggerEvent_nid_no_patch(eq, 0, EvfiltVideoOut, reinterpret_cast<void*>(std::intptr_t{9})) == SceOk, "the flip was refused");
         Require(Wait(eq, events, 4) == 1 && events[0].fflags == 1 && ((static_cast<std::uint64_t>(events[0].data) >> 16u) == 9u) && ((static_cast<std::uint64_t>(events[0].data) >> 12u) & 0xfu) == 1u, "the flip event does not carry its payload and count");
+        std::int64_t physical = -1;
+        constexpr std::uint64_t driver = 0xfe0000000ull;
+        Require(KytyGpuMapDriverMemory_nid_no_patch(driver, 0x200000, &physical) == 0 && physical >= 0, "the Kyty GPU driver memory was not mapped at 0xfe0000000");
+        *reinterpret_cast<volatile std::uint32_t*>(driver) = 0x12345678;
+        Require(*reinterpret_cast<volatile std::uint32_t*>(driver) == 0x12345678, "the driver memory does not hold a store");
+        Require(KytyGpuReleaseDriverMemory_nid_no_patch(physical, 0x200000) == 0, "the driver memory was not released");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "kyty events: %s\n", error.what());
         return 1;

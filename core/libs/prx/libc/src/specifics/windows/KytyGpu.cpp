@@ -72,10 +72,22 @@ const Kyty& Dll() {
         Load(module, path, "kyty_gpu_on_section_closed", loaded.onSectionClosed);
         Load(module, path, "kyty_gpu_handle_fault", loaded.handleFault);
         Load(module, path, "kyty_gpu_prepare_host_write", loaded.prepareHostWrite);
-        static const Aps5Host host{2, &KytyGpuProtectHost, &ResolveHostExport};
-        loaded.init(&host);
         return loaded;
     }();
+    return kyty;
+}
+
+std::atomic<bool> g_initStarted{false};
+
+void InitOnce() {
+    if (g_initStarted.exchange(true, std::memory_order_acq_rel)) return;
+    static const Aps5Host host{2, &KytyGpuProtectHost, &ResolveHostExport};
+    Dll().init(&host);
+}
+
+const Kyty& Ready() {
+    const auto& kyty = Dll();
+    InitOnce();
     return kyty;
 }
 
@@ -98,6 +110,7 @@ bool KytyGpuEnabled() {
 
 void* KytyGpuImport(void* target, const char* name, const char* library) {
     if (!KytyGpuEnabled() || name == nullptr || library == nullptr || !Routed(library)) return target;
+    InitOnce();
     char nid[32] = {};
     const auto length = std::strcspn(name, "#");
     if (length >= sizeof(nid)) return target;
@@ -108,19 +121,19 @@ void* KytyGpuImport(void* target, const char* name, const char* library) {
 }
 
 void KytyGpuOnMap(std::uintptr_t address, std::size_t bytes, std::uint32_t protection, void* section, std::uint64_t offset) {
-    if (KytyGpuEnabled()) Dll().onMap(address, bytes, protection, section, offset);
+    if (KytyGpuEnabled()) Ready().onMap(address, bytes, protection, section, offset);
 }
 
 void KytyGpuOnUnmap(std::uintptr_t address, std::size_t bytes) {
-    if (KytyGpuEnabled()) Dll().onUnmap(address, bytes);
+    if (KytyGpuEnabled()) Ready().onUnmap(address, bytes);
 }
 
 void KytyGpuOnProtect(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
-    if (KytyGpuEnabled()) Dll().onProtect(address, bytes, protection);
+    if (KytyGpuEnabled()) Ready().onProtect(address, bytes, protection);
 }
 
 void KytyGpuOnSectionClosed(void* section) {
-    if (KytyGpuEnabled()) Dll().onSectionClosed(section);
+    if (KytyGpuEnabled()) Ready().onSectionClosed(section);
 }
 
 namespace {
@@ -186,7 +199,7 @@ bool KytyGpuProtectHost(std::uint64_t address, std::uint64_t bytes, std::uint32_
 }
 
 void KytyGpuPrepareHostWrite(std::uintptr_t address, std::size_t bytes) {
-    if (KytyGpuEnabled() && GuestArena::GuestArenaDonatedAny_nid_no_patch(address, bytes)) Dll().prepareHostWrite(address, bytes);
+    if (KytyGpuEnabled() && GuestArena::GuestArenaDonatedAny_nid_no_patch(address, bytes)) Ready().prepareHostWrite(address, bytes);
 }
 
 bool KytyGpuHandleFault(std::uintptr_t address, std::uint32_t access, std::uint64_t rip, void* context) {
