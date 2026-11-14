@@ -1,4 +1,6 @@
 #include "prx/libScePad/include/PadState.hpp"
+#include <atomic>
+#include <cstdio>
 #include "prx/libScePad/include/PadAudioHapticQueue.hpp"
 #include "prx/libScePad/include/Pad.hpp"
 #include "prx/libScePad/include/InputCommandFile.hpp"
@@ -550,4 +552,21 @@ extern "C" void PadSubmitAudioHaptics_nid_postfix(std::uint8_t large, std::uint8
 
 extern "C" void PadSetPortConnected_nid_postfix(int port, bool connected) {
     Pad::SetConnected(port, connected);
+}
+
+extern "C" bool KytyGpuPadInjection_nid_no_patch(int port, PadData* out, std::size_t bytes) {
+    if (port != 0 || out == nullptr || bytes != sizeof(PadData)) return false;
+    try {
+        Pad::Initialize();
+        {
+            std::lock_guard lock(stateMutex);
+            if (InjectedInput(sceKernelGetProcessTime()) == Pad::InputCommandFile::Input{}) return false;
+        }
+        *out = Pad::ReadState(port);
+        return true;
+    } catch (const std::exception& error) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) std::fprintf(stderr, "[kyty-gpu] pad injection off: %s\n", error.what());
+        return false;
+    }
 }

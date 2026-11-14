@@ -577,6 +577,8 @@ static void CheckControllerType(int handle) {
     Require(type == PAD_CONTROLLER_TYPE_DUAL_SENSE);
 }
 
+extern "C" bool KytyGpuPadInjection_nid_no_patch(int port, PadData* out, std::size_t bytes);
+
 static void CheckInjectedState(const std::filesystem::path& path) {
     PadInputState physical;
     physical.buttons = 0x2000;
@@ -594,10 +596,14 @@ static void CheckInjectedState(const std::filesystem::path& path) {
     } while (std::chrono::steady_clock::now() < deadline);
     Require(pressed.buttons == (0x2000 | 0x4000 | 0x100));
     Require(pressed.analog_buttons_l2 == 255 && pressed.analog_buttons_r2 == 73);
+    PadData forKyty{};
+    Require(KytyGpuPadInjection_nid_no_patch(0, &forKyty, sizeof(forKyty)) && (forKyty.buttons & 0x4100) == 0x4100);
+    Require(!KytyGpuPadInjection_nid_no_patch(1, &forKyty, sizeof(forKyty)) && !KytyGpuPadInjection_nid_no_patch(0, &forKyty, sizeof(forKyty) - 1));
     Require(pressed.left_stick_x == 42 && pressed.timestamp > before.timestamp);
     std::this_thread::sleep_for(std::chrono::milliseconds(310));
     const auto released = Pad::ReadState();
     Require(released.buttons == 0x2000 && released.analog_buttons_l2 == 0);
+    Require(!KytyGpuPadInjection_nid_no_patch(0, &forKyty, sizeof(forKyty)));
     Require(released.timestamp > pressed.timestamp);
     physical.sticks[3] = 17;
     PadPublishInput_nid_postfix(physical);
