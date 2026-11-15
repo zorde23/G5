@@ -478,6 +478,8 @@ struct Replay {
         case FrameCallKind::End:
         case FrameCallKind::DisplayBuffer:
             return;
+        case FrameCallKind::GuestCall:
+            throw std::runtime_error("frame replay: guest-call captures of the Kyty GPU hybrid have no replay yet");
         }
         throw std::runtime_error("frame replay: unknown call kind");
     }

@@ -55,6 +55,7 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/CrashReport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/x86_64/CallTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/KytyGpu.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/KytyCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/linux/DlIteratePhdr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/macos/GuestImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Strings.cpp
@@ -871,6 +872,12 @@ if(BUILD_TESTING)
         if(WIN32)
             add_library(kyty_gpu_fake SHARED ${LIBS_INCLUDE_DIR}/tests/KytyGpuFake.cpp)
             set_target_properties(kyty_gpu_fake PROPERTIES PREFIX "" RUNTIME_OUTPUT_DIRECTORY "$<1:${ANYPS5_TEST_OUTPUT_DIRECTORY}>")
+            add_test_executable(kyty_capture_trampoline_tests ${LIBS_INCLUDE_DIR}/tests/KytyCaptureTrampoline.cpp)
+            target_include_directories(kyty_capture_trampoline_tests PRIVATE ${LIBS_INCLUDE_DIR})
+            target_link_libraries(kyty_capture_trampoline_tests PRIVATE libc)
+            configure_windows_unwind(kyty_capture_trampoline_tests)
+            add_test(NAME kyty_capture_trampoline COMMAND kyty_capture_trampoline_tests)
+            set_tests_properties(kyty_capture_trampoline PROPERTIES TIMEOUT 20 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
             add_test_executable(kyty_gpu_import_tests ${LIBS_INCLUDE_DIR}/tests/KytyGpuImport.cpp)
             target_include_directories(kyty_gpu_import_tests PRIVATE ${LIBS_INCLUDE_DIR})
             target_link_libraries(kyty_gpu_import_tests PRIVATE libc)
