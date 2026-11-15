@@ -128,13 +128,12 @@ void Commit(std::uint64_t address, std::uint64_t bytes, bool range) {
     auto* const pointer = reinterpret_cast<void*>(static_cast<std::uintptr_t>(address));
     if (InArena(address, bytes)) {
         if (CommittedWritable(address, bytes)) return;
-        if (range) {
-            std::uintptr_t start = 0, end = 0;
-            if (GuestArena::GuestArenaNextUsed_nid_no_patch(static_cast<std::uintptr_t>(address), &start, &end) && start < address + bytes) throw std::runtime_error("kyty frame replay: the captured range at " + std::to_string(address) + " falls in a used or reserved part of this process's guest arena");
-            GuestArena::GuestArenaMarkUsed_nid_postfix(pointer, static_cast<std::size_t>(bytes));
+        std::uintptr_t start = 0, end = 0;
+        if (!GuestArena::GuestArenaNextUsed_nid_no_patch(static_cast<std::uintptr_t>(address), &start, &end) || start >= address + bytes) {
+            if (range) GuestArena::GuestArenaMarkUsed_nid_postfix(pointer, static_cast<std::size_t>(bytes));
+            GuestArena::GuestArenaCommit_nid_postfix(pointer, static_cast<std::size_t>(bytes), PAGE_READWRITE, static_cast<std::size_t>(bytes));
+            return;
         }
-        GuestArena::GuestArenaCommit_nid_postfix(pointer, static_cast<std::size_t>(bytes), PAGE_READWRITE, static_cast<std::size_t>(bytes));
-        return;
     }
     const auto begin = address & ~(Granularity - 1);
     const auto end = (address + bytes + Granularity - 1) & ~(Granularity - 1);
@@ -154,7 +153,7 @@ void ApplyDeltas(const FrameCaptureReader& reader, std::uint64_t group) {
     }
 }
 
-int Replay(const std::filesystem::path& directory, const std::filesystem::path& dllPath) {
+int Replay(const std::filesystem::path& directory, const std::filesystem::path& dllPath, const std::filesystem::path& output) {
     const FrameCaptureReader reader(directory);
     if (reader.Truncated()) throw std::runtime_error("kyty frame replay: the capture is truncated");
     std::uintptr_t arenaBase = 0;
@@ -175,7 +174,9 @@ int Replay(const std::filesystem::path& directory, const std::filesystem::path& 
     for (const auto& call : reader.Calls()) {
         if (call.kind == FrameCallKind::GuestCall && call.size != 0) Commit(call.address, call.size, false);
     }
-    const auto dll = LoadLibraryW(dllPath.c_str());
+    std::filesystem::create_directories(output);
+    std::filesystem::current_path(output);
+    const auto dll = LoadLibraryExW(dllPath.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (dll == nullptr) throw std::runtime_error("kyty frame replay: cannot load " + dllPath.string());
     const auto init = reinterpret_cast<void (*)(const Aps5Host*)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_init")));
     const auto resolve = reinterpret_cast<std::uint64_t (*)(const char*)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_resolve")));
@@ -186,6 +187,7 @@ int Replay(const std::filesystem::path& directory, const std::filesystem::path& 
     std::uint64_t frame = 0, calls = 0;
     for (const auto& call : reader.Calls()) {
         if (call.kind == FrameCallKind::FrameStart) {
+            waitIdle();
             ApplyDeltas(reader, ++frame);
             continue;
         }
@@ -218,11 +220,12 @@ int Replay(const std::filesystem::path& directory, const std::filesystem::path& 
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: kyty_frame_replay <capture directory> <kyty_gpu.dll>\n");
+        std::fprintf(stderr, "usage: kyty_frame_replay <capture directory> <kyty_gpu.dll> [output directory, default <capture>/replay]\n");
         return 2;
     }
     try {
-        const int result = Replay(argv[1], argv[2]);
+        const auto capture = std::filesystem::absolute(argv[1]);
+        const int result = Replay(capture, std::filesystem::absolute(argv[2]), argc > 3 ? std::filesystem::absolute(argv[3]) : capture / "replay");
         std::fflush(stderr);
         TerminateProcess(GetCurrentProcess(), static_cast<UINT>(result));
     } catch (const std::exception& error) {
