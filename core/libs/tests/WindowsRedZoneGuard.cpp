@@ -23,6 +23,16 @@ constexpr DWORD Terminated = 0xC0000409u;
     *target = 1;
 }
 
+[[gnu::noinline]] void StoreWithCleanUpperYmm(volatile char* target) {
+    asm volatile("vzeroupper" ::: "memory");
+    *target = 1;
+}
+
+[[gnu::noinline]] void StoreWithDirtyUpperYmm(volatile char* target) {
+    asm volatile("vpcmpeqd %%ymm0, %%ymm0, %%ymm0" ::: "xmm0", "memory");
+    *target = 1;
+}
+
 [[gnu::noinline]] int Elsewhere(int value) {
     return value * 3 + 1;
 }
@@ -31,7 +41,7 @@ std::uintptr_t Rva(const void* function) {
     return reinterpret_cast<std::uintptr_t>(function) - reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
 }
 
-int Child() {
+int Child(void (*store)(volatile char*)) {
     std::int64_t physical = 0;
     Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, Page, 0, 0, &physical) == 0, "allocate direct memory");
     void* mapping = nullptr;
@@ -43,12 +53,12 @@ int Child() {
     Require(GuestArena::GuestArenaCollectWrites_nid_postfix(reinterpret_cast<std::uintptr_t>(mapping), Page, pages.data(), &count, true), "collect tracked writes");
     MEMORY_BASIC_INFORMATION memory{};
     Require(VirtualQuery(mapping, &memory, sizeof(memory)) == sizeof(memory) && memory.Protect == PAGE_READONLY, "the shared page is armed");
-    Store(static_cast<volatile char*>(mapping));
+    store(static_cast<volatile char*>(mapping));
     Require(static_cast<volatile char*>(twin)[0] == 1, "the resumed store reached the page");
     return Elsewhere(0) == 1 ? 0 : 2;
 }
 
-DWORD RunChild(const wchar_t* self, const std::uintptr_t begin) {
+DWORD RunChild(const wchar_t* self, const std::uintptr_t begin, const wchar_t* mode = L"child") {
     char tablePath[MAX_PATH * 3];
     std::snprintf(tablePath, sizeof(tablePath), "%ls.redzone.txt", self);
     {
@@ -57,7 +67,7 @@ DWORD RunChild(const wchar_t* self, const std::uintptr_t begin) {
         std::snprintf(line, sizeof(line), "%llx %llx test leaf\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(begin + 0x40));
         table << line;
     }
-    std::wstring command = L"\"" + std::wstring(self) + L"\" child";
+    std::wstring command = L"\"" + std::wstring(self) + L"\" " + mode;
     STARTUPINFOW startup{sizeof(startup)};
     PROCESS_INFORMATION process{};
     Require(CreateProcessW(self, command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &process) != 0, "start the child");
@@ -74,12 +84,17 @@ DWORD RunChild(const wchar_t* self, const std::uintptr_t begin) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc > 1 && std::strcmp(argv[1], "child") == 0) return Child();
+        if (argc > 1 && std::strcmp(argv[1], "child") == 0) return Child(&Store);
+        if (argc > 1 && std::strcmp(argv[1], "clean") == 0) return Child(&StoreWithCleanUpperYmm);
+        if (argc > 1 && std::strcmp(argv[1], "dirty") == 0) return Child(&StoreWithDirtyUpperYmm);
         wchar_t self[MAX_PATH]{};
         GetModuleFileNameW(nullptr, self, MAX_PATH);
         SetEnvironmentVariableW(L"APS5_RED_ZONE_GUARD", L"1");
         Require(RunChild(self, Rva(reinterpret_cast<const void*>(&Elsewhere))) == 0, "a resumed fault outside every listed range was not resumed");
         Require(RunChild(self, Rva(reinterpret_cast<const void*>(&Store))) == Terminated, "a resumed fault inside a listed red-zone function did not terminate the process");
+        SetEnvironmentVariableW(L"APS5_RED_ZONE_GUARD_BY_FRAME", L"1");
+        Require(RunChild(self, Rva(reinterpret_cast<const void*>(&StoreWithCleanUpperYmm)), L"clean") == 0, "with APS5_RED_ZONE_GUARD_BY_FRAME, a fault with the upper YMM state clean was not resumed");
+        Require(RunChild(self, Rva(reinterpret_cast<const void*>(&StoreWithDirtyUpperYmm)), L"dirty") == Terminated, "with APS5_RED_ZONE_GUARD_BY_FRAME, a fault with the upper YMM state in use did not terminate the process");
         std::puts("red-zone guard tests passed");
         return 0;
     } catch (const std::exception& error) {
