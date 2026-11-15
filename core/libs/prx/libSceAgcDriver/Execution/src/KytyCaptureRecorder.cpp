@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -43,16 +44,22 @@ struct Range {
     bool donated = false;
 };
 
+constexpr std::uint64_t SetupLimitBytes = 256ull << 20;
+constexpr std::uint64_t PointedBytes = 4096;
+
+bool IsSetup(const char* nid) {
+    static constexpr const char* setups[] = {
+        "23LRUSvYu1M", "f3dg2CSgRKY", "D9sr1xGUriE", "HV4j+E0MBHE", "dbOlWdppb4o",
+        "F0Y42t-3e18", "X-Nm5KLREeg", "U9ueyEhSkF4", "W5z4eZrjEas", "pWLG7WOpVcw", "ZLJk9r2+2Aw", "3AyTaWcF-H8", "XlNp7jzGiPo", "MM4IZSEYytQ", "w2rJhmD+dsE", "DL2RXaXOy88",
+        "Up36PTk687E", "uquVH4-Du78", "WkYtyOg30do", "MBlv8YWoyOk", "PjS5uASwcV8", "rKBUtgRrtbk", "N5KDtkIjjJ4", "CBiu4mCE1DA", "MTxxrOCeSig",
+        "HXzjK9yI30k", "Xru92wHJRmg", "keipklF0pMY", "-Ozn0F1AFRg", "oNOQn3knW6s", "elWQ9vERF-Q", "kmSe30JTs+E", "+I4K03i3EL0", "w0hLuNarQxY", "5tRaBjtdTzY", "T4ucGB8CsnM",
+        "hv1luiJrqQM", "xk0AcarP3V4", "WFIiSfXGUq8", "clVvL4ZDntw"};
+    return std::any_of(std::begin(setups), std::end(setups), [nid](const char* setup) { return std::strcmp(nid, setup) == 0; });
+}
+
 bool IsSubmit(const char* nid) {
     static constexpr const char* submits[] = {"UglJIZjGssM", "AhGvpITrf4M", "6UzEidRZwkg", "+T8Xo6LtFJI", "b4fpgH5ZXxQ", "Fj7r9EHzF38", "gSRnr79F8tQ", "HF3YllT3mXU", "U46NwOiJpys"};
     return std::any_of(std::begin(submits), std::end(submits), [nid](const char* submit) { return std::strcmp(nid, submit) == 0; });
-}
-
-std::uint64_t Hash(const std::byte* bytes, std::size_t size) {
-    std::uint64_t hash = 0xcbf29ce484222325ull;
-    const auto* words = reinterpret_cast<const std::uint64_t*>(bytes);
-    for (std::size_t i = 0; i < size / 8; ++i) hash = (hash ^ words[i]) * 0x100000001b3ull;
-    return hash;
 }
 
 class Recorder {
@@ -100,6 +107,10 @@ public:
                 start();
             }
         }
+        if (state == State::Waiting && IsSetup(nid)) {
+            keepSetup(nid, registers);
+            return;
+        }
         if (state != State::Recording) return;
         if (IsSubmit(nid)) submitDelta();
         record(nid, registers);
@@ -129,6 +140,7 @@ private:
         const auto dll = GetModuleHandleA(std::filesystem::path(path != nullptr ? path : "kyty_gpu.dll").filename().string().c_str());
         flipCount = reinterpret_cast<std::uint64_t (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_flip_count")));
         waitIdle = reinterpret_cast<void (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_wait_idle")));
+        requestTargetDump = reinterpret_cast<void (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_request_target_dump")));
         const char* at = std::getenv("APS5_KYTY_CAPTURE_AT_FLIP");
         atFlip = at != nullptr ? std::strtoull(at, nullptr, 10) : 0;
         if (flipCount == nullptr || waitIdle == nullptr) throw std::runtime_error("APS5_KYTY_CAPTURE: the Kyty GPU DLL has no kyty_gpu_flip_count or kyty_gpu_wait_idle");
@@ -150,6 +162,7 @@ private:
     void start() {
         const auto began = std::chrono::steady_clock::now();
         writer = std::make_unique<FrameCaptureWriter>(directory);
+        writeSetup();
         ranges = committedRanges();
         for (auto& range : ranges) {
             if (!range.writable) continue;
@@ -176,12 +189,13 @@ private:
         state = State::Recording;
         recordedFrames = 0;
         writeMarker(FrameCallKind::FrameStart);
+        if (requestTargetDump != nullptr) requestTargetDump();
         std::fprintf(stderr, "[kyty-capture] started: %zu ranges, %.1f MiB stored in %.1f s\n", ranges.size(), static_cast<double>(snapshotBytes) / (1024.0 * 1024.0), std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count());
     }
 
     void hashPages(std::uint64_t address, std::span<const std::byte> bytes, bool emit) {
         for (std::size_t at = 0; at + PageBytes <= bytes.size(); at += PageBytes) {
-            const auto hash = Hash(bytes.data() + at, PageBytes);
+            const auto hash = AgcDriver::FrameHash(bytes.data() + at, PageBytes);
             auto& known = pageHashes[address + at];
             if (known == hash) continue;
             known = hash;
@@ -246,10 +260,45 @@ private:
         writer->WriteCall(call);
     }
 
-    void record(const char* nid, const KytyCaptureRegisters& registers) {
+    struct SetupCall {
+        FrameCall call;
+        std::vector<std::uint64_t> pointed;
+    };
+
+    void keepSetup(const char* nid, const KytyCaptureRegisters& registers) {
+        SetupCall setup{makeCall(nid, registers), {}};
+        for (const auto address : registers.integers) {
+            const auto bytes = AgcDriver::FrameReadableBytes(address, PointedBytes);
+            if (bytes != 0) setup.pointed.insert(setup.pointed.end(), {address, bytes, AgcDriver::FrameHash(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), static_cast<std::size_t>(bytes))});
+        }
+        setupBytes += setup.call.values.size() * 8 + setup.pointed.size() * 8;
+        if (setupBytes > SetupLimitBytes) throw std::runtime_error("APS5_KYTY_CAPTURE: the calls made before the trigger passed 256 MiB");
+        ++setupCounts[nid];
+        setupCalls.push_back(std::move(setup));
+    }
+
+    void writeSetup() {
+        for (auto& setup : setupCalls) {
+            setup.call.ordinal = ++ordinal;
+            writer->WriteCall(setup.call);
+            if (setup.pointed.empty()) continue;
+            FrameCall memory;
+            memory.kind = FrameCallKind::GuestCallMemory;
+            memory.ordinal = ++ordinal;
+            memory.values = {setup.call.ordinal};
+            memory.values.insert(memory.values.end(), setup.pointed.begin(), setup.pointed.end());
+            writer->WriteCall(memory);
+        }
+        std::fprintf(stderr, "[kyty-capture] setup: %zu calls before the trigger, %.1f MiB:", setupCalls.size(), static_cast<double>(setupBytes) / (1024.0 * 1024.0));
+        for (const auto& [name, count] : setupCounts) std::fprintf(stderr, " %s %llu", name.c_str(), static_cast<unsigned long long>(count));
+        std::fputs("\n", stderr);
+        setupCalls.clear();
+        setupCalls.shrink_to_fit();
+    }
+
+    FrameCall makeCall(const char* nid, const KytyCaptureRegisters& registers) {
         FrameCall call;
         call.kind = FrameCallKind::GuestCall;
-        call.ordinal = ++ordinal;
         call.timeNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - origin).count());
         call.thread = GetCurrentThreadId();
         call.address = registers.stack - 8;
@@ -266,6 +315,12 @@ private:
         call.size = stackBytes;
         const auto* stack = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(call.address));
         call.values.insert(call.values.end(), stack, stack + stackBytes / 8);
+        return call;
+    }
+
+    void record(const char* nid, const KytyCaptureRegisters& registers) {
+        auto call = makeCall(nid, registers);
+        call.ordinal = ++ordinal;
         writer->WriteCall(call);
         t_callOrdinal = call.ordinal;
         recordObject(call.ordinal, registers.integers[0]);
@@ -344,6 +399,10 @@ private:
     std::chrono::steady_clock::time_point origin;
     std::uint64_t (*flipCount)() = nullptr;
     void (*waitIdle)() = nullptr;
+    void (*requestTargetDump)() = nullptr;
+    std::vector<SetupCall> setupCalls;
+    std::map<std::string, std::uint64_t> setupCounts;
+    std::uint64_t setupBytes = 0;
     State state = State::Waiting;
     bool starting = false;
     std::uint64_t lastFlips = 0;
