@@ -3,6 +3,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/KytyCapture.hpp"
 #include "prx/libc/include/KytyGpu.hpp"
+#include "prx/libkernel/Time/include/Time.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -75,6 +76,13 @@ bool IsSubmit(const char* nid) {
     return std::any_of(std::begin(submits), std::end(submits), [nid](const char* submit) { return std::strcmp(nid, submit) == 0; });
 }
 
+struct GuestClockPause {
+    GuestClockPause() { KernelGuestClockPause_nid_no_patch(true); }
+    ~GuestClockPause() { KernelGuestClockPause_nid_no_patch(false); }
+    GuestClockPause(const GuestClockPause&) = delete;
+    GuestClockPause& operator=(const GuestClockPause&) = delete;
+};
+
 class Recorder {
 public:
     static Recorder* Active() {
@@ -142,6 +150,7 @@ public:
                 starting = true;
                 startingSeen = startingPassed = 0;
                 lock.unlock();
+                const GuestClockPause paused;
                 step("waiting for the GPU to go quiet");
                 std::uint32_t blocked = 0;
                 const bool full = waitQuietFor != nullptr ? waitQuietFor(FullIdleTimeoutMs, &blocked) : waitIdleFor != nullptr ? waitIdleFor(FullIdleTimeoutMs) : (waitIdle(), true);
@@ -311,6 +320,7 @@ private:
     }
 
     void emitDelta() {
+        const GuestClockPause paused;
         ++deltaGroup;
         writtenPages = 0;
         std::vector<std::byte> bytes;
