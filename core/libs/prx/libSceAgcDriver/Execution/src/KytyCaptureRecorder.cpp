@@ -85,6 +85,21 @@ public:
         if (state == State::Recording) record(nid, registers);
     }
 
+    void Callback(std::uint64_t function, std::uint64_t first, std::uint64_t second, std::uint64_t third, std::uint64_t result) {
+        if (abandoned.load()) return;
+        std::lock_guard lock(mutex);
+        if (state != State::Recording) return;
+        emitDelta();
+        FrameCall call;
+        call.kind = FrameCallKind::GuestCallback;
+        call.ordinal = ++ordinal;
+        call.timeNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - origin).count());
+        call.thread = GetCurrentThreadId();
+        call.values = {function, first, second, third, result, deltaGroup};
+        writer->WriteCall(call);
+        ++recordedCallbacks;
+    }
+
 private:
     enum class State { Waiting, Recording, Done };
 
@@ -185,7 +200,7 @@ private:
         FrameCall call;
         call.kind = kind;
         call.ordinal = ++ordinal;
-        call.values = {lastFlips};
+        call.values = {lastFlips, deltaGroup};
         writer->WriteCall(call);
     }
 
@@ -195,9 +210,9 @@ private:
         std::size_t arenaSize = 0;
         GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaSize);
         char header[512];
-        std::snprintf(header, sizeof(header), "{\"kind\":\"kyty-guest-calls\",\"arena_base\":%llu,\"frames\":%llu,\"calls\":%llu,\"ranges\":%zu,\"snapshot_bytes\":%llu,\"delta_bytes\":%llu,\"stack_bytes\":%llu}", static_cast<unsigned long long>(arenaBase), static_cast<unsigned long long>(recordedFrames), static_cast<unsigned long long>(recordedCalls), ranges.size(), static_cast<unsigned long long>(snapshotBytes), static_cast<unsigned long long>(deltaBytes), static_cast<unsigned long long>(StackBytes));
+        std::snprintf(header, sizeof(header), "{\"kind\":\"kyty-guest-calls\",\"arena_base\":%llu,\"frames\":%llu,\"calls\":%llu,\"callbacks\":%llu,\"ranges\":%zu,\"snapshot_bytes\":%llu,\"delta_bytes\":%llu,\"stack_bytes\":%llu}", static_cast<unsigned long long>(arenaBase), static_cast<unsigned long long>(recordedFrames), static_cast<unsigned long long>(recordedCalls), static_cast<unsigned long long>(recordedCallbacks), ranges.size(), static_cast<unsigned long long>(snapshotBytes), static_cast<unsigned long long>(deltaBytes), static_cast<unsigned long long>(StackBytes));
         writer->Finish(header);
-        std::fprintf(stderr, "[kyty-capture] %llu frames, %llu guest calls, %.1f MiB of deltas, stored in %s\n", static_cast<unsigned long long>(recordedFrames), static_cast<unsigned long long>(recordedCalls), static_cast<double>(deltaBytes) / (1024.0 * 1024.0), directory.string().c_str());
+        std::fprintf(stderr, "[kyty-capture] %llu frames, %llu guest calls, %llu guest callbacks, %.1f MiB of deltas, stored in %s\n", static_cast<unsigned long long>(recordedFrames), static_cast<unsigned long long>(recordedCalls), static_cast<unsigned long long>(recordedCallbacks), static_cast<double>(deltaBytes) / (1024.0 * 1024.0), directory.string().c_str());
         writer.reset();
         state = State::Done;
     }
@@ -248,6 +263,7 @@ private:
     std::uint64_t lastFlips = 0;
     std::uint64_t recordedFrames = 0;
     std::uint64_t recordedCalls = 0;
+    std::uint64_t recordedCallbacks = 0;
     std::uint64_t ordinal = 0;
     std::uint64_t deltaGroup = 0;
     std::uint64_t snapshotBytes = 0;
@@ -263,6 +279,17 @@ extern "C" void AgcDriverKytyCaptureCall_nid_no_patch(const char* nid, const Kyt
     if (Recorder::Abandoned()) return;
     try {
         if (auto* recorder = Recorder::Active(); recorder != nullptr && nid != nullptr && registers != nullptr) recorder->Call(nid, *registers);
+    } catch (const std::exception& error) {
+        Recorder::Abandon(error.what());
+    } catch (...) {
+        Recorder::Abandon("unknown error");
+    }
+}
+
+extern "C" void AgcDriverKytyCaptureCallback_nid_no_patch(std::uint64_t function, std::uint64_t first, std::uint64_t second, std::uint64_t third, std::uint64_t result) {
+    if (Recorder::Abandoned()) return;
+    try {
+        if (auto* recorder = Recorder::Active()) recorder->Callback(function, first, second, third, result);
     } catch (const std::exception& error) {
         Recorder::Abandon(error.what());
     } catch (...) {

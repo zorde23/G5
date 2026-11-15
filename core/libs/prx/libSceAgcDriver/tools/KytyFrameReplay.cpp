@@ -103,8 +103,11 @@ int APS5_VABI RefusedKernel() {
     return static_cast<int>(0x80020016u);
 }
 
+std::uint64_t CallGuest(std::uint64_t function, std::uint64_t, std::uint64_t, std::uint64_t);
+
 std::uint64_t Resolve(const char* name) {
     static const std::map<std::string, void*> exports = {
+        {"KytyGpuCallGuest_nid_no_patch", reinterpret_cast<void*>(&CallGuest)},
         {"KytyGpuMapDriverMemory_nid_no_patch", reinterpret_cast<void*>(&MapDriverMemory)},
         {"KytyGpuReleaseDriverMemory_nid_no_patch", reinterpret_cast<void*>(&ReleaseDriverMemory)},
         {"KytyGpuAddEvent_nid_no_patch", reinterpret_cast<void*>(&NoEvent)},
@@ -152,53 +155,46 @@ void ApplyDeltas(const FrameCaptureReader& reader, std::uint64_t group) {
     }
 }
 
-int Replay(const std::filesystem::path& directory, const std::filesystem::path& dllPath, const std::filesystem::path& output) {
-    const FrameCaptureReader reader(directory);
-    if (reader.Truncated()) throw std::runtime_error("kyty frame replay: the capture is truncated");
-    std::uintptr_t arenaBase = 0;
-    std::size_t arenaSize = 0;
-    GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaSize);
-    if (HeaderNumber(reader.Header(), "arena_base") != arenaBase) throw std::runtime_error("kyty frame replay: the guest arena is at a different address than in the capture");
-    {
-        GuestAllocations::Mutation mutation;
-        for (const auto& chunk : reader.Chunks()) {
-            if (chunk.kind != FrameMemoryKind::Range) continue;
-            Commit(chunk.address, chunk.bytes, true);
-            if (chunk.address >= arenaBase && chunk.address + chunk.bytes <= arenaBase + arenaSize) mutation.Add(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes), true, true, true);
-        }
+struct Replayer {
+    const FrameCaptureReader& reader;
+    std::uint64_t (*resolve)(const char*);
+    void (*waitIdle)();
+    std::size_t next = 0;
+    std::uint64_t frame = 0, calls = 0, callbacks = 0;
+
+    void Run() {
+        while (next < reader.Calls().size()) Step(reader.Calls()[next++]);
     }
-    for (const auto& chunk : reader.Chunks()) {
-        if (chunk.kind == FrameMemoryKind::Snapshot) reader.Read(chunk, std::span(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes)));
+
+    std::uint64_t Callback(std::uint64_t function) {
+        const auto& all = reader.Calls();
+        while (next < all.size() && all[next].kind != FrameCallKind::GuestCallback) Step(all[next++]);
+        if (next == all.size()) throw std::runtime_error("kyty frame replay: Kyty called a guest callback the capture does not have at " + std::to_string(function));
+        const auto& call = all[next++];
+        if (call.values.size() < 6 || call.values[0] != function) throw std::runtime_error("kyty frame replay: Kyty called the guest callback at " + std::to_string(function) + " where the capture has another one");
+        ApplyDeltas(reader, call.values[5]);
+        ++callbacks;
+        return call.values[4];
     }
-    for (const auto& chunk : reader.Chunks()) {
-        if (chunk.kind != FrameMemoryKind::Range || (chunk.protection & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0) continue;
-        DWORD previous = 0;
-        if (VirtualProtect(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<SIZE_T>(chunk.bytes), PAGE_EXECUTE_READWRITE, &previous) == 0) {
-            throw std::runtime_error("kyty frame replay: cannot make the captured guest code at " + std::to_string(chunk.address) + " executable (error " + std::to_string(GetLastError()) + ")");
-        }
-    }
-    for (const auto& call : reader.Calls()) {
-        if (call.kind == FrameCallKind::GuestCall && call.size != 0) Commit(call.address, call.size, false);
-    }
-    std::filesystem::create_directories(output);
-    std::filesystem::current_path(output);
-    const auto dll = LoadLibraryExW(dllPath.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-    if (dll == nullptr) throw std::runtime_error("kyty frame replay: cannot load " + dllPath.string());
-    const auto init = reinterpret_cast<void (*)(const Aps5Host*)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_init")));
-    const auto resolve = reinterpret_cast<std::uint64_t (*)(const char*)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_resolve")));
-    const auto waitIdle = reinterpret_cast<void (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_wait_idle")));
-    if (init == nullptr || resolve == nullptr || waitIdle == nullptr) throw std::runtime_error("kyty frame replay: the DLL lacks kyty_gpu_init, kyty_gpu_resolve or kyty_gpu_wait_idle");
-    static const Aps5Host host{2, &ProtectHost, &Resolve};
-    init(&host);
-    std::uint64_t frame = 0, calls = 0;
-    for (const auto& call : reader.Calls()) {
+
+    void Step(const FrameCall& call) {
         if (call.kind == FrameCallKind::FrameStart) {
             waitIdle();
-            if (frame != 0) ApplyDeltas(reader, frame);
+            if (call.values.size() > 1) {
+                if (call.values[1] != 0) ApplyDeltas(reader, call.values[1]);
+            } else if (frame != 0) {
+                ApplyDeltas(reader, frame);
+            }
             ++frame;
-            continue;
+            return;
         }
-        if (call.kind != FrameCallKind::GuestCall) continue;
+        if (call.kind == FrameCallKind::GuestCallback) {
+            std::fprintf(stderr, "[kyty-replay] a recorded guest callback at %llu was not called; its memory is applied\n", static_cast<unsigned long long>(call.values.empty() ? 0 : call.values[0]));
+            waitIdle();
+            if (call.values.size() >= 6) ApplyDeltas(reader, call.values[5]);
+            return;
+        }
+        if (call.kind != FrameCallKind::GuestCall) return;
         if (call.values.size() < StackAt) throw std::runtime_error("kyty frame replay: a guest call record is too short");
         char nid[NameWords * 8 + 1]{};
         std::memcpy(nid, call.values.data(), NameWords * 8);
@@ -217,8 +213,50 @@ int Replay(const std::filesystem::path& directory, const std::filesystem::path& 
         KytyCaptureReplay(replay, reinterpret_cast<void*>(static_cast<std::uintptr_t>(target)));
         ++calls;
     }
+};
+
+Replayer* g_replayer = nullptr;
+
+std::uint64_t CallGuest(std::uint64_t function, std::uint64_t, std::uint64_t, std::uint64_t) {
+    return g_replayer->Callback(function);
+}
+
+int Replay(const std::filesystem::path& directory, const std::filesystem::path& dllPath, const std::filesystem::path& output) {
+    const FrameCaptureReader reader(directory);
+    if (reader.Truncated()) throw std::runtime_error("kyty frame replay: the capture is truncated");
+    std::uintptr_t arenaBase = 0;
+    std::size_t arenaSize = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaSize);
+    if (HeaderNumber(reader.Header(), "arena_base") != arenaBase) throw std::runtime_error("kyty frame replay: the guest arena is at a different address than in the capture");
+    {
+        GuestAllocations::Mutation mutation;
+        for (const auto& chunk : reader.Chunks()) {
+            if (chunk.kind != FrameMemoryKind::Range) continue;
+            Commit(chunk.address, chunk.bytes, true);
+            if (chunk.address >= arenaBase && chunk.address + chunk.bytes <= arenaBase + arenaSize) mutation.Add(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes), true, true, true);
+        }
+    }
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind == FrameMemoryKind::Snapshot) reader.Read(chunk, std::span(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes)));
+    }
+    for (const auto& call : reader.Calls()) {
+        if (call.kind == FrameCallKind::GuestCall && call.size != 0) Commit(call.address, call.size, false);
+    }
+    std::filesystem::create_directories(output);
+    std::filesystem::current_path(output);
+    const auto dll = LoadLibraryExW(dllPath.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (dll == nullptr) throw std::runtime_error("kyty frame replay: cannot load " + dllPath.string());
+    const auto init = reinterpret_cast<void (*)(const Aps5Host*)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_init")));
+    const auto resolve = reinterpret_cast<std::uint64_t (*)(const char*)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_resolve")));
+    const auto waitIdle = reinterpret_cast<void (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_wait_idle")));
+    if (init == nullptr || resolve == nullptr || waitIdle == nullptr) throw std::runtime_error("kyty frame replay: the DLL lacks kyty_gpu_init, kyty_gpu_resolve or kyty_gpu_wait_idle");
+    Replayer replayer{reader, resolve, waitIdle};
+    g_replayer = &replayer;
+    static const Aps5Host host{2, &ProtectHost, &Resolve};
+    init(&host);
+    replayer.Run();
     waitIdle();
-    std::fprintf(stderr, "[kyty-replay] %llu frames, %llu guest calls replayed from %s\n", static_cast<unsigned long long>(frame), static_cast<unsigned long long>(calls), directory.string().c_str());
+    std::fprintf(stderr, "[kyty-replay] %llu frames, %llu guest calls, %llu guest callbacks replayed from %s\n", static_cast<unsigned long long>(replayer.frame), static_cast<unsigned long long>(replayer.calls), static_cast<unsigned long long>(replayer.callbacks), directory.string().c_str());
     std::this_thread::sleep_for(std::chrono::seconds(2));
     return 0;
 }
