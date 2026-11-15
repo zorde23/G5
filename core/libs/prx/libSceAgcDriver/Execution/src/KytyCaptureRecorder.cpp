@@ -57,6 +57,23 @@ bool IsSetup(const char* nid) {
     return std::any_of(std::begin(setups), std::end(setups), [nid](const char* setup) { return std::strcmp(nid, setup) == 0; });
 }
 
+std::uint64_t GuestReadableBytes(std::uint64_t address, std::uint64_t limit) {
+    if (address == 0) return 0;
+    std::uint64_t end = 0;
+    if (const auto allocation = GuestAllocations::GuestAllocationsLookup_nid_postfix(static_cast<std::uintptr_t>(address), false); allocation != nullptr) {
+        if (!allocation->readable) return 0;
+        end = allocation->address + allocation->bytes;
+    } else {
+        const auto* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+        const auto low = reinterpret_cast<std::uintptr_t>(tib->StackLimit);
+        const auto high = reinterpret_cast<std::uintptr_t>(tib->StackBase);
+        if (address < low || address >= high) return 0;
+        end = high;
+    }
+    const auto bytes = std::min<std::uint64_t>(limit, end - address) & ~std::uint64_t{7};
+    return bytes != 0 && KytyGpuReadableWithoutFault_nid_no_patch(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes)) ? bytes : 0;
+}
+
 bool IsSubmit(const char* nid) {
     static constexpr const char* submits[] = {"UglJIZjGssM", "AhGvpITrf4M", "6UzEidRZwkg", "+T8Xo6LtFJI", "b4fpgH5ZXxQ", "Fj7r9EHzF38", "gSRnr79F8tQ", "HF3YllT3mXU", "U46NwOiJpys"};
     return std::any_of(std::begin(submits), std::end(submits), [nid](const char* submit) { return std::strcmp(nid, submit) == 0; });
@@ -107,8 +124,11 @@ public:
                 start();
             }
         }
-        if (state == State::Waiting && IsSetup(nid)) {
-            keepSetup(nid, registers);
+        if (state == State::Waiting) {
+            ++setupSeen;
+            ++seenCounts[nid];
+            if (IsSetup(nid)) keepSetup(nid, registers);
+            reportSetup();
             return;
         }
         if (state != State::Recording) return;
@@ -266,15 +286,32 @@ private:
     };
 
     void keepSetup(const char* nid, const KytyCaptureRegisters& registers) {
+        const auto began = std::chrono::steady_clock::now();
         SetupCall setup{makeCall(nid, registers), {}};
         for (const auto address : registers.integers) {
-            const auto bytes = AgcDriver::FrameReadableBytes(address, PointedBytes);
+            const auto bytes = GuestReadableBytes(address, PointedBytes);
             if (bytes != 0) setup.pointed.insert(setup.pointed.end(), {address, bytes, AgcDriver::FrameHash(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), static_cast<std::size_t>(bytes))});
         }
         setupBytes += setup.call.values.size() * 8 + setup.pointed.size() * 8;
         if (setupBytes > SetupLimitBytes) throw std::runtime_error("APS5_KYTY_CAPTURE: the calls made before the trigger passed 256 MiB");
         ++setupCounts[nid];
         setupCalls.push_back(std::move(setup));
+        ++setupKept;
+        setupNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count());
+    }
+
+    void reportSetup() {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - setupReported < std::chrono::seconds(10)) return;
+        setupReported = now;
+        std::vector<std::pair<std::uint64_t, std::string>> top;
+        for (const auto& [name, count] : seenCounts) top.emplace_back(count, name);
+        std::partial_sort(top.begin(), top.begin() + std::min<std::size_t>(3, top.size()), top.end(), std::greater<>());
+        std::fprintf(stderr, "[kyty-capture] setup 10 s: %llu calls seen, %llu kept, %.1f ms spent; most seen:", static_cast<unsigned long long>(setupSeen), static_cast<unsigned long long>(setupKept), static_cast<double>(setupNs) / 1e6);
+        for (std::size_t i = 0; i < std::min<std::size_t>(3, top.size()); ++i) std::fprintf(stderr, " %s %llu%s", top[i].second.c_str(), static_cast<unsigned long long>(top[i].first), IsSetup(top[i].second.c_str()) ? " (setup)" : "");
+        std::fputs("\n", stderr);
+        setupSeen = setupKept = setupNs = 0;
+        seenCounts.clear();
     }
 
     void writeSetup() {
@@ -309,9 +346,7 @@ private:
         call.values.insert(call.values.end(), std::begin(registers.integers), std::end(registers.integers));
         call.values.push_back(registers.vectorCount);
         for (const auto& xmm : registers.xmm) call.values.insert(call.values.end(), std::begin(xmm), std::end(xmm));
-        MEMORY_BASIC_INFORMATION info{};
-        std::uint64_t stackBytes = 0;
-        if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(call.address)), &info, sizeof(info)) != 0) stackBytes = std::min<std::uint64_t>(StackBytes, reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize - call.address) & ~std::uint64_t{7};
+        const auto stackBytes = GuestReadableBytes(call.address, StackBytes);
         call.size = stackBytes;
         const auto* stack = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(call.address));
         call.values.insert(call.values.end(), stack, stack + stackBytes / 8);
@@ -403,6 +438,9 @@ private:
     std::vector<SetupCall> setupCalls;
     std::map<std::string, std::uint64_t> setupCounts;
     std::uint64_t setupBytes = 0;
+    std::uint64_t setupSeen = 0, setupKept = 0, setupNs = 0;
+    std::unordered_map<std::string, std::uint64_t> seenCounts;
+    std::chrono::steady_clock::time_point setupReported = std::chrono::steady_clock::now();
     State state = State::Waiting;
     bool starting = false;
     std::uint64_t lastFlips = 0;
