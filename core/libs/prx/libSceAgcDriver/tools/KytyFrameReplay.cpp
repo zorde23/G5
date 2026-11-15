@@ -67,7 +67,7 @@ bool InArena(std::uint64_t address, std::uint64_t bytes) {
     std::uintptr_t base = 0;
     std::size_t size = 0;
     GuestArena::GuestArenaRange_nid_postfix(&base, &size);
-    return address >= base && address + bytes <= base + size;
+    return address >= base && address - base < size && bytes <= size - (address - base);
 }
 
 void Commit(std::uint64_t address, std::uint64_t bytes, bool range);
@@ -324,7 +324,7 @@ int Replay(const std::filesystem::path& directory, const std::filesystem::path& 
         for (const auto& chunk : reader.Chunks()) {
             if (chunk.kind != FrameMemoryKind::Range) continue;
             Commit(chunk.address, chunk.bytes, true);
-            if (chunk.address >= arenaBase && chunk.address + chunk.bytes <= arenaBase + arenaSize) mutation.Add(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes), true, true, true);
+            if (chunk.address >= arenaBase && chunk.address - arenaBase < arenaSize && chunk.bytes <= arenaSize - (chunk.address - arenaBase)) mutation.Add(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes), true, true, true);
         }
     }
     for (const auto& chunk : reader.Chunks()) {
