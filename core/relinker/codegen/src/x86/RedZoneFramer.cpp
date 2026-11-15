@@ -362,7 +362,18 @@ struct ExitSite {
     std::size_t End;
     std::vector<std::uint8_t> Lead;
     std::size_t Operands = 0;
+    std::vector<std::pair<std::size_t, std::size_t>> Branches;
 };
+
+std::optional<std::uint8_t> conditionCode(const std::uint8_t* code, const Insn& insn) {
+    const auto& info = insn.Info;
+    if (info.FlowKind != ControlFlowKind::ConditionalBranch || !info.HasBranchTarget || info.HasRipRelativeDisp || info.TruncatesBranchTarget) return std::nullopt;
+    for (std::size_t prefix = 0; prefix < info.OpcodeOffset; ++prefix)
+        if (code[prefix] != 0x2e && code[prefix] != 0x3e && (code[prefix] & 0xf0) != 0x40) return std::nullopt;
+    if (!info.IsTwoByteOpcode && info.Opcode >= 0x70 && info.Opcode <= 0x7f) return static_cast<std::uint8_t>(info.Opcode & 0xf);
+    if (info.IsTwoByteOpcode && info.Opcode >= 0x80 && info.Opcode <= 0x8f) return static_cast<std::uint8_t>(info.Opcode & 0xf);
+    return std::nullopt;
+}
 
 void frameSegment(
     const std::vector<std::uint8_t>& fileBytes,
@@ -375,7 +386,8 @@ void frameSegment(
     const bool shrinkWrapped,
     const bool countFramePointerAllocation,
     const bool suspectFramePointerLeaves,
-    const bool stubJumpsStayInBody
+    const bool stubJumpsStayInBody,
+    const bool exitBranches
 ) {
     const auto segOffset = static_cast<std::size_t>(ph.Offset);
     const auto segSize = static_cast<std::size_t>(ph.FileSize);
@@ -717,11 +729,24 @@ void frameSegment(
                 while (exit.End - exit.Begin < kJumpBytes && exit.First > p) {
                     const auto j = exit.First - 1;
                     const auto& prior = body[j];
+                    if (exitBranches && prior.Offset + prior.Length == exit.Begin && prior.Info.FlowKind == ControlFlowKind::ConditionalBranch) {
+                        const auto condition = conditionCode(at(j), prior);
+                        const auto target = static_cast<std::int64_t>(prior.Offset + prior.Length) + prior.Info.BranchDisp;
+                        if (!condition || target < static_cast<std::int64_t>(start) || target >= static_cast<std::int64_t>(prior.Offset) || frees.contains(j)) break;
+                        const std::vector<std::uint8_t> jump{0x0f, static_cast<std::uint8_t>(0x80 | *condition), 0, 0, 0, 0};
+                        exit.Lead.insert(exit.Lead.begin(), jump.begin(), jump.end());
+                        for (auto& branch : exit.Branches) branch.first += jump.size();
+                        exit.Branches.emplace_back(0, static_cast<std::size_t>(target));
+                        exit.Begin = prior.Offset;
+                        exit.First = j;
+                        continue;
+                    }
                     if (prior.Offset + prior.Length != exit.Begin || prior.Info.FlowKind != ControlFlowKind::Sequential || prior.Info.HasRipRelativeDisp || frees.contains(j) || pushesOrPops(at(j), prior)) break;
                     const auto priorUse = memoryUse(at(j), prior);
                     const auto bytes = priorUse.RspBased ? withDisplacement(at(j), prior, priorUse, priorUse.RspDisp + shift) : std::vector<std::uint8_t>(at(j), at(j) + prior.Length);
                     if (!bytes) break;
                     exit.Lead.insert(exit.Lead.begin(), bytes->begin(), bytes->end());
+                    for (auto& branch : exit.Branches) branch.first += bytes->size();
                     if (priorUse.RspBased) ++exit.Operands;
                     exit.Begin = prior.Offset;
                     exit.First = j;
@@ -871,6 +896,8 @@ void frameSegment(
             const auto tail = original(exit.TailBegin, exit.End);
             code.insert(code.end(), tail.begin(), tail.end());
             addSite(exit.Begin, exit.End, std::move(code));
+            for (const auto& [at, target] : exit.Branches)
+                sites.back().Relocations.push_back({at + 2, at + 6, static_cast<std::int64_t>(target) - static_cast<std::int64_t>(exit.Begin)});
         }
         for (auto& stub : stubs) addSite(stub.Begin, stub.End, std::move(stub.Body));
         for (auto& [k, move] : moves) displacements.push_back({ph.Offset + move.first, std::move(move.second)});
@@ -1120,10 +1147,11 @@ std::vector<TrampolineSite> FrameRedZoneFunctions(
     const bool shrinkWrapped,
     const bool countFramePointerAllocation,
     const bool suspectFramePointerLeaves,
-    const bool stubJumpsStayInBody
+    const bool stubJumpsStayInBody,
+    const bool exitBranches
 ) {
     std::vector<TrampolineSite> sites;
-    for (const auto& ph : codeSegments) frameSegment(fileBytes, ph, functions, existing, sites, displacements, report, shrinkWrapped, countFramePointerAllocation, suspectFramePointerLeaves, stubJumpsStayInBody);
+    for (const auto& ph : codeSegments) frameSegment(fileBytes, ph, functions, existing, sites, displacements, report, shrinkWrapped, countFramePointerAllocation, suspectFramePointerLeaves, stubJumpsStayInBody, exitBranches);
     return sites;
 }
 

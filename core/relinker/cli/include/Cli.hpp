@@ -24,6 +24,7 @@ struct Args {
     bool framePointerAllocation = false;
     bool suspectFramePointerLeaves = false;
     bool framePointerStubJumps = false;
+    bool frameExitBranches = false;
     bool writeRegistry = false;
     bool toWindows = false;
     bool toMacos = false;

@@ -22,6 +22,7 @@ struct ConversionOptions {
     bool FramePointerAllocation = false;
     bool SuspectFramePointerLeaves = false;
     bool FramePointerStubJumps = false;
+    bool FrameExitBranches = false;
     bool SkipSyscallCheck = false;
     bool TrapSdkSyscallStubs = false;
     bool LazyBinding = false;
