@@ -555,12 +555,14 @@ Codegen::RedZoneFrameReport runLeaves(const std::vector<Leaf>& leaves, const boo
 
 #ifdef _WIN32
 std::uint8_t* guardedPage = nullptr;
+std::uint64_t faultRsp = 0;
 
 LONG CALLBACK reopenGuardedPage(EXCEPTION_POINTERS* exception) {
     const auto& record = *exception->ExceptionRecord;
     if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2 || reinterpret_cast<std::uint8_t*>(record.ExceptionInformation[1]) != guardedPage)
         return EXCEPTION_CONTINUE_SEARCH;
     DWORD old = 0;
+    faultRsp = exception->ContextRecord->Rsp;
     return VirtualProtect(guardedPage, 0x1000, PAGE_READWRITE, &old) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -589,6 +591,71 @@ void exceptionDispatchLeavesBytesAboveRspIntact() {
     require(changed == 0, "the exception dispatch changed bytes at or above RSP while the faulting store ran");
     std::cout << "exception dispatch: the 256 bytes at and above RSP were intact after a resumed write fault\n";
 }
+
+std::uint64_t runFaultingLeaf(const std::uint64_t value) {
+    DWORD old = 0;
+    require(VirtualProtect(guardedPage, 0x1000, PAGE_READONLY, &old) != 0, "cannot guard the page again");
+    require(FlushInstructionCache(GetCurrentProcess(), arena, kArenaBytes) != 0, "cannot flush the generated code");
+    const auto leaf = reinterpret_cast<std::uint64_t (*)(std::uint8_t*, std::uint64_t)>(arena);
+    return leaf(guardedPage, value);
+}
+
+void trampolinedAccessesKeepTheRedZoneThroughAResumedFault() {
+    guardedPage = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY));
+    require(guardedPage != nullptr, "cannot allocate the guarded page");
+    const auto handler = AddVectoredExceptionHandler(1, reopenGuardedPage);
+    require(handler != nullptr, "cannot install the access-violation handler");
+    const std::vector<std::uint8_t> leaf{
+        0x49, 0x89, 0xc8, 0x48, 0x8d, 0x7c, 0x24, 0x80, 0xb9, 0x80, 0x00, 0x00, 0x00, 0xb0, kClobber, 0xf3, 0xaa,
+        0x41, 0xc7, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x48, 0x8d, 0x74, 0x24, 0x80, 0xb9, 0x80, 0x00, 0x00, 0x00, 0x31, 0xc0,
+        0x80, 0x3e, kClobber, 0x74, 0x02, 0xff, 0xc0, 0x48, 0xff, 0xc6, 0xff, 0xc9, 0x75, 0xf2, 0xc3,
+    };
+    constexpr std::uint64_t kValue = 0;
+    std::fill_n(arena, kArenaBytes, 0xcc);
+    std::copy(leaf.begin(), leaf.end(), arena);
+    const auto plain = runFaultingLeaf(kValue);
+    {
+        const std::vector<std::uint8_t> probe{
+            0x49, 0x89, 0xc8, 0x48, 0x8d, 0xbc, 0x24, 0x00, 0xfc, 0xff, 0xff, 0xb9, 0x00, 0x04, 0x00, 0x00, 0xb0, kClobber, 0xf3, 0xaa,
+            0x41, 0xc7, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x48, 0x8d, 0x74, 0x24, 0xff, 0x31, 0xc0,
+            0x80, 0x3e, kClobber, 0x75, 0x0d, 0x48, 0xff, 0xce, 0xff, 0xc0, 0x3d, 0x00, 0x04, 0x00, 0x00, 0x75, 0xef, 0xc3,
+            0xff, 0xc0, 0xc3,
+        };
+        std::fill_n(arena, kArenaBytes, 0xcc);
+        std::copy(probe.begin(), probe.end(), arena);
+        const auto untouched = runFaultingLeaf(0);
+        std::cout << "exception dispatch probe: the first byte the dispatch changed lies " << untouched << " bytes below RSP (1024 = none in 1 KiB)\n";
+        std::fill_n(arena, kArenaBytes, 0xcc);
+        std::copy(leaf.begin(), leaf.end(), arena);
+    }
+    const auto plainRsp = faultRsp;
+    const auto base = reinterpret_cast<std::uint64_t>(arena);
+    const std::vector<Domain::ProgramHeader> segments{{1, 5, 0, base, base, leaf.size(), leaf.size(), 16}};
+    std::vector<Codegen::RedZoneDeadRange> covered;
+    Codegen::RedZoneTrampolineReport report;
+    const auto sites = Codegen::TrampolineRedZoneRanges(leaf, segments, {{base, base + leaf.size()}}, {}, covered, report);
+    require(!sites.empty() && std::any_of(covered.begin(), covered.end(), [&](const auto& range) { return range.Begin <= base + 17 && base + 24 <= range.End; }), "the faulting store was not moved into a trampoline");
+    std::size_t cursor = kStubBase;
+    for (const auto& site : sites) {
+        auto* stub = arena + cursor;
+        std::copy(site.Body.begin(), site.Body.end(), stub);
+        Codegen::ApplyStubRelocations(std::span<std::uint8_t>(stub, site.ReturnBranchOffset), site.Relocations, site.Address, base + cursor, site.Offset);
+        writeRel32(stub + site.ReturnBranchOffset + 1, site.Address + site.Length, base + cursor + site.ReturnBranchOffset + 5);
+        const auto at = static_cast<std::size_t>(site.Address - base);
+        std::fill_n(arena + at, site.Length, 0x90);
+        arena[at] = 0xe9;
+        writeRel32(arena + at + 1, base + cursor, site.Address + 5);
+        cursor += (site.Body.size() + 15) / 16 * 16;
+    }
+    const auto trampolined = runFaultingLeaf(kValue);
+    RemoveVectoredExceptionHandler(handler);
+    VirtualFree(guardedPage, 0, MEM_RELEASE);
+    require(trampolined == plain, "the trampolined leaf returned " + std::to_string(trampolined) + ", not the unprotected leaf's " + std::to_string(plain));
+    require(plainRsp - faultRsp == 128, "the faulting store ran with RSP " + std::to_string(plainRsp - faultRsp) + " bytes lower in its trampoline, not 128");
+    std::cout << "red-zone trampoline: the faulting store ran with RSP 128 bytes lower; the unprotected leaf lost " << plain << " of the 128 bytes below RSP\n";
+}
 #endif
 }
 
@@ -613,6 +680,7 @@ int main() {
         runsAShrinkWrappedLeafThroughItsTakenEarlyExit();
 #ifdef _WIN32
         exceptionDispatchLeavesBytesAboveRspIntact();
+        trampolinedAccessesKeepTheRedZoneThroughAResumedFault();
 #endif
         Precision precision;
         for (const auto& leaves : {framedLeaves(), stubbedLeaves(), backwardStubbedLeaves(), widenedLeaves(), shrinkWrappedLeaves(), leavesWithADeadTail()}) {

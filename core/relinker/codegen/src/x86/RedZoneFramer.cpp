@@ -1,5 +1,7 @@
 #include <codegen/x86/RedZoneFramer.hpp>
+#include <codegen/CodegenException.hpp>
 #include <codegen/IInstructionScanner.hpp>
+#include <codegen/x86/StubBodyBuilder.hpp>
 #include <codegen/x86/X64InstructionDecoder.hpp>
 #include <algorithm>
 #include <bitset>
@@ -9,6 +11,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 
 namespace Codegen {
 
@@ -1098,6 +1101,134 @@ std::vector<RedZoneDeadRange> deadRanges(const std::vector<std::uint8_t>& seg, c
     return dead;
 }
 
+}
+
+std::vector<TrampolineSite> TrampolineRedZoneRanges(
+    const std::vector<std::uint8_t>& fileBytes,
+    const std::vector<Domain::ProgramHeader>& codeSegments,
+    const std::vector<RedZoneDeadRange>& live,
+    const std::vector<TrampolineSite>& existing,
+    std::vector<RedZoneDeadRange>& covered,
+    RedZoneTrampolineReport& report
+) {
+    std::vector<TrampolineSite> sites;
+    const std::vector<std::uint8_t> lower{0x48, 0x8d, 0x64, 0x24, 0x80};
+    const std::vector<std::uint8_t> raise{0x48, 0x8d, 0xa4, 0x24, 0x80, 0x00, 0x00, 0x00};
+    const auto scanner = MakeInstructionScanner();
+    const X64InstructionDecoder decoder;
+    for (const auto& ph : codeSegments) {
+        const auto segOffset = static_cast<std::size_t>(ph.Offset);
+        const auto segSize = static_cast<std::size_t>(ph.FileSize);
+        if (segOffset > fileBytes.size() || segSize > fileBytes.size() - segOffset) continue;
+        const auto* seg = fileBytes.data() + segOffset;
+        std::set<std::size_t> targets;
+        bool scanned = false;
+        std::vector<std::pair<std::size_t, std::size_t>> taken;
+        for (const auto& site : existing)
+            if (site.Address >= ph.MappedAddress && site.Address < ph.MappedAddress + segSize) taken.emplace_back(static_cast<std::size_t>(site.Address - ph.MappedAddress), static_cast<std::size_t>(site.Address - ph.MappedAddress) + site.Length);
+        for (const auto& range : live) {
+            if (range.Begin < ph.MappedAddress || range.End <= range.Begin || range.End - ph.MappedAddress > segSize) continue;
+            if (!scanned) {
+                scanned = true;
+                for (const auto& match : scanner->ScanCodeSection(std::vector<std::uint8_t>(seg, seg + segSize), 0, segSize)) {
+                    const auto info = decoder.DecodeInstruction(seg + match.Offset, match.Length);
+                    if (!info.HasBranchTarget || info.HasRipRelativeDisp) continue;
+                    const auto target = static_cast<std::int64_t>(match.Offset + match.Length) + info.BranchDisp;
+                    if (target >= 0 && static_cast<std::size_t>(target) < segSize) targets.insert(static_cast<std::size_t>(target));
+                }
+            }
+            const auto begin = static_cast<std::size_t>(range.Begin - ph.MappedAddress);
+            const auto end = static_cast<std::size_t>(range.End - ph.MappedAddress);
+            const auto limit = std::min(segSize, end + 64);
+            std::vector<Insn> body;
+            for (const auto stop : {limit, end}) {
+                body.clear();
+                try {
+                    const std::vector<std::uint8_t> window(seg + begin, seg + stop);
+                    for (const auto& match : scanner->ScanCodeSection(window, 0, window.size())) {
+                        if (begin + match.Offset != (body.empty() ? begin : body.back().Offset + body.back().Length)) break;
+                        body.push_back({begin + static_cast<std::size_t>(match.Offset), match.Length, decoder.DecodeInstruction(window.data() + match.Offset, match.Length)});
+                    }
+                    break;
+                } catch (const std::exception&) {
+                    body.clear();
+                }
+            }
+            if (body.empty()) { ++report.Refused["range that does not decode"]; continue; }
+            const auto code = [&](const std::size_t k) { return seg + body[k].Offset; };
+            const auto guarded = [&](const std::size_t k) {
+                const auto& insn = body[k];
+                if (!insn.Info.HasMemoryOperand || insn.Info.FlowKind != ControlFlowKind::Sequential || insn.Info.SegmentPrefix != 0) return false;
+                const auto use = memoryUse(code(k), insn);
+                return !use.RspBased && !use.UsesRsp && !use.RegisterRsp && !usesRspOutsideOperands(code(k), insn) && !pushesOrPops(code(k), insn);
+            };
+            const auto movable = [&](const std::size_t k) {
+                const auto& insn = body[k];
+                const auto flow = insn.Info.FlowKind;
+                if (code(k)[insn.Info.OpcodeOffset] == 0xcc || insn.Info.TruncatesBranchTarget || insn.Info.SegmentPrefix != 0) return false;
+                if (flow == ControlFlowKind::Sequential) return true;
+                return (flow == ControlFlowKind::ConditionalBranch || flow == ControlFlowKind::UnconditionalJump) && insn.Info.HasBranchTarget && !insn.Info.HasRipRelativeDisp;
+            };
+            const auto refuse = [&](const char* why) { ++report.Refused[why]; };
+            std::size_t next = 0;
+            for (std::size_t k = 0; k < body.size() && body[k].Offset < end; ++k) {
+                if (k < next || !guarded(k)) continue;
+                if (body[k].Info.FlowKind != ControlFlowKind::Sequential) { refuse("guarded instruction is not sequential"); continue; }
+                std::size_t first = k;
+                std::size_t last = k + 1;
+                const auto bytes = [&] { return body[last - 1].Offset + body[last - 1].Length - body[first].Offset; };
+                bool stop = false;
+                while (bytes() < 5 && !stop) {
+                    if (last < body.size() && body[last - 1].Info.FlowKind == ControlFlowKind::Sequential && movable(last)) { ++last; continue; }
+                    if (first > next && movable(first - 1) && body[first - 1].Info.FlowKind == ControlFlowKind::Sequential) { --first; continue; }
+                    stop = true;
+                }
+                if (bytes() < 5) { refuse("no room for a jump"); continue; }
+                const auto siteBegin = body[first].Offset;
+                const auto siteEnd = siteBegin + bytes();
+                const auto inside = targets.upper_bound(siteBegin);
+                if (inside != targets.end() && *inside < siteEnd) { refuse("branch into the site"); continue; }
+                if (std::any_of(taken.begin(), taken.end(), [&](const auto& span) { return siteBegin < span.second && span.first < siteEnd; })) { refuse("overlaps another stub"); continue; }
+                StubBodyBuilder builder;
+                bool encoded = true;
+                std::size_t wrapped = 0;
+                try {
+                    for (auto j = first; j < last; ++j) {
+                        const std::span<const std::uint8_t> instruction(code(j), body[j].Length);
+                        builder.Seek(static_cast<std::int64_t>(body[j].Offset - siteBegin));
+                        if (body[j].Info.FlowKind != ControlFlowKind::Sequential) {
+                            builder.MoveControlFlow(instruction, body[j].Info);
+                            continue;
+                        }
+                        const bool wrap = guarded(j);
+                        if (wrap) builder.Raw(lower);
+                        builder.Move(instruction, body[j].Info.HasRipRelativeDisp ? std::optional<std::size_t>(body[j].Info.RipRelativeDispOffset) : std::nullopt);
+                        if (wrap) { builder.Raw(raise); ++wrapped; }
+                    }
+                } catch (const CodegenException&) {
+                    encoded = false;
+                }
+                if (!encoded) { refuse("instruction that cannot move into a stub"); continue; }
+                auto lowered = builder.Finish();
+                TrampolineSite site;
+                site.Offset = ph.Offset + siteBegin;
+                site.Address = ph.MappedAddress + siteBegin;
+                site.Length = siteEnd - siteBegin;
+                site.OriginalBytes.assign(seg + siteBegin, seg + siteEnd);
+                site.Body = std::move(lowered.Bytes);
+                site.ReturnBranchOffset = lowered.ReturnBranchOffset;
+                site.Relocations = std::move(lowered.Relocations);
+                sites.push_back(std::move(site));
+                taken.emplace_back(siteBegin, siteEnd);
+                covered.push_back({ph.MappedAddress + siteBegin, ph.MappedAddress + siteEnd});
+                report.Instructions += wrapped;
+                ++report.Sites;
+                next = last;
+            }
+        }
+    }
+    std::sort(covered.begin(), covered.end(), [](const auto& left, const auto& right) { return left.Begin < right.Begin; });
+    return sites;
 }
 
 std::vector<std::vector<RedZoneDeadRange>> FindRedZoneDeadRanges(
