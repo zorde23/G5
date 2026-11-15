@@ -188,6 +188,11 @@ struct Replayer {
             ++frame;
             return;
         }
+        if (call.kind == FrameCallKind::Memory) {
+            waitIdle();
+            if (!call.values.empty()) ApplyDeltas(reader, call.values[0]);
+            return;
+        }
         if (call.kind == FrameCallKind::GuestCallback) {
             std::fprintf(stderr, "[kyty-replay] a recorded guest callback at %llu was not called; its memory is applied\n", static_cast<unsigned long long>(call.values.empty() ? 0 : call.values[0]));
             waitIdle();
