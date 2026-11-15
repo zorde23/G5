@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cerrno>
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <exception>
 #include <future>
@@ -19,6 +20,7 @@
 #include <atomic>
 #include <stdexcept>
 #include "prx/libc/include/Shutdown.hpp"
+#include "prx/libc/include/KytyGpu.hpp"
 
 #include "prx/libc/include/General.hpp"
 #include "SceTypes.hpp"
@@ -56,6 +58,16 @@ extern "C" void LibcRequestExit_nid_postfix(int code) {
     if (exitRequested.exchange(true)) return;
     LibcRequestShutdown_nid_postfix();
     std::thread([code] { LibcExitWithoutHandlers_nid_no_patch(code); }).detach();
+    std::thread([code] {
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+        std::fputs("[libc] requested exit exceeded 10 seconds: terminating\n", stderr);
+        std::fflush(stderr);
+        LibcRunEndFlush_nid_no_patch();
+#ifdef _WIN32
+        TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+#endif
+        std::_Exit(code);
+    }).detach();
 }
 
 extern "C" [[noreturn]] void LibcAwaitExit_nid_postfix() {
@@ -129,7 +141,7 @@ extern "C" void LibcSetEndFlush_nid_no_patch(void (*flush)()) {
 }
 
 extern "C" void LibcRunEndFlush_nid_no_patch() {
-    if (const auto flush = endFlush.load(std::memory_order_acquire)) flush();
+    if (const auto flush = endFlush.exchange(nullptr, std::memory_order_acq_rel)) flush();
 }
 
 extern "C" void LibcSetExitDrain_nid_no_patch(void (*drain)()) {
@@ -198,12 +210,22 @@ void LibcStartExit_nid_postfix() {
     StartExit();
     CxaFinalize_nid_no_patch(nullptr);
     LibcRunShutdown_nid_postfix();
+    if (KytyGpuEnabled()) {
+        std::fflush(nullptr);
+        LibcTerminate_nid_no_patch(code);
+    }
     std::exit(code);
 }
 
 [[noreturn]] void LibcExitWithoutHandlers_nid_no_patch(int code) {
     StartExit();
-    LibcRunShutdown_nid_postfix();
+    try {
+        LibcRunShutdown_nid_postfix();
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[libc] shutdown failed: %s\n", error.what());
+    } catch (...) {
+        std::fputs("[libc] shutdown failed\n", stderr);
+    }
     std::fflush(nullptr);
     LibcTerminate_nid_no_patch(code);
 }
