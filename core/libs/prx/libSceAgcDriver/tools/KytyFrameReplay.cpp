@@ -194,7 +194,8 @@ int Replay(const std::filesystem::path& directory, const std::filesystem::path& 
     for (const auto& call : reader.Calls()) {
         if (call.kind == FrameCallKind::FrameStart) {
             waitIdle();
-            ApplyDeltas(reader, ++frame);
+            if (frame != 0) ApplyDeltas(reader, frame);
+            ++frame;
             continue;
         }
         if (call.kind != FrameCallKind::GuestCall) continue;
