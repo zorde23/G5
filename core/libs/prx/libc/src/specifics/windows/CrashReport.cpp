@@ -512,7 +512,9 @@ DispatchFrame dispatchFrame(const EXCEPTION_POINTERS* info) {
         const auto* ex = reinterpret_cast<const ContextEx*>(context + 1);
         const auto* header = reinterpret_cast<const std::uint8_t*>(ex) + ex->XState.Offset;
         std::memcpy(&frame.Mask, header, sizeof(frame.Mask));
-        frame.KnownMask = true;
+        const auto areaEnd = static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(header) + ex->XState.Length);
+        const auto above = static_cast<std::int64_t>(context->Rsp) - areaEnd;
+        frame.KnownMask = reinterpret_cast<std::uintptr_t>(header) > reinterpret_cast<std::uintptr_t>(context) && above >= 0 && above < 64;
         const auto written = (frame.Mask & ~std::uint64_t{7}) != 0 ? static_cast<std::uintptr_t>(ex->XState.Length) : (frame.Mask & 4) != 0 ? std::uintptr_t{64 + 256} : std::uintptr_t{64};
         top = std::max(top, reinterpret_cast<std::uintptr_t>(header) + written);
     }
@@ -527,7 +529,7 @@ void GuardRedZone(const EXCEPTION_POINTERS* info) {
     if (!frame.KnownMask) g_unknownXstateFaults.fetch_add(1, std::memory_order_relaxed);
     else if ((frame.Mask & 4) != 0) g_avxDirtyFaults.fetch_add(1, std::memory_order_relaxed);
     for (auto nearest = g_nearestFrame.load(std::memory_order_relaxed); frame.Gap < nearest && !g_nearestFrame.compare_exchange_weak(nearest, frame.Gap, std::memory_order_relaxed);) {}
-    const auto rip = static_cast<std::uint64_t>(info->ContextRecord->Rip);
+    const auto rip = reinterpret_cast<std::uint64_t>(info->ExceptionRecord->ExceptionAddress);
     const bool memoryFault = info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && info->ExceptionRecord->NumberParameters >= 2;
     const auto access = memoryFault ? info->ExceptionRecord->ExceptionInformation[0] : ULONG_PTR{2};
     HMODULE module = nullptr;
@@ -544,7 +546,7 @@ void GuardRedZone(const EXCEPTION_POINTERS* info) {
         break;
     }
     if (tabled && hit == nullptr) g_outsideFaults.fetch_add(1, std::memory_order_relaxed);
-    if (hit != nullptr && !hit->Uncovered && g_guardByFrame && frame.KnownMask && frame.Gap >= 192) {
+    if (hit != nullptr && !hit->Uncovered && g_guardByFrame && frame.KnownMask && (frame.Mask & ~std::uint64_t{3}) == 0 && frame.Gap >= 192) {
         g_leafFaultsResumed.fetch_add(1, std::memory_order_relaxed);
         auto& resumed = g_redZoneLogged[(rip * 0x9e3779b97f4a7c15ull) >> 54];
         std::uint64_t none = 0;
