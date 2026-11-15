@@ -32,6 +32,7 @@ enum class FrameCallKind : std::uint32_t {
     UnregisterVideoOutput,
     GuestCall,
     GuestCallback,
+    GuestCallObject,
 };
 
 struct FrameCall {

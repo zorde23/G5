@@ -233,6 +233,19 @@ private:
         }
     }
 
+    void recordObject(std::uint64_t callOrdinal, std::uint64_t address) {
+        const auto bytes = CallbackObjectWords * 8;
+        const bool captured = std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.writable && address >= range.address && address + bytes <= range.address + range.bytes; });
+        if (!captured) return;
+        FrameCall call;
+        call.kind = FrameCallKind::GuestCallObject;
+        call.ordinal = ++ordinal;
+        call.values = {callOrdinal, address};
+        const auto* object = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(address));
+        call.values.insert(call.values.end(), object, object + CallbackObjectWords);
+        writer->WriteCall(call);
+    }
+
     void record(const char* nid, const KytyCaptureRegisters& registers) {
         FrameCall call;
         call.kind = FrameCallKind::GuestCall;
@@ -255,6 +268,7 @@ private:
         call.values.insert(call.values.end(), stack, stack + stackBytes / 8);
         writer->WriteCall(call);
         t_callOrdinal = call.ordinal;
+        recordObject(call.ordinal, registers.integers[0]);
         ++recordedCalls;
     }
 
