@@ -33,6 +33,7 @@ using AgcDriver::FrameRangeKind;
 constexpr std::uint64_t PageBytes = 4096;
 constexpr std::uint64_t StackBytes = 4096;
 constexpr std::size_t CallbackObjectWords = 7;
+constexpr std::uint32_t IdleTimeoutMs = 5000;
 
 thread_local std::uint64_t t_callOrdinal = 0;
 
@@ -112,9 +113,18 @@ public:
             lastFlips = flips;
             if (boundary()) {
                 starting = true;
+                startingSeen = startingPassed = 0;
                 lock.unlock();
-                waitIdle();
+                step("waiting for the GPU to go idle");
+                const bool idle = waitIdleFor != nullptr ? waitIdleFor(IdleTimeoutMs) : (waitIdle(), true);
                 lock.lock();
+                if (!idle) {
+                    starting = false;
+                    started.notify_all();
+                    step(trigger == "F9" ? "the GPU did not go idle in time (it may wait on memory this game thread writes later): not started, press F9 again" : "the GPU did not go idle in time (it may wait on memory this game thread writes later): not started, trying at the next flip");
+                    return;
+                }
+                step("GPU idle");
                 try {
                     start();
                 } catch (...) {
@@ -162,6 +172,7 @@ private:
         requestTargetDump = reinterpret_cast<void (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_request_target_dump")));
         captureState = reinterpret_cast<std::uint64_t (*)(std::uint64_t*, std::uint64_t)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_capture_state")));
         takeHotkey = reinterpret_cast<bool (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_take_capture_hotkey")));
+        waitIdleFor = reinterpret_cast<bool (*)(std::uint32_t)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_wait_idle_for")));
         if (this->trigger == "F9" && takeHotkey == nullptr) throw std::runtime_error("APS5_KYTY_CAPTURE_TRIGGER=F9: the Kyty GPU DLL has no kyty_gpu_take_capture_hotkey");
         const char* at = std::getenv("APS5_KYTY_CAPTURE_AT_FLIP");
         atFlip = at != nullptr ? std::strtoull(at, nullptr, 10) : 0;
@@ -185,6 +196,7 @@ private:
     void start() {
         const auto began = std::chrono::steady_clock::now();
         writer = std::make_unique<FrameCaptureWriter>(directory);
+        step("folder created");
         writeKytyState();
         ranges = committedRanges();
         for (auto& range : ranges) {
@@ -199,6 +211,7 @@ private:
         }
         armed = true;
         KytyGpuCaptureFaults_nid_no_patch();
+        step("snapshot");
         std::vector<std::byte> bytes;
         for (const auto& range : ranges) {
             writer->WriteRange(range.address, range.bytes, FrameRangeKind::Section, range.protection, AgcDriver::FrameRangeAccess::Readable | (range.writable ? AgcDriver::FrameRangeAccess::Writable : 0u));
@@ -284,6 +297,11 @@ private:
         const auto* object = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(address));
         call.values.insert(call.values.end(), object, object + CallbackObjectWords);
         writer->WriteCall(call);
+    }
+
+    void step(const char* what) const {
+        std::fprintf(stderr, "[kyty-capture] %.3f s: %s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - origin).count(), what);
+        std::fflush(stderr);
     }
 
     void writeKytyState() {
@@ -401,6 +419,7 @@ private:
     void (*requestTargetDump)() = nullptr;
     std::uint64_t (*captureState)(std::uint64_t*, std::uint64_t) = nullptr;
     bool (*takeHotkey)() = nullptr;
+    bool (*waitIdleFor)(std::uint32_t) = nullptr;
     std::condition_variable started;
     std::uint64_t startingSeen = 0, startingPassed = 0;
     State state = State::Waiting;
