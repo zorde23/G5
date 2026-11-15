@@ -34,6 +34,7 @@ constexpr std::size_t VectorCountAt = IntegerAt + 6;
 constexpr std::size_t XmmAt = VectorCountAt + 1;
 constexpr std::size_t StackAt = XmmAt + 16;
 constexpr std::uint64_t Granularity = 64u * 1024u;
+constexpr std::uint32_t QuietTimeoutMs = 30000;
 
 struct Aps5Host {
     std::uint32_t version;
@@ -161,7 +162,15 @@ void ApplyDeltas(const FrameCaptureReader& reader, std::uint64_t group) {
 struct Replayer {
     const FrameCaptureReader& reader;
     std::uint64_t (*resolve)(const char*);
-    void (*waitIdle)();
+    bool (*waitQuiet)(std::uint32_t, std::uint32_t*);
+
+    void Settle(const char* where) {
+        std::uint32_t blocked = 0;
+        if (waitQuiet(QuietTimeoutMs, &blocked)) return;
+        std::fprintf(stderr, "[kyty-replay] the GPU did not go quiet in %u ms %s\n", QuietTimeoutMs, where);
+        Totals();
+        throw std::runtime_error(std::string("kyty frame replay: the GPU did not go quiet ") + where);
+    }
     std::uint64_t frame = 0, calls = 0, callbacks = 0;
     std::uint64_t current = 0;
     std::set<const FrameCall*> used;
@@ -252,7 +261,8 @@ struct Replayer {
 
     void Step(const FrameCall& call) {
         if (call.kind == FrameCallKind::FrameStart) {
-            waitIdle();
+            if (frame == 0) Totals();
+            Settle("before a frame's memory");
             if (call.values.size() > 1) {
                 if (call.values[1] != 0) ApplyDeltas(reader, call.values[1]);
             } else if (frame != 0) {
@@ -262,7 +272,7 @@ struct Replayer {
             return;
         }
         if (call.kind == FrameCallKind::Memory) {
-            waitIdle();
+            Settle("before a submit's memory");
             if (!call.values.empty()) ApplyDeltas(reader, call.values[0]);
             return;
         }
@@ -306,6 +316,19 @@ int SelfTest(const std::filesystem::path& dllPath) {
     const bool passed = test();
     std::fprintf(stderr, "[kyty-replay] self test: %s\n", passed ? "passed" : "FAILED");
     return passed ? 0 : 1;
+}
+
+int Peek(const std::filesystem::path& directory, std::uint64_t address) {
+    const FrameCaptureReader reader(directory);
+    for (const auto& chunk : reader.Chunks()) {
+        if ((chunk.kind != FrameMemoryKind::Snapshot && chunk.kind != FrameMemoryKind::Delta) || address < chunk.address || address - chunk.address + 8 > chunk.bytes) continue;
+        std::vector<std::byte> bytes(static_cast<std::size_t>(chunk.bytes));
+        reader.Read(chunk, bytes);
+        std::uint64_t value = 0;
+        std::memcpy(&value, bytes.data() + (address - chunk.address), sizeof(value));
+        std::printf("%s group %llu: %llx holds %016llx\n", chunk.kind == FrameMemoryKind::Snapshot ? "snapshot" : "delta", static_cast<unsigned long long>(chunk.group), static_cast<unsigned long long>(address), static_cast<unsigned long long>(value));
+    }
+    return 0;
 }
 
 int List(const std::filesystem::path& directory) {
@@ -352,9 +375,9 @@ int Replay(const std::filesystem::path& directory, const std::filesystem::path& 
     if (dll == nullptr) throw std::runtime_error("kyty frame replay: cannot load " + dllPath.string());
     const auto init = reinterpret_cast<void (*)(const Aps5Host*)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_init")));
     const auto resolve = reinterpret_cast<std::uint64_t (*)(const char*)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_resolve")));
-    const auto waitIdle = reinterpret_cast<void (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_wait_idle")));
-    if (init == nullptr || resolve == nullptr || waitIdle == nullptr) throw std::runtime_error("kyty frame replay: the DLL lacks kyty_gpu_init, kyty_gpu_resolve or kyty_gpu_wait_idle");
-    Replayer replayer{reader, resolve, waitIdle};
+    const auto waitQuiet = reinterpret_cast<bool (*)(std::uint32_t, std::uint32_t*)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_wait_quiet_for")));
+    if (init == nullptr || resolve == nullptr || waitQuiet == nullptr) throw std::runtime_error("kyty frame replay: the DLL lacks kyty_gpu_init, kyty_gpu_resolve or kyty_gpu_wait_quiet_for");
+    Replayer replayer{reader, resolve, waitQuiet};
     g_replayer = &replayer;
     static const Aps5Host host{2, &ProtectHost, &Resolve};
     init(&host);
@@ -374,7 +397,7 @@ int Replay(const std::filesystem::path& directory, const std::filesystem::path& 
     std::fprintf(stderr, "[kyty-replay] %llu captured ranges mapped for the GPU in place, Kyty state restored\n", static_cast<unsigned long long>(mapped));
     if (const auto request = reinterpret_cast<void (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_request_target_dump")))) request();
     replayer.Run();
-    waitIdle();
+    replayer.Settle("after the last call");
     std::fprintf(stderr, "[kyty-replay] %llu frames, %llu guest calls, %llu guest callbacks replayed from %s\n", static_cast<unsigned long long>(replayer.frame), static_cast<unsigned long long>(replayer.calls), static_cast<unsigned long long>(replayer.callbacks), directory.string().c_str());
     std::this_thread::sleep_for(std::chrono::seconds(2));
     return 0;
@@ -384,6 +407,7 @@ int Replay(const std::filesystem::path& directory, const std::filesystem::path& 
 
 int main(int argc, char** argv) {
     if (argc == 3 && std::string(argv[1]) == "--list") return List(argv[2]);
+    if (argc == 4 && std::string(argv[1]) == "--peek") return Peek(argv[2], std::strtoull(argv[3], nullptr, 16));
     if (argc == 3 && std::string(argv[1]) == "--self-test") {
         SetEnvironmentVariableA("DISABLE_RTSS_LAYER", "1");
         SetEnvironmentVariableA("DISABLE_VULKAN_OBS_CAPTURE", "1");
