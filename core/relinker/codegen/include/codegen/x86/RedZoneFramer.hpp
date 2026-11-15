@@ -52,6 +52,21 @@ std::vector<std::vector<RedZoneDeadRange>> FindRedZoneDeadRanges(
     std::vector<std::uint64_t>* tailCallLeaves = nullptr
 );
 
+struct RedZoneTrampolineReport {
+    std::size_t Sites = 0;
+    std::size_t Instructions = 0;
+    std::map<std::string, std::size_t> Refused;
+};
+
+std::vector<TrampolineSite> TrampolineRedZoneRanges(
+    const std::vector<std::uint8_t>& fileBytes,
+    const std::vector<Domain::ProgramHeader>& codeSegments,
+    const std::vector<RedZoneDeadRange>& live,
+    const std::vector<TrampolineSite>& existing,
+    std::vector<RedZoneDeadRange>& covered,
+    RedZoneTrampolineReport& report
+);
+
 struct RedZoneDisplacement {
     Domain::FileByteOffset Offset;
     std::vector<std::uint8_t> Bytes;

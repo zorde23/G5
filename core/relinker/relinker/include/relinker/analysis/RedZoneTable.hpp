@@ -16,9 +16,11 @@ struct RedZoneGuardStats {
     std::uint64_t LeafBytes = 0;
     std::uint64_t DeadBytes = 0;
     std::vector<std::uint64_t> TailCallLeaves;
+    std::vector<Codegen::TrampolineSite> Trampolines;
+    Codegen::RedZoneTrampolineReport TrampolineReport;
 };
 
-std::string RedZoneGuardTable(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::vector<Codegen::TrampolineSite>& existing, const Codegen::RedZoneFrameReport* framed, bool precise = false, RedZoneGuardStats* stats = nullptr, bool countFramePointerAllocation = false, bool suspectFramePointerLeaves = false, bool stubJumpsStayInBody = false, bool killStores = false);
+std::string RedZoneGuardTable(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::vector<Codegen::TrampolineSite>& existing, const Codegen::RedZoneFrameReport* framed, bool precise = false, RedZoneGuardStats* stats = nullptr, bool countFramePointerAllocation = false, bool suspectFramePointerLeaves = false, bool stubJumpsStayInBody = false, bool killStores = false, bool trampolines = false);
 
 }
 

@@ -65,6 +65,7 @@ ConvertedExecutable Convert(const Cli::Args& args, const std::string& inputPath,
     options.FrameShrinkWrapped = args.frameShrinkWrapped;
     options.PreciseRedZoneGuard = args.preciseRedZoneGuard;
     options.PreciseRedZoneKills = args.preciseRedZoneKills;
+    options.RedZoneTrampolines = args.redZoneTrampolines;
     options.FramePointerAllocation = args.framePointerAllocation;
     options.SuspectFramePointerLeaves = args.suspectFramePointerLeaves;
     options.FramePointerStubJumps = args.framePointerStubJumps;

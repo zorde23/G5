@@ -4,6 +4,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -1304,6 +1305,25 @@ void framesExitsBehindABranchOnlyWhenAsked() {
     require(restart.Framed == 0, "an exit behind a branch to the start of the leaf was framed");
 }
 
+void trampolinesOnlyAccessesAwayFromTheStack() {
+    const std::vector<std::uint8_t> leaf{0x48, 0x89, 0x7c, 0x24, 0xf8, 0x89, 0x06, 0x48, 0x8b, 0x44, 0x24, 0xf8, 0xc3};
+    const std::vector<std::uint8_t> looped{0x48, 0x89, 0x7c, 0x24, 0xf8, 0x89, 0x06, 0x48, 0x8b, 0x44, 0x24, 0xf8, 0x85, 0xc0, 0x75, 0xf7, 0xc3};
+    const auto trampoline = [](const std::vector<std::uint8_t>& code) {
+        const auto input = image({code});
+        std::vector<Codegen::RedZoneDeadRange> covered;
+        Codegen::RedZoneTrampolineReport report;
+        const auto sites = Codegen::TrampolineRedZoneRanges(input.bytes, input.segments, {{input.functions[0].Begin, input.functions[0].End}}, {}, covered, report);
+        return std::tuple{sites, covered, report, input.functions[0].Begin};
+    };
+    const auto [sites, covered, report, begin] = trampoline(leaf);
+    require(sites.size() == 1 && report.Instructions == 1 && covered.size() == 1, "the store through rsi was not the one trampolined instruction");
+    require(sites[0].Address == begin + 5 && sites[0].Length == 7, "the trampoline does not start at the store through rsi and take in the next instruction");
+    const std::vector<std::uint8_t> expected{0x48, 0x8d, 0x64, 0x24, 0x80, 0x89, 0x06, 0x48, 0x8d, 0xa4, 0x24, 0x80, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x44, 0x24, 0xf8};
+    require(std::equal(expected.begin(), expected.end(), sites[0].Body.begin()), "the stub does not lower RSP by 128 around the store alone");
+    const auto [loopSites, loopCovered, loopReport, loopBegin] = trampoline(looped);
+    require(loopSites.empty() && loopReport.Refused.at("branch into the site") == 1, "a trampoline over a loop head was built");
+}
+
 int main() {
     try {
         framesRedZoneLeaf();
@@ -1355,6 +1375,7 @@ int main() {
         killsRedZoneSlotsOnlyWithWholeStoresWhenAsked();
         killsRedZoneSlotsOnlyWhereEveryPathStoresTheWholeSlot();
         framesExitsBehindABranchOnlyWhenAsked();
+        trampolinesOnlyAccessesAwayFromTheStack();
         listsFramePointerLeavesWithUnanalyzedInstructionsWhenAsked();
         std::cout << "red-zone framer tests passed\n";
         return 0;

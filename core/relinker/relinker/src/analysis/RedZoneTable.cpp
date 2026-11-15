@@ -38,7 +38,7 @@ void AddUncovered(const std::vector<std::uint8_t>& bytes, const Domain::ProgramH
 
 }
 
-std::string RedZoneGuardTable(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::vector<Codegen::TrampolineSite>& existing, const Codegen::RedZoneFrameReport* framed, const bool precise, RedZoneGuardStats* stats, const bool countFramePointerAllocation, const bool suspectFramePointerLeaves, const bool stubJumpsStayInBody, const bool killStores) {
+std::string RedZoneGuardTable(const std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::vector<Codegen::TrampolineSite>& existing, const Codegen::RedZoneFrameReport* framed, const bool precise, RedZoneGuardStats* stats, const bool countFramePointerAllocation, const bool suspectFramePointerLeaves, const bool stubJumpsStayInBody, const bool killStores, const bool trampolines) {
     std::vector<Domain::ProgramHeader> codeSegments;
     std::uint64_t firstAddress = std::numeric_limits<std::uint64_t>::max();
     for (const auto& header : headers) {
@@ -87,6 +87,23 @@ std::string RedZoneGuardTable(const std::vector<std::uint8_t>& bytes, const std:
             for (const auto& range : dead[index]) stats->DeadBytes += range.End - range.Begin;
             stats->LeafBytes += listed[index].End - listed[index].Begin;
         }
+    }
+    if (trampolines && stats != nullptr) {
+        std::vector<Codegen::RedZoneDeadRange> live;
+        for (const auto& range : ranges) live.push_back({range.Begin, range.End});
+        std::vector<Codegen::RedZoneDeadRange> covered;
+        stats->Trampolines = Codegen::TrampolineRedZoneRanges(bytes, codeSegments, live, existing, covered, stats->TrampolineReport);
+        std::vector<GuardRange> left;
+        for (const auto& range : ranges) {
+            auto cursor = range.Begin;
+            for (const auto& site : covered) {
+                if (site.End <= cursor || site.Begin >= range.End) continue;
+                if (site.Begin > cursor) left.push_back({cursor, site.Begin, range.Reason});
+                cursor = std::max(cursor, site.End);
+            }
+            if (cursor < range.End) left.push_back({cursor, range.End, range.Reason});
+        }
+        ranges = std::move(left);
     }
     for (const auto& segment : codeSegments) AddUncovered(bytes, segment, functions, ranges);
 

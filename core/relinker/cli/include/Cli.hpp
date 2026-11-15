@@ -21,6 +21,7 @@ struct Args {
     bool frameShrinkWrapped = false;
     bool preciseRedZoneGuard = false;
     bool preciseRedZoneKills = false;
+    bool redZoneTrampolines = false;
     bool framePointerAllocation = false;
     bool suspectFramePointerLeaves = false;
     bool framePointerStubJumps = false;
