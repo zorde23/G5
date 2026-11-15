@@ -761,6 +761,15 @@ void ThreadCancel::EndWait() {
 }
 
 extern "C" void* APS5_VABI Aps5CallGuestEntry_nid_no_patch(PthreadEntry entry, void* arg);
+static bool GuestMxcsrHost() {
+    const char* value = std::getenv("APS5_GUEST_MXCSR");
+    return value != nullptr && std::strcmp(value, "host") == 0;
+}
+
+extern "C" {
+extern const bool Aps5GuestMxcsrHost_nid_no_patch;
+const bool Aps5GuestMxcsrHost_nid_no_patch = GuestMxcsrHost();
+}
 
 asm(".text\n"
     APS5_ASM_FUNCTION("Aps5CallGuestEntry_nid_no_patch") R"(
@@ -775,7 +784,11 @@ asm(".text\n"
     mov %rsp, %rbp
     sub $16, %rsp
     .cfi_adjust_cfa_offset 16
+    stmxcsr (%rsp)
+    cmpb $0, Aps5GuestMxcsrHost_nid_no_patch(%rip)
+    jne 1f
     movl $0x9fc0, (%rsp)
+1:
     ldmxcsr (%rsp)
     mov %rdi, %rax
     mov %rsi, %rdi
