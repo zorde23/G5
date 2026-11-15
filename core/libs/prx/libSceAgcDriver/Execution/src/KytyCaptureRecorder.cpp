@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -46,6 +47,8 @@ struct Range {
 
 constexpr std::uint64_t SetupLimitBytes = 256ull << 20;
 constexpr std::uint64_t PointedBytes = 4096;
+constexpr std::uint64_t StackArgumentBytes = 9 * 8;
+constexpr std::size_t SetupStackAt = 2 + 6 + 1 + 16;
 
 bool IsSetup(const char* nid) {
     static constexpr const char* setups[] = {
@@ -72,6 +75,11 @@ std::uint64_t GuestReadableBytes(std::uint64_t address, std::uint64_t limit) {
     }
     const auto bytes = std::min<std::uint64_t>(limit, end - address) & ~std::uint64_t{7};
     return bytes != 0 && KytyGpuReadableWithoutFault_nid_no_patch(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes)) ? bytes : 0;
+}
+
+bool IsSetupCreate(const char* nid) {
+    static constexpr const char* creates[] = {"f3dg2CSgRKY", "D9sr1xGUriE", "HV4j+E0MBHE", "dbOlWdppb4o"};
+    return std::any_of(std::begin(creates), std::end(creates), [nid](const char* create) { return std::strcmp(nid, create) == 0; });
 }
 
 bool IsSubmit(const char* nid) {
@@ -288,26 +296,55 @@ private:
     void keepSetup(const char* nid, const KytyCaptureRegisters& registers) {
         const auto began = std::chrono::steady_clock::now();
         SetupCall setup{makeCall(nid, registers), {}};
+        const auto stackStart = setup.call.address, stackEnd = setup.call.address + setup.call.size;
+        const bool pointsIntoStack = std::any_of(std::begin(registers.integers), std::end(registers.integers), [&](std::uint64_t value) { return value >= stackStart && value < stackEnd; });
+        if (!pointsIntoStack && setup.call.size > StackArgumentBytes) {
+            setup.call.size = StackArgumentBytes;
+            setup.call.values.resize(SetupStackAt + StackArgumentBytes / 8);
+        }
         for (const auto address : registers.integers) {
             const auto bytes = GuestReadableBytes(address, PointedBytes);
             if (bytes != 0) setup.pointed.insert(setup.pointed.end(), {address, bytes, AgcDriver::FrameHash(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), static_cast<std::size_t>(bytes))});
         }
-        setupBytes += setup.call.values.size() * 8 + setup.pointed.size() * 8;
-        if (setupBytes > SetupLimitBytes) throw std::runtime_error("APS5_KYTY_CAPTURE: the calls made before the trigger passed 256 MiB");
         ++setupCounts[nid];
-        setupCalls.push_back(std::move(setup));
         ++setupKept;
+        setupBytesByNid[nid] += setup.call.values.size() * 8 + setup.pointed.size() * 8;
+        std::string key(nid);
+        key.append(reinterpret_cast<const char*>(registers.integers), sizeof(registers.integers));
+        const auto bytes = setup.call.values.size() * 8 + setup.pointed.size() * 8;
+        const bool replaceable = IsSetupCreate(nid);
+        if (const auto found = replaceable ? setupIndex.find(key) : setupIndex.end(); found != setupIndex.end()) {
+            auto& kept = setupCalls[found->second];
+            const auto keptBytes = kept.call.values.size() * 8 + kept.pointed.size() * 8;
+            setupBytes = setupBytes - keptBytes + bytes;
+            setupBytesByNid[nid] -= keptBytes;
+            --setupCounts[nid];
+            kept = std::move(setup);
+            ++setupRepeated;
+        } else {
+            setupBytes += bytes;
+            if (replaceable) setupIndex.emplace(std::move(key), setupCalls.size());
+            setupCalls.push_back(std::move(setup));
+        }
+        if (setupBytes > SetupLimitBytes) {
+            reportSetup(true);
+            throw std::runtime_error("APS5_KYTY_CAPTURE: the calls made before the trigger passed 256 MiB");
+        }
         setupNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count());
     }
 
-    void reportSetup() {
+    void reportSetup(bool force = false) {
         const auto now = std::chrono::steady_clock::now();
-        if (now - setupReported < std::chrono::seconds(10)) return;
+        if (!force && now - setupReported < std::chrono::seconds(10)) return;
         setupReported = now;
         std::vector<std::pair<std::uint64_t, std::string>> top;
         for (const auto& [name, count] : seenCounts) top.emplace_back(count, name);
         std::partial_sort(top.begin(), top.begin() + std::min<std::size_t>(3, top.size()), top.end(), std::greater<>());
-        std::fprintf(stderr, "[kyty-capture] setup 10 s: %llu calls seen, %llu kept, %.1f ms spent; most seen:", static_cast<unsigned long long>(setupSeen), static_cast<unsigned long long>(setupKept), static_cast<double>(setupNs) / 1e6);
+        std::fprintf(stderr, "[kyty-capture] setup %s: %llu calls seen, %llu kept (%zu distinct so far, %llu repeats replaced, %.1f MiB), %.1f ms spent; most seen:", force ? "at the limit" : "10 s", static_cast<unsigned long long>(setupSeen), static_cast<unsigned long long>(setupKept), setupCalls.size(), static_cast<unsigned long long>(setupRepeated), static_cast<double>(setupBytes) / (1024.0 * 1024.0), static_cast<double>(setupNs) / 1e6);
+        std::vector<std::pair<std::uint64_t, std::string>> heavy;
+        for (const auto& [name, bytes] : setupBytesByNid) heavy.emplace_back(bytes, name);
+        std::partial_sort(heavy.begin(), heavy.begin() + std::min<std::size_t>(5, heavy.size()), heavy.end(), std::greater<>());
+        for (std::size_t i = 0; i < std::min<std::size_t>(5, heavy.size()); ++i) std::fprintf(stderr, " kept %s %llu calls %.1f MiB,", heavy[i].second.c_str(), static_cast<unsigned long long>(setupCounts[heavy[i].second]), static_cast<double>(heavy[i].first) / (1024.0 * 1024.0));
         for (std::size_t i = 0; i < std::min<std::size_t>(3, top.size()); ++i) std::fprintf(stderr, " %s %llu%s", top[i].second.c_str(), static_cast<unsigned long long>(top[i].first), IsSetup(top[i].second.c_str()) ? " (setup)" : "");
         std::fputs("\n", stderr);
         setupSeen = setupKept = setupNs = 0;
@@ -326,11 +363,12 @@ private:
             memory.values.insert(memory.values.end(), setup.pointed.begin(), setup.pointed.end());
             writer->WriteCall(memory);
         }
-        std::fprintf(stderr, "[kyty-capture] setup: %zu calls before the trigger, %.1f MiB:", setupCalls.size(), static_cast<double>(setupBytes) / (1024.0 * 1024.0));
+        std::fprintf(stderr, "[kyty-capture] setup: %zu distinct calls before the trigger (%llu repeats replaced), %.1f MiB:", setupCalls.size(), static_cast<unsigned long long>(setupRepeated), static_cast<double>(setupBytes) / (1024.0 * 1024.0));
         for (const auto& [name, count] : setupCounts) std::fprintf(stderr, " %s %llu", name.c_str(), static_cast<unsigned long long>(count));
         std::fputs("\n", stderr);
         setupCalls.clear();
         setupCalls.shrink_to_fit();
+        setupIndex.clear();
     }
 
     FrameCall makeCall(const char* nid, const KytyCaptureRegisters& registers) {
@@ -438,7 +476,9 @@ private:
     std::vector<SetupCall> setupCalls;
     std::map<std::string, std::uint64_t> setupCounts;
     std::uint64_t setupBytes = 0;
-    std::uint64_t setupSeen = 0, setupKept = 0, setupNs = 0;
+    std::uint64_t setupSeen = 0, setupKept = 0, setupNs = 0, setupRepeated = 0;
+    std::unordered_map<std::string, std::size_t> setupIndex;
+    std::map<std::string, std::uint64_t> setupBytesByNid;
     std::unordered_map<std::string, std::uint64_t> seenCounts;
     std::chrono::steady_clock::time_point setupReported = std::chrono::steady_clock::now();
     State state = State::Waiting;
