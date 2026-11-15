@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #include <windows.h>
 
 namespace {
@@ -39,18 +40,21 @@ void ProtectionComesBack() {
     KytyGpuCaptureTrack_nid_no_patch(Base, 3 * Page, true);
     Require(Protection(Base) == PAGE_READONLY, "an armed writable page stayed writable");
     Require(Protection(Base + Page) == PAGE_READONLY && Protection(Base + 2 * Page) == PAGE_NOACCESS, "arming changed a page that was not writable");
-    Require(KytyGpuCaptureTakeWritten_nid_no_patch(Base, 3 * Page).empty(), "a page counts as written before any write");
+    std::vector<std::uintptr_t> written;
+    KytyGpuCaptureTakeWritten_nid_no_patch(Base, 3 * Page, &written);
+    Require(written.empty(), "a page counts as written before any write");
 
     Require(KytyGpuHandleFault(Base + 8, 1, 0, nullptr), "the capture did not take the write fault of an armed page");
     Require(Protection(Base) == PAGE_READWRITE, "the written page was not released");
     Require(KytyGpuCaptureFaults_nid_no_patch() == 1, "the write fault was not counted");
-    const auto written = KytyGpuCaptureTakeWritten_nid_no_patch(Base, 3 * Page);
+    KytyGpuCaptureTakeWritten_nid_no_patch(Base, 3 * Page, &written);
     Require(written.size() == 1 && written.front() == Base, "the written page was not reported once");
     Require(Protection(Base) == PAGE_READONLY, "a reported page was not armed again");
 
     KytyGpuCaptureTrack_nid_no_patch(Base, 3 * Page, false);
     for (std::size_t index = 0; index < 3; ++index) Require(Protection(Base + index * Page) == before[index], "page " + std::to_string(index) + " did not get its protection back");
-    Require(KytyGpuCaptureTakeWritten_nid_no_patch(Base, 3 * Page).empty(), "a page counts as written after the capture stopped");
+    KytyGpuCaptureTakeWritten_nid_no_patch(Base, 3 * Page, &written);
+    Require(written.empty(), "a page counts as written after the capture stopped");
 }
 
 }
