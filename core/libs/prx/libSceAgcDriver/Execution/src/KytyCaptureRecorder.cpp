@@ -66,6 +66,10 @@ std::uint64_t GuestReadableBytes(std::uint64_t address, std::uint64_t limit) {
     return bytes != 0 && KytyGpuReadableWithoutFault_nid_no_patch(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes)) ? bytes : 0;
 }
 
+bool IsRewindRelease(const char* nid) {
+    return std::strcmp(nid, "ziVA3whp3p4") == 0 || std::strcmp(nid, "eWaWyFegzgQ") == 0;
+}
+
 bool IsSubmit(const char* nid) {
     static constexpr const char* submits[] = {"UglJIZjGssM", "AhGvpITrf4M", "6UzEidRZwkg", "+T8Xo6LtFJI", "b4fpgH5ZXxQ", "Fj7r9EHzF38", "gSRnr79F8tQ", "HF3YllT3mXU", "U46NwOiJpys"};
     return std::any_of(std::begin(submits), std::end(submits), [nid](const char* submit) { return std::strcmp(nid, submit) == 0; });
@@ -176,7 +180,7 @@ public:
             }
         }
         if (state != State::Recording) return;
-        if (IsSubmit(nid)) submitDelta();
+        if (IsSubmit(nid) || IsRewindRelease(nid)) submitDelta();
         record(nid, registers);
     }
 
