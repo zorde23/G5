@@ -385,6 +385,15 @@ std::uint64_t KytyGpuCaptureFaults_nid_no_patch() {
     return g_captureFaults.exchange(0, std::memory_order_relaxed);
 }
 
+bool KytyGpuReadableWithoutFault_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    if (!KytyGpuEnabled()) return true;
+    const auto end = address + bytes;
+    for (auto page = address & ~static_cast<std::uintptr_t>(GuestArena::HostPageBytes - 1); page < end; page += GuestArena::HostPageBytes) {
+        if (GuestArena::GuestArenaDonated_nid_no_patch(page) && Effective(GuestArena::GuestArenaHostPageState_nid_no_patch(page)) == PAGE_NOACCESS) return false;
+    }
+    return true;
+}
+
 void KytyGpuReportCounters() {
     if (!KytyGpuEnabled()) return;
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
@@ -417,6 +426,9 @@ void KytyGpuCaptureTakeWritten_nid_no_patch(std::uintptr_t, std::size_t, std::ve
 }
 std::uint64_t KytyGpuCaptureFaults_nid_no_patch() {
     return 0;
+}
+bool KytyGpuReadableWithoutFault_nid_no_patch(std::uintptr_t, std::size_t) {
+    return true;
 }
 
 bool KytyGpuHandleFault(std::uintptr_t, std::uint32_t, std::uint64_t, void*) {

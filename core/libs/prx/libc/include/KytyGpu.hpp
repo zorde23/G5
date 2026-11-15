@@ -22,6 +22,7 @@ extern "C" {
 void KytyGpuCaptureTrack_nid_no_patch(std::uintptr_t address, std::size_t bytes, bool on);
 void KytyGpuCaptureTakeWritten_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::vector<std::uintptr_t>* written);
 std::uint64_t KytyGpuCaptureFaults_nid_no_patch();
+bool KytyGpuReadableWithoutFault_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 }
 
 #endif
