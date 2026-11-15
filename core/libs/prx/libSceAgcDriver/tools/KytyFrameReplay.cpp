@@ -170,7 +170,7 @@ struct Replayer {
     std::uint64_t compared = 0, uncovered = 0;
 
     void Totals() {
-        std::fprintf(stderr, "[kyty-replay] call objects so far: %llu compared, %llu differed, %llu calls not covered\n", static_cast<unsigned long long>(compared), static_cast<unsigned long long>(differing), static_cast<unsigned long long>(uncovered));
+        std::fprintf(stderr, "[kyty-replay] call objects so far: %llu compared, %llu differed (set to the game's words), %llu calls not covered; setup memory: %llu checked, %llu differed\n", static_cast<unsigned long long>(compared), static_cast<unsigned long long>(differing), static_cast<unsigned long long>(uncovered), static_cast<unsigned long long>(memoryChecks), static_cast<unsigned long long>(memoryDiffers));
         std::fflush(stderr);
     }
 
@@ -194,9 +194,28 @@ struct Replayer {
                 std::fputs(" (replay/game)\n", stderr);
             }
         }
+        std::copy(values.begin() + 2, values.end(), object);
+    }
+
+    std::map<std::uint64_t, const FrameCall*> memories;
+    std::uint64_t memoryChecks = 0, memoryDiffers = 0;
+
+    void CheckMemory(std::uint64_t ordinal, const char* nid) {
+        const auto found = memories.find(ordinal);
+        if (found == memories.end()) return;
+        const auto& values = found->second->values;
+        for (std::size_t at = 1; at + 3 <= values.size(); at += 3) {
+            ++memoryChecks;
+            const bool mapped = AgcDriver::FrameReadableBytes(values[at], values[at + 1]) == values[at + 1];
+            if (mapped && AgcDriver::FrameHash(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(values[at])), static_cast<std::size_t>(values[at + 1])) == values[at + 2]) continue;
+            if (++memoryDiffers <= 32) std::fprintf(stderr, "[kyty-replay] setup call %llu %s: %llu bytes at %llx %s than at the call in the game\n", static_cast<unsigned long long>(ordinal), nid, static_cast<unsigned long long>(values[at + 1]), static_cast<unsigned long long>(values[at]), mapped ? "hold other bytes" : "are not mapped");
+        }
     }
 
     void Run() {
+        for (const auto& call : reader.Calls()) {
+            if (call.kind == FrameCallKind::GuestCallMemory && !call.values.empty()) memories[call.values[0]] = &call;
+        }
         for (const auto& call : reader.Calls()) {
             if (call.kind == FrameCallKind::GuestCallObject && !call.values.empty()) objects[call.values[0]] = &call;
         }
@@ -269,7 +288,7 @@ struct Replayer {
         std::memcpy(nid, call.values.data(), NameWords * 8);
         const auto target = resolve(nid);
         if (target == 0) throw std::runtime_error(std::string("kyty frame replay: the DLL does not export ") + nid);
-        CheckObject(call.ordinal, nid, call.values[IntegerAt]);
+        if (!memories.contains(call.ordinal)) CheckObject(call.ordinal, nid, call.values[IntegerAt]);
         KytyCaptureReplayCall replay{};
         std::copy_n(call.values.begin() + IntegerAt, 6, replay.registers.integers);
         replay.registers.vectorCount = call.values[VectorCountAt];
@@ -280,6 +299,7 @@ struct Replayer {
         const auto stackWords = call.values.size() - StackAt;
         std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(call.address)), call.values.data() + StackAt, stackWords * 8);
         for (std::size_t i = 0; i < 8 && 1 + i < stackWords; ++i) replay.stackArguments[i] = call.values[StackAt + 1 + i];
+        CheckMemory(call.ordinal, nid);
         KytyCaptureReplay(replay, reinterpret_cast<void*>(static_cast<std::uintptr_t>(target)));
         ++calls;
     }
@@ -341,6 +361,7 @@ int Replay(const std::filesystem::path& directory, const std::filesystem::path& 
     g_replayer = &replayer;
     static const Aps5Host host{2, &ProtectHost, &Resolve};
     init(&host);
+    if (const auto request = reinterpret_cast<void (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_request_target_dump")))) request();
     replayer.Run();
     waitIdle();
     std::fprintf(stderr, "[kyty-replay] %llu frames, %llu guest calls, %llu guest callbacks replayed from %s\n", static_cast<unsigned long long>(replayer.frame), static_cast<unsigned long long>(replayer.calls), static_cast<unsigned long long>(replayer.callbacks), directory.string().c_str());

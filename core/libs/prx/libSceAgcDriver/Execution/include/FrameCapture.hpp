@@ -33,6 +33,7 @@ enum class FrameCallKind : std::uint32_t {
     GuestCall,
     GuestCallback,
     GuestCallObject,
+    GuestCallMemory,
 };
 
 struct FrameCall {
@@ -134,6 +135,8 @@ private:
 };
 
 std::string_view FrameCallName(FrameCallKind kind);
+std::uint64_t FrameHash(const void* bytes, std::size_t size);
+std::uint64_t FrameReadableBytes(std::uint64_t address, std::uint64_t limit);
 bool AllZero(std::span<const std::byte> bytes);
 
 }

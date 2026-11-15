@@ -9,6 +9,9 @@
 #include <stdexcept>
 #include <system_error>
 #include <thread>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace AgcDriver {
 namespace {
@@ -120,7 +123,7 @@ FrameCall decodeCall(FrameCallKind kind, std::span<const std::byte> payload) {
 }
 
 bool knownCall(std::uint32_t kind) {
-    return kind >= static_cast<std::uint32_t>(FrameCallKind::RegisterShader) && kind <= static_cast<std::uint32_t>(FrameCallKind::GuestCallObject);
+    return kind >= static_cast<std::uint32_t>(FrameCallKind::RegisterShader) && kind <= static_cast<std::uint32_t>(FrameCallKind::GuestCallMemory);
 }
 
 std::vector<std::byte> readFile(const std::filesystem::path& path) {
@@ -177,6 +180,7 @@ std::string_view FrameCallName(FrameCallKind kind) {
     case FrameCallKind::GuestCall: return "guest-call";
     case FrameCallKind::GuestCallback: return "guest-callback";
     case FrameCallKind::GuestCallObject: return "guest-call-object";
+    case FrameCallKind::GuestCallMemory: return "guest-call-memory";
     }
     throw std::runtime_error("frame capture: unknown call kind " + std::to_string(static_cast<std::uint32_t>(kind)));
 }
@@ -453,6 +457,31 @@ std::vector<std::byte> FrameCaptureReader::Read(const FrameMemoryChunk& chunk) c
     std::vector<std::byte> bytes(chunk.bytes);
     Read(chunk, bytes);
     return bytes;
+}
+
+std::uint64_t FrameHash(const void* bytes, std::size_t size) {
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    const auto* at = static_cast<const std::byte*>(bytes);
+    for (std::size_t i = 0; i + 8 <= size; i += 8) {
+        std::uint64_t word = 0;
+        std::memcpy(&word, at + i, sizeof(word));
+        hash = (hash ^ word) * 0x100000001b3ull;
+    }
+    return hash;
+}
+
+std::uint64_t FrameReadableBytes(std::uint64_t address, std::uint64_t limit) {
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION info{};
+    if (address == 0 || VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT) return 0;
+    const auto page = info.Protect & 0xffu;
+    if ((info.Protect & PAGE_GUARD) != 0 || page == PAGE_NOACCESS || page == PAGE_EXECUTE || page == 0) return 0;
+    return std::min<std::uint64_t>(limit, reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize - address) & ~std::uint64_t{7};
+#else
+    (void)address;
+    (void)limit;
+    return 0;
+#endif
 }
 
 }
