@@ -474,7 +474,7 @@ void InstallRedZoneGuard() {
     const bool exeCovered = std::any_of(tables->begin(), tables->end(), [&](const RedZoneTable& table) { return _wcsicmp(table.Module.c_str(), exe) == 0; });
     std::size_t ranges = 0;
     for (const auto& table : *tables) ranges += table.Ranges.size();
-    Report("[red-zone-guard] %zu tables, %zu ranges%s\n", tables->size(), ranges, exeCovered ? "" : "; INERT for the executable: it has no .redzone.txt (convert with --frame-red-zone)");
+    Report("[red-zone-guard] %zu tables, %zu ranges%s; resume by dispatch frame %s (APS5_RED_ZONE_GUARD_BY_FRAME, layout-checked, no AVX state)\n", tables->size(), ranges, exeCovered ? "" : "; INERT for the executable: it has no .redzone.txt (convert with --frame-red-zone)", g_guardByFrame ? "on" : "off");
     g_redZoneTables = tables;
     if (KytyGpuEnabled()) {
         CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
