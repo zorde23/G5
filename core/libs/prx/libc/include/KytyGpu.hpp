@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 // The Kyty GPU hybrid's import binding (APS5_KYTY_GPU; known gaps in docs/dev/debt/libc.md).
 void* KytyGpuImport(void* target, const char* name, const char* library);
@@ -17,5 +18,8 @@ bool KytyGpuProtectHost(std::uint64_t address, std::uint64_t bytes, std::uint32_
 void KytyGpuPrepareHostWrite(std::uintptr_t address, std::size_t bytes);
 bool KytyGpuHandleFault(std::uintptr_t address, std::uint32_t access, std::uint64_t rip, void* context);
 void KytyGpuReportCounters();
+void KytyGpuCaptureTrack_nid_no_patch(std::uintptr_t address, std::size_t bytes, bool on);
+std::vector<std::uintptr_t> KytyGpuCaptureTakeWritten_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+std::uint64_t KytyGpuCaptureFaults_nid_no_patch();
 
 #endif

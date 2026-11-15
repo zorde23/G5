@@ -2,6 +2,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/KytyCapture.hpp"
+#include "prx/libc/include/KytyGpu.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -39,6 +40,7 @@ struct Range {
     std::uint64_t bytes = 0;
     std::uint32_t protection = 0;
     bool writable = false;
+    bool donated = false;
 };
 
 bool IsSubmit(const char* nid) {
@@ -72,6 +74,14 @@ public:
         static std::atomic<bool> reported{false};
         if (!reported.exchange(true)) std::fprintf(stderr, "[kyty-capture] stopped: %s\n", reason);
         abandoned.store(true);
+        try {
+            if (auto* recorder = Active()) {
+                std::lock_guard lock(recorder->mutex);
+                recorder->disarm();
+            }
+        } catch (...) {
+            std::fputs("[kyty-capture] the donated pages could not be released from the capture write protection\n", stderr);
+        }
     }
 
     void Call(const char* nid, const KytyCaptureRegisters& registers) {
@@ -141,6 +151,18 @@ private:
         const auto began = std::chrono::steady_clock::now();
         writer = std::make_unique<FrameCaptureWriter>(directory);
         ranges = committedRanges();
+        for (auto& range : ranges) {
+            if (!range.writable) continue;
+            range.donated = GuestArena::GuestArenaDonatedAny_nid_no_patch(static_cast<std::uintptr_t>(range.address), static_cast<std::size_t>(range.bytes));
+            if (!range.donated) {
+                writableBytes += range.bytes;
+                continue;
+            }
+            donatedBytes += range.bytes;
+            KytyGpuCaptureTrack_nid_no_patch(static_cast<std::uintptr_t>(range.address), static_cast<std::size_t>(range.bytes), true);
+        }
+        armed = true;
+        KytyGpuCaptureFaults_nid_no_patch();
         std::vector<std::byte> bytes;
         for (const auto& range : ranges) {
             writer->WriteRange(range.address, range.bytes, FrameRangeKind::Section, range.protection, AgcDriver::FrameRangeAccess::Readable | (range.writable ? AgcDriver::FrameRangeAccess::Writable : 0u));
@@ -150,11 +172,6 @@ private:
                 snapshotBytes += writer->WriteSnapshot(range.address + at, bytes);
                 if (range.writable) hashPages(range.address + at, bytes, false);
             }
-        }
-        for (const auto& range : ranges) {
-            if (!range.writable) continue;
-            writableBytes += range.bytes;
-            if (GuestArena::GuestArenaDonatedAny_nid_no_patch(static_cast<std::uintptr_t>(range.address), static_cast<std::size_t>(range.bytes))) donatedBytes += range.bytes;
         }
         state = State::Recording;
         recordedFrames = 0;
@@ -188,13 +205,24 @@ private:
         ++submits;
         submitMs += ms;
         submitMaxMs = std::max(submitMaxMs, ms);
-        if (submits <= 16) std::fprintf(stderr, "[kyty-capture] submit %llu: %.1f MiB hashed (%.1f MiB donated), %.1f KiB changed, %.2f ms\n", static_cast<unsigned long long>(submits), static_cast<double>(writableBytes) / (1024.0 * 1024.0), static_cast<double>(donatedBytes) / (1024.0 * 1024.0), static_cast<double>(deltaBytes - before) / 1024.0, ms);
+        if (submits <= 16) std::fprintf(stderr, "[kyty-capture] submit %llu: %.1f MiB not donated hashed, %zu of %.1f MiB donated pages written (%llu write faults), %.1f KiB changed, %.2f ms\n", static_cast<unsigned long long>(submits), static_cast<double>(writableBytes) / (1024.0 * 1024.0), writtenPages, static_cast<double>(donatedBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(KytyGpuCaptureFaults_nid_no_patch()), static_cast<double>(deltaBytes - before) / 1024.0, ms);
     }
 
     void emitDelta() {
         ++deltaGroup;
+        writtenPages = 0;
         std::vector<std::byte> bytes;
         for (const auto& range : ranges) {
+            if (range.donated) {
+                const auto written = KytyGpuCaptureTakeWritten_nid_no_patch(static_cast<std::uintptr_t>(range.address), static_cast<std::size_t>(range.bytes));
+                writtenPages += written.size();
+                bytes.resize(PageBytes);
+                for (const auto page : written) {
+                    std::memcpy(bytes.data(), reinterpret_cast<const void*>(page), PageBytes);
+                    hashPages(page, bytes, true);
+                }
+                continue;
+            }
             if (!range.writable || !stillReadable(range)) continue;
             for (std::uint64_t at = 0; at < range.bytes; at += FrameCaptureWriter::ChunkBytes) {
                 bytes.resize(static_cast<std::size_t>(std::min<std::uint64_t>(FrameCaptureWriter::ChunkBytes, range.bytes - at)));
@@ -237,7 +265,16 @@ private:
         writer->WriteCall(call);
     }
 
+    void disarm() {
+        if (!armed) return;
+        armed = false;
+        for (const auto& range : ranges) {
+            if (range.donated) KytyGpuCaptureTrack_nid_no_patch(static_cast<std::uintptr_t>(range.address), static_cast<std::size_t>(range.bytes), false);
+        }
+    }
+
     void finish() {
+        disarm();
         writeMarker(FrameCallKind::End);
         std::uintptr_t arenaBase = 0;
         std::size_t arenaSize = 0;
@@ -276,7 +313,7 @@ private:
                 const auto page = info.Protect & 0xffu;
                 const bool readable = (info.Protect & PAGE_GUARD) == 0 && page != PAGE_NOACCESS && page != 0;
                 const bool donated = GuestArena::GuestArenaDonatedAny_nid_no_patch(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(regionEnd - address));
-                if (info.State == MEM_COMMIT && (readable || donated)) result.push_back({address, regionEnd - address, info.Protect, allocation->writable});
+                if (info.State == MEM_COMMIT && (readable || donated)) result.push_back({address, regionEnd - address, info.Protect, allocation->writable, false});
                 address = regionEnd;
             }
         }
@@ -303,6 +340,8 @@ private:
     std::uint64_t donatedBytes = 0;
     double submitMs = 0;
     double submitMaxMs = 0;
+    std::size_t writtenPages = 0;
+    bool armed = false;
     std::uint64_t ordinal = 0;
     std::uint64_t deltaGroup = 0;
     std::uint64_t snapshotBytes = 0;
