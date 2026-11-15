@@ -135,6 +135,7 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
         for (const auto& [reason, count] : report.Skipped) { std::ostringstream message; message << "Red-zone framing: skipped " << count << ": " << reason << '\n'; inputProgress.Message(message.str()); }
         RedZoneGuardStats guard;
         redZoneTable = RedZoneGuardTable(sourceBytes, headers, trampolines, &report, options.PreciseRedZoneGuard, &guard, false, false, false, options.PreciseRedZoneKills);
+        if (!guard.TailCallLeaves.empty()) { std::ostringstream message; message << "Red-zone guard: " << guard.TailCallLeaves.size() << " leaves end in a tail call taken as an exit:" << std::hex; for (const auto leaf : guard.TailCallLeaves) message << " 0x" << leaf; message << '\n'; inputProgress.Message(message.str()); }
         if (options.PreciseRedZoneGuard) { std::ostringstream message; message << "Red-zone guard: " << guard.LeavesWithDeadCode << " of " << guard.Leaves << " unframed leaves have code where nothing below RSP is read again; " << guard.DeadBytes << " of " << guard.LeafBytes << " bytes left out of the guard table\n"; inputProgress.Message(message.str()); }
         trampolines.insert(trampolines.end(), std::make_move_iterator(framed.begin()), std::make_move_iterator(framed.end()));
     }
