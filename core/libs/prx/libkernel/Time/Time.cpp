@@ -12,6 +12,7 @@
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -20,6 +21,7 @@
 #include <ctime>
 #include <functional>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -102,15 +104,49 @@ static double TimeScale() {
     return scale;
 }
 
+static std::uint64_t GuestRawNanos();
+
 static std::uint64_t ClockOrigin() {
-    static const std::uint64_t origin = RawMonotonicNanos();
+    static const std::uint64_t origin = GuestRawNanos();
     return origin;
 }
 
+static std::atomic<std::uint64_t> g_pausedAtNanos{0};
+static std::atomic<std::uint64_t> g_pausedNanos{0};
+static std::atomic<std::uint64_t> g_pausedAtTicks{0};
+static std::atomic<std::uint64_t> g_pausedTicks{0};
+
+static std::atomic<std::uint64_t> g_pauseSequence{0};
+
+static std::uint64_t PausedRead(std::uint64_t (*now)(), const std::atomic<std::uint64_t>& pausedAt, const std::atomic<std::uint64_t>& paused) {
+    for (;;) {
+        const auto before = g_pauseSequence.load(std::memory_order_acquire);
+        if ((before & 1) != 0) {
+            std::this_thread::yield();
+            continue;
+        }
+        const auto current = now();
+        const auto at = pausedAt.load(std::memory_order_acquire);
+        const auto span = paused.load(std::memory_order_acquire);
+        if (g_pauseSequence.load(std::memory_order_acquire) == before) return (at != 0 ? at : current) - span;
+    }
+}
+
+static std::uint64_t GuestRawNanos() {
+    return PausedRead(RawMonotonicNanos, g_pausedAtNanos, g_pausedNanos);
+}
+
+static std::uint64_t GuestTicks() {
+    return PausedRead([] {
+        _mm_lfence();
+        return static_cast<std::uint64_t>(__rdtsc());
+    }, g_pausedAtTicks, g_pausedTicks);
+}
+
 static std::uint64_t GetMonotonicNanos() {
-    if (TimeScale() == 1.0) return RawMonotonicNanos();
+    if (TimeScale() == 1.0) return GuestRawNanos();
     const auto origin = ClockOrigin();
-    const auto raw = RawMonotonicNanos();
+    const auto raw = GuestRawNanos();
     return origin + static_cast<std::uint64_t>(static_cast<double>(raw - origin) * TimeScale());
 }
 
@@ -815,9 +851,29 @@ int APS5_VABI sceKernelGettimezone(KernelTimezone* tz) {
 }
 
 uint64_t APS5_VABI sceKernelReadTsc(void) {
-    if (TimeScale() == 1.0) return __rdtsc();
-    static const std::uint64_t origin = __rdtsc();
-    return origin + static_cast<std::uint64_t>(static_cast<double>(__rdtsc() - origin) * TimeScale());
+    if (TimeScale() == 1.0) return GuestTicks();
+    static const std::uint64_t origin = GuestTicks();
+    return origin + static_cast<std::uint64_t>(static_cast<double>(GuestTicks() - origin) * TimeScale());
+}
+
+void KernelGuestClockPause_nid_no_patch(bool pause) {
+    static std::mutex lock;
+    const std::lock_guard guard(lock);
+    if ((g_pausedAtNanos.load(std::memory_order_relaxed) != 0) == pause) return;
+    g_pauseSequence.fetch_add(1, std::memory_order_acq_rel);
+    const auto nanos = RawMonotonicNanos();
+    _mm_lfence();
+    const auto ticks = static_cast<std::uint64_t>(__rdtsc());
+    if (pause) {
+        g_pausedAtNanos.store(nanos, std::memory_order_release);
+        g_pausedAtTicks.store(ticks, std::memory_order_release);
+    } else {
+        g_pausedNanos.fetch_add(nanos - g_pausedAtNanos.load(std::memory_order_relaxed), std::memory_order_release);
+        g_pausedTicks.fetch_add(ticks - g_pausedAtTicks.load(std::memory_order_relaxed), std::memory_order_release);
+        g_pausedAtNanos.store(0, std::memory_order_release);
+        g_pausedAtTicks.store(0, std::memory_order_release);
+    }
+    g_pauseSequence.fetch_add(1, std::memory_order_acq_rel);
 }
 
 uint64_t APS5_VABI sceKernelGetTscFrequency(void) {
