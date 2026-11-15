@@ -365,17 +365,16 @@ void KytyGpuCaptureTrack_nid_no_patch(std::uintptr_t address, std::size_t bytes,
     });
 }
 
-std::vector<std::uintptr_t> KytyGpuCaptureTakeWritten_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
-    std::vector<std::uintptr_t> written;
-    if (!KytyGpuEnabled()) return written;
+void KytyGpuCaptureTakeWritten_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::vector<std::uintptr_t>* written) {
+    written->clear();
+    if (!KytyGpuEnabled()) return;
     const auto first = address & ~static_cast<std::uintptr_t>(GuestArena::HostPageBytes - 1);
     for (auto page = first; page < address + bytes; page += GuestArena::HostPageBytes) {
         if ((GuestArena::GuestArenaHostPageState_nid_no_patch(page) & DirtyBit) == 0) continue;
         GuestArena::GuestArenaSetHostPageState_nid_no_patch(page, GuestArena::HostPageBytes, CaptureBit | DirtyBit, CaptureBit);
         ApplyEffectivePage(page, false, true);
-        written.push_back(page);
+        written->push_back(page);
     }
-    return written;
 }
 
 std::uint64_t KytyGpuCaptureFaults_nid_no_patch() {
@@ -409,8 +408,8 @@ bool KytyGpuProtectHost(std::uint64_t, std::uint64_t, std::uint32_t) {
 }
 void KytyGpuReportCounters() {}
 void KytyGpuCaptureTrack_nid_no_patch(std::uintptr_t, std::size_t, bool) {}
-std::vector<std::uintptr_t> KytyGpuCaptureTakeWritten_nid_no_patch(std::uintptr_t, std::size_t) {
-    return {};
+void KytyGpuCaptureTakeWritten_nid_no_patch(std::uintptr_t, std::size_t, std::vector<std::uintptr_t>* written) {
+    written->clear();
 }
 std::uint64_t KytyGpuCaptureFaults_nid_no_patch() {
     return 0;

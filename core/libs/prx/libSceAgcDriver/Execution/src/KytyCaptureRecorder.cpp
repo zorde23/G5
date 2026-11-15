@@ -214,7 +214,8 @@ private:
         std::vector<std::byte> bytes;
         for (const auto& range : ranges) {
             if (range.donated) {
-                const auto written = KytyGpuCaptureTakeWritten_nid_no_patch(static_cast<std::uintptr_t>(range.address), static_cast<std::size_t>(range.bytes));
+                std::vector<std::uintptr_t> written;
+                KytyGpuCaptureTakeWritten_nid_no_patch(static_cast<std::uintptr_t>(range.address), static_cast<std::size_t>(range.bytes), &written);
                 writtenPages += written.size();
                 bytes.resize(PageBytes);
                 for (const auto page : written) {
