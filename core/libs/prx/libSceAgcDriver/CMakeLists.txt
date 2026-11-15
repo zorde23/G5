@@ -311,6 +311,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubmissionCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FrameCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FrameRecorder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/KytyCaptureRecorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/VulkanDevice.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FloatFlushProbe.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/AspectFit.cpp

@@ -1,4 +1,5 @@
 #include "prx/libc/include/KytyGpu.hpp"
+#include "prx/libc/include/KytyCapture.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/WindowsMappings.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string_view>
 
 #ifdef _WIN32
@@ -102,6 +104,34 @@ std::uint64_t APS5_VABI MissingImport() {
 
 }
 
+namespace {
+
+using CaptureCall = void (*)(const char* nid, const KytyCaptureRegisters* registers);
+
+CaptureCall g_captureCall = nullptr;
+
+void CaptureRecord(std::uint64_t nid, const KytyCaptureRegisters* registers) {
+    g_captureCall(reinterpret_cast<const char*>(static_cast<std::uintptr_t>(nid)), registers);
+}
+
+void* CaptureWrap(void* target, const char* nid) {
+    static const bool capture = [] {
+        const char* value = std::getenv("APS5_KYTY_CAPTURE");
+        return value != nullptr && *value != '\0';
+    }();
+    if (!capture) return target;
+    if (g_captureCall == nullptr) {
+        g_captureCall = reinterpret_cast<CaptureCall>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("libSceAgcDriver.prx"), "AgcDriverKytyCaptureCall_nid_no_patch")));
+        if (g_captureCall == nullptr) throw std::runtime_error("APS5_KYTY_CAPTURE: libSceAgcDriver.prx is not loaded or has no AgcDriverKytyCaptureCall_nid_no_patch");
+    }
+    const auto length = std::strlen(nid) + 1;
+    auto* stable = new char[length];
+    std::memcpy(stable, nid, length);
+    return KytyCaptureTrampoline(target, reinterpret_cast<std::uintptr_t>(stable), &CaptureRecord);
+}
+
+}
+
 bool KytyGpuEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_KYTY_GPU");
@@ -117,7 +147,7 @@ void* KytyGpuImport(void* target, const char* name, const char* library) {
     const auto length = std::strcspn(name, "#");
     if (length >= sizeof(nid)) return target;
     std::memcpy(nid, name, length);
-    if (const auto address = Dll().resolve(nid); address != 0) return reinterpret_cast<void*>(static_cast<std::uintptr_t>(address));
+    if (const auto address = Dll().resolve(nid); address != 0) return CaptureWrap(reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)), nid);
     std::fprintf(stderr, "[kyty-gpu] not in Kyty, bound to a stub that returns 0: %s %s\n", library, name);
     return reinterpret_cast<void*>(&MissingImport);
 }
