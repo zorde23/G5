@@ -36,6 +36,9 @@ constexpr std::size_t CallbackObjectWords = 7;
 constexpr std::uint32_t IdleTimeoutMs = 5000;
 
 thread_local std::uint64_t t_callOrdinal = 0;
+thread_local bool t_setFlip = false;
+constexpr const char* SetFlipNid = "YUeqkyT7mEQ";
+constexpr const char* SubmitFlipNid = "U46NwOiJpys";
 
 struct Range {
     std::uint64_t address = 0;
@@ -111,7 +114,26 @@ public:
         const auto flips = flipCount != nullptr ? flipCount() : 0;
         if (flips != lastFlips) {
             lastFlips = flips;
-            if (boundary()) {
+            if (boundary() && !pending) {
+                pending = true;
+                step("armed: starting after the next frame's flip submit on the presenting thread");
+            }
+        }
+        const auto thread = GetCurrentThreadId();
+        if (state == State::Waiting && startThread == 0) {
+            if (std::strcmp(nid, SetFlipNid) == 0) t_setFlip = true;
+            const bool flipSubmit = std::strcmp(nid, SubmitFlipNid) == 0 || (t_setFlip && IsSubmit(nid));
+            if (flipSubmit) t_setFlip = false;
+            if (pending && flipSubmit) {
+                startThread = thread;
+                step("flip submitted: the capture starts at this thread's next call");
+            }
+            return;
+        }
+        if (state == State::Waiting && pending && startThread == thread) {
+            {
+                pending = false;
+                startThread = 0;
                 starting = true;
                 startingSeen = startingPassed = 0;
                 lock.unlock();
@@ -121,6 +143,7 @@ public:
                 if (!idle) {
                     starting = false;
                     started.notify_all();
+                    lastFlips = flipCount != nullptr ? flipCount() : 0;
                     step(trigger == "F9" ? "the GPU did not go idle in time (it may wait on memory this game thread writes later): not started, press F9 again" : "the GPU did not go idle in time (it may wait on memory this game thread writes later): not started, trying at the next flip");
                     return;
                 }
@@ -420,6 +443,8 @@ private:
     std::uint64_t (*captureState)(std::uint64_t*, std::uint64_t) = nullptr;
     bool (*takeHotkey)() = nullptr;
     bool (*waitIdleFor)(std::uint32_t) = nullptr;
+    bool pending = false;
+    DWORD startThread = 0;
     std::condition_variable started;
     std::uint64_t startingSeen = 0, startingPassed = 0;
     State state = State::Waiting;
