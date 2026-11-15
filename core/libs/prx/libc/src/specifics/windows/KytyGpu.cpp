@@ -171,18 +171,60 @@ DWORD Effective(std::uint8_t state) {
     }
 }
 
+bool ApplyEffectivePage(std::uintptr_t page, bool trackedOnly, bool record) {
+    bool applied = true;
+    for (auto state = GuestArena::GuestArenaHostPageState_nid_no_patch(page);;) {
+        if (trackedOnly && (state & TrackerMask) == 0) break;
+        DWORD previous = 0;
+        if (record) GuestArena::WindowsMappings::RecordProtection(page, GuestArena::HostPageBytes, Effective(state), "protect a page the Kyty GPU tracks");
+        applied = VirtualProtect(reinterpret_cast<void*>(page), GuestArena::HostPageBytes, Effective(state), &previous) != 0 && applied;
+        const auto now = GuestArena::GuestArenaHostPageState_nid_no_patch(page);
+        if (now == state) break;
+        state = now;
+    }
+    return applied;
+}
+
+bool FastProtect() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_KYTY_FAST_PROTECT");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+bool ApplyEffectiveRuns(std::uintptr_t address, std::size_t bytes, bool trackedOnly) {
+    const auto first = address & ~static_cast<std::uintptr_t>(GuestArena::HostPageBytes - 1);
+    const auto end = address + bytes;
+    bool applied = true;
+    for (auto page = first; page < end;) {
+        const auto state = GuestArena::GuestArenaHostPageState_nid_no_patch(page);
+        if (trackedOnly && (state & TrackerMask) == 0) {
+            page += GuestArena::HostPageBytes;
+            continue;
+        }
+        const auto protection = Effective(state);
+        auto runEnd = page + GuestArena::HostPageBytes;
+        while (runEnd < end) {
+            const auto next = GuestArena::GuestArenaHostPageState_nid_no_patch(runEnd);
+            if ((trackedOnly && (next & TrackerMask) == 0) || Effective(next) != protection) break;
+            runEnd += GuestArena::HostPageBytes;
+        }
+        DWORD previous = 0;
+        const bool whole = VirtualProtect(reinterpret_cast<void*>(page), runEnd - page, protection, &previous) != 0;
+        for (auto at = page; at < runEnd; at += GuestArena::HostPageBytes) {
+            if (!whole || Effective(GuestArena::GuestArenaHostPageState_nid_no_patch(at)) != protection) applied = ApplyEffectivePage(at, trackedOnly, false) && applied;
+        }
+        page = runEnd;
+    }
+    return applied;
+}
+
 bool ApplyEffective(std::uintptr_t address, std::size_t bytes, bool trackedOnly) {
+    if (FastProtect()) return ApplyEffectiveRuns(address, bytes, trackedOnly);
     bool applied = true;
     for (auto page = address & ~static_cast<std::uintptr_t>(GuestArena::HostPageBytes - 1); page < address + bytes; page += GuestArena::HostPageBytes) {
-        for (auto state = GuestArena::GuestArenaHostPageState_nid_no_patch(page);;) {
-            if (trackedOnly && (state & TrackerMask) == 0) break;
-            DWORD previous = 0;
-            GuestArena::WindowsMappings::RecordProtection(page, GuestArena::HostPageBytes, Effective(state), "protect a page the Kyty GPU tracks");
-            applied = VirtualProtect(reinterpret_cast<void*>(page), GuestArena::HostPageBytes, Effective(state), &previous) != 0 && applied;
-            const auto now = GuestArena::GuestArenaHostPageState_nid_no_patch(page);
-            if (now == state) break;
-            state = now;
-        }
+        applied = ApplyEffectivePage(page, trackedOnly, true) && applied;
     }
     return applied;
 }

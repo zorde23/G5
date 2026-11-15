@@ -55,6 +55,8 @@ void CheckEffectiveProtection(void* block) {
     Require(Protection(bytes) == PAGE_READONLY && Protection(bytes + 0x1000) == PAGE_READWRITE, "a game mprotect lifted the tracker's protection instead of keeping the stricter one");
     Require(KytyProtect(bytes + 0x3000, 0x2000, 2), "aps5_protect_host refused a range across two 16 KiB views");
     Require(Protection(bytes + 0x3000) == PAGE_NOACCESS && Protection(bytes + 0x4000) == PAGE_NOACCESS, "a protection across two views did not reach both pages");
+    Require(KytyProtect(bytes + 0x4000, 0x3000, 1), "aps5_protect_host refused three pages of one view");
+    Require(Protection(bytes + 0x4000) == PAGE_READONLY && Protection(bytes + 0x5000) == PAGE_READONLY && Protection(bytes + 0x6000) == PAGE_READONLY && Protection(bytes + 0x7000) == PAGE_READWRITE, "a protection of three pages of one view did not reach exactly those pages");
     Require(KytyProtect(bytes, BlockBytes, 0), "aps5_protect_host refused to clear the tracker");
     Require(Protection(bytes) == PAGE_READWRITE && Protection(bytes + 0x4000) == PAGE_READWRITE, "clearing the tracker did not restore the game's protection");
     Require(!KytyProtect(bytes + BlockBytes, 0x1000, 1), "aps5_protect_host accepted a page that is not donated");
