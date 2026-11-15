@@ -33,7 +33,7 @@ enum class FrameCallKind : std::uint32_t {
     GuestCall,
     GuestCallback,
     GuestCallObject,
-    GuestCallMemory,
+    KytyState,
 };
 
 struct FrameCall {
