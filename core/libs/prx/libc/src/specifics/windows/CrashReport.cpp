@@ -19,6 +19,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 #include <iterator>
@@ -482,11 +483,49 @@ void InstallRedZoneGuard() {
     }
 }
 
+std::atomic<std::uint64_t> g_avxDirtyFaults{0};
+std::atomic<std::uint64_t> g_unknownXstateFaults{0};
+std::atomic<std::int64_t> g_nearestFrame{std::numeric_limits<std::int64_t>::max()};
+
+struct DispatchFrame {
+    std::uint64_t Mask = 0;
+    bool KnownMask = false;
+    std::int64_t Gap = 0;
+};
+
+std::string nearestFrameText() {
+    const auto nearest = g_nearestFrame.exchange(std::numeric_limits<std::int64_t>::max(), std::memory_order_relaxed);
+    return nearest == std::numeric_limits<std::int64_t>::max() ? std::string("none") : std::to_string(nearest) + " bytes below RSP";
+}
+
+DispatchFrame dispatchFrame(const EXCEPTION_POINTERS* info) {
+    struct Chunk { LONG Offset; DWORD Length; };
+    struct ContextEx { Chunk All; Chunk Legacy; Chunk XState; };
+    DispatchFrame frame;
+    const auto* context = info->ContextRecord;
+    auto top = std::max(reinterpret_cast<std::uintptr_t>(context) + sizeof(CONTEXT), reinterpret_cast<std::uintptr_t>(info->ExceptionRecord) + sizeof(EXCEPTION_RECORD));
+    if ((context->ContextFlags & 0x40u) != 0) {
+        const auto* ex = reinterpret_cast<const ContextEx*>(context + 1);
+        const auto* header = reinterpret_cast<const std::uint8_t*>(ex) + ex->XState.Offset;
+        std::memcpy(&frame.Mask, header, sizeof(frame.Mask));
+        frame.KnownMask = true;
+        const auto written = (frame.Mask & ~std::uint64_t{7}) != 0 ? static_cast<std::uintptr_t>(ex->XState.Length) : (frame.Mask & 4) != 0 ? std::uintptr_t{64 + 256} : std::uintptr_t{64};
+        top = std::max(top, reinterpret_cast<std::uintptr_t>(header) + written);
+    }
+    frame.Gap = static_cast<std::int64_t>(context->Rsp) - static_cast<std::int64_t>(top);
+    return frame;
+}
+
 void GuardRedZone(const EXCEPTION_POINTERS* info) {
     if (g_redZoneTables == nullptr) return;
     const auto faults = g_redZoneFaults.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto frame = dispatchFrame(info);
+    if (!frame.KnownMask) g_unknownXstateFaults.fetch_add(1, std::memory_order_relaxed);
+    else if ((frame.Mask & 4) != 0) g_avxDirtyFaults.fetch_add(1, std::memory_order_relaxed);
+    for (auto nearest = g_nearestFrame.load(std::memory_order_relaxed); frame.Gap < nearest && !g_nearestFrame.compare_exchange_weak(nearest, frame.Gap, std::memory_order_relaxed);) {}
     const auto rip = static_cast<std::uint64_t>(info->ContextRecord->Rip);
-    const auto access = info->ExceptionRecord->ExceptionInformation[0];
+    const bool memoryFault = info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && info->ExceptionRecord->NumberParameters >= 2;
+    const auto access = memoryFault ? info->ExceptionRecord->ExceptionInformation[0] : ULONG_PTR{2};
     HMODULE module = nullptr;
     wchar_t path[MAX_PATH] = L"?";
     if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(rip), &module) && module != nullptr) GetModuleFileNameW(module, path, MAX_PATH);
@@ -503,7 +542,8 @@ void GuardRedZone(const EXCEPTION_POINTERS* info) {
     if (tabled && hit == nullptr) g_outsideFaults.fetch_add(1, std::memory_order_relaxed);
     if (hit != nullptr && !hit->Uncovered) {
         Report("[red-zone-guard] %s fault at %ls+0x%llx resumed inside a red-zone leaf without a frame [0x%llx, 0x%llx) (%s): its values below RSP were overwritten; terminating\n", access == 1 ? "write" : access == 0 ? "read" : "other", path, static_cast<unsigned long long>(rva), static_cast<unsigned long long>(hit->Begin), static_cast<unsigned long long>(hit->End), hit->Reason);
-        GuestArena::WindowsMappings::ReportProtections(static_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionInformation[1]), [](const char* text) { Report("%s", text); });
+        Report("[red-zone-guard] dispatch frame: XSTATE_BV %s0x%llx, its top %lld bytes below the guest RSP\n", frame.KnownMask ? "" : "unknown ", static_cast<unsigned long long>(frame.Mask), static_cast<long long>(frame.Gap));
+        if (memoryFault) GuestArena::WindowsMappings::ReportProtections(static_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionInformation[1]), [](const char* text) { Report("%s", text); });
         TerminateProcess(GetCurrentProcess(), 0xC0000409u);
     }
     auto& slot = g_redZoneLogged[(rip * 0x9e3779b97f4a7c15ull) >> 54];
@@ -536,8 +576,14 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
         noteResumedFault(info, entered);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
-    if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
-    if (HandleSse4a(info)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (HandleWatch(info)) {
+        GuardRedZone(info);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (HandleSse4a(info)) {
+        GuardRedZone(info);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     const auto* record = info->ExceptionRecord;
     if ((record->ExceptionCode & GccExceptionMask) == GccException) {
         if (const auto frame = FrameWithoutUnwindData(*info->ContextRecord)) ReportUndeliverableException(info, frame);
@@ -883,7 +929,7 @@ extern "C" void LibcReportRedZoneFaults_nid_no_patch() {
     QueryPerformanceFrequency(&frequency);
     const auto faults = g_resumedFaults.exchange(0, std::memory_order_relaxed);
     const auto handlerUs = g_handlerTicks.exchange(0, std::memory_order_relaxed) * 1000000u / static_cast<std::uint64_t>(frequency.QuadPart);
-    std::string line = "[red-zone-faults] 10 s: " + std::to_string(faults) + " resumed guest-memory faults, " + std::to_string(g_outsideFaults.exchange(0, std::memory_order_relaxed)) + " outside every listed range, " + std::to_string(g_untrackedFaults.exchange(0, std::memory_order_relaxed)) + " past the slot tables; handler " + std::to_string(handlerUs) + " us (Kyty GPU " + std::to_string(g_kytyTicks.exchange(0, std::memory_order_relaxed) * 1000000u / static_cast<std::uint64_t>(frequency.QuadPart)) + " us, guard " + std::to_string(g_guardTicks.exchange(0, std::memory_order_relaxed) * 1000000u / static_cast<std::uint64_t>(frequency.QuadPart)) + " us); by thread:";
+    std::string line = "[red-zone-faults] 10 s: " + std::to_string(faults) + " resumed guest-memory faults, " + std::to_string(g_outsideFaults.exchange(0, std::memory_order_relaxed)) + " outside every listed range, " + std::to_string(g_untrackedFaults.exchange(0, std::memory_order_relaxed)) + " past the slot tables; handler " + std::to_string(handlerUs) + " us (Kyty GPU " + std::to_string(g_kytyTicks.exchange(0, std::memory_order_relaxed) * 1000000u / static_cast<std::uint64_t>(frequency.QuadPart)) + " us, guard " + std::to_string(g_guardTicks.exchange(0, std::memory_order_relaxed) * 1000000u / static_cast<std::uint64_t>(frequency.QuadPart)) + " us); AVX state saved " + std::to_string(g_avxDirtyFaults.exchange(0, std::memory_order_relaxed)) + ", XSTATE unknown " + std::to_string(g_unknownXstateFaults.exchange(0, std::memory_order_relaxed)) + ", nearest dispatch frame " + nearestFrameText() + "; by thread:";
     for (const auto& [count, thread] : takeTop(g_faultThreads, 5)) line += " " + std::to_string(thread) + " " + std::to_string(count) + ";";
     line += " by site:";
     for (const auto& [count, rip] : takeTop(g_faultSites, 10)) {
