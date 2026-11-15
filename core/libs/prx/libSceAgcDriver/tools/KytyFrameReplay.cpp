@@ -163,12 +163,34 @@ struct Replayer {
     std::uint64_t current = 0;
     std::set<const FrameCall*> used;
 
+    std::map<std::uint64_t, const FrameCall*> objects;
+    std::uint64_t differing = 0;
+
+    void CheckObject(std::uint64_t ordinal, const char* nid) {
+        const auto found = objects.find(ordinal);
+        if (found == objects.end() || found->second->values.size() < 3) return;
+        const auto& values = found->second->values;
+        auto* object = reinterpret_cast<std::uint64_t*>(static_cast<std::uintptr_t>(values[1]));
+        const auto words = values.size() - 2;
+        if (!std::equal(values.begin() + 2, values.end(), object)) {
+            if (++differing <= 32) {
+                std::fprintf(stderr, "[kyty-replay] call %llu %s: object %llu differs from the game:", static_cast<unsigned long long>(ordinal), nid, static_cast<unsigned long long>(values[1]));
+                for (std::size_t i = 0; i < words; ++i) std::fprintf(stderr, " [%zu] %llx/%llx", i, static_cast<unsigned long long>(object[i]), static_cast<unsigned long long>(values[2 + i]));
+                std::fputs(" (replay/game)\n", stderr);
+            }
+        }
+    }
+
     void Run() {
+        for (const auto& call : reader.Calls()) {
+            if (call.kind == FrameCallKind::GuestCallObject && !call.values.empty()) objects[call.values[0]] = &call;
+        }
         for (const auto& call : reader.Calls()) {
             if (call.kind != FrameCallKind::GuestCallback) continue;
             std::fprintf(stderr, "[kyty-replay] recorded guest callback %llu: function %llu, object %llu, during call %llu on thread %llu, result %llu\n", static_cast<unsigned long long>(call.ordinal), static_cast<unsigned long long>(call.values[0]), static_cast<unsigned long long>(call.values[1]), static_cast<unsigned long long>(call.values.size() > 6 ? call.values[6] : 0), static_cast<unsigned long long>(call.thread), static_cast<unsigned long long>(call.values[4]));
         }
         for (const auto& call : reader.Calls()) Step(call);
+        std::fprintf(stderr, "[kyty-replay] %llu of %zu recorded call objects differed from the game before the call\n", static_cast<unsigned long long>(differing), objects.size());
         for (const auto& call : reader.Calls()) {
             if (call.kind == FrameCallKind::GuestCallback && !used.contains(&call)) std::fprintf(stderr, "[kyty-replay] recorded guest callback %llu was not asked for\n", static_cast<unsigned long long>(call.ordinal));
         }
@@ -215,6 +237,7 @@ struct Replayer {
         std::memcpy(nid, call.values.data(), NameWords * 8);
         const auto target = resolve(nid);
         if (target == 0) throw std::runtime_error(std::string("kyty frame replay: the DLL does not export ") + nid);
+        CheckObject(call.ordinal, nid);
         KytyCaptureReplayCall replay{};
         std::copy_n(call.values.begin() + IntegerAt, 6, replay.registers.integers);
         replay.registers.vectorCount = call.values[VectorCountAt];
