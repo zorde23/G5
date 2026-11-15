@@ -3675,6 +3675,17 @@ if(WIN32)
 endif()
 set_target_properties(agc_frame_replay PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_frame_replay)
+if(WIN32)
+    add_executable(kyty_frame_replay EXCLUDE_FROM_ALL
+            tools/KytyFrameReplay.cpp
+            Execution/src/FrameCapture.cpp
+    )
+    target_include_directories(kyty_frame_replay PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(kyty_frame_replay PRIVATE libc libzstd_static)
+    target_link_options(kyty_frame_replay PRIVATE LINKER:--image-base=0x500000000000)
+    set_target_properties(kyty_frame_replay PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(kyty_frame_replay)
+endif()
 
 add_executable(agc_pm4_replay EXCLUDE_FROM_ALL
         tools/Pm4Replay.cpp

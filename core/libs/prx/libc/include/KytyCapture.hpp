@@ -14,4 +14,11 @@ using KytyCaptureRecord = void (*)(std::uint64_t index, const KytyCaptureRegiste
 
 void* KytyCaptureTrampoline(void* target, std::uint64_t index, KytyCaptureRecord record);
 
+struct KytyCaptureReplayCall {
+    KytyCaptureRegisters registers;
+    std::uint64_t stackArguments[8];
+};
+
+std::uint64_t KytyCaptureReplay(const KytyCaptureReplayCall& call, void* target);
+
 #endif
