@@ -67,7 +67,8 @@ std::vector<TrampolineSite> FrameRedZoneFunctions(
     bool shrinkWrapped = false,
     bool countFramePointerAllocation = false,
     bool suspectFramePointerLeaves = false,
-    bool stubJumpsStayInBody = false
+    bool stubJumpsStayInBody = false,
+    bool exitBranches = false
 );
 
 }

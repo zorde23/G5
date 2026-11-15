@@ -68,6 +68,7 @@ ConvertedExecutable Convert(const Cli::Args& args, const std::string& inputPath,
     options.FramePointerAllocation = args.framePointerAllocation;
     options.SuspectFramePointerLeaves = args.suspectFramePointerLeaves;
     options.FramePointerStubJumps = args.framePointerStubJumps;
+    options.FrameExitBranches = args.frameExitBranches;
     options.SkipSyscallCheck = args.skipSyscallCheck;
     options.TrapSdkSyscallStubs = args.trapSdkSyscallStubs;
     options.UnusedFilterLevel = args.unusedFilterLevel;

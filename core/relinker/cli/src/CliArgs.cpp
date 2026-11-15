@@ -13,7 +13,7 @@
 namespace Cli {
 
 const char* Usage() {
-    return "Usage: relinker [--help] [--version] [--windows | --macos] [--windows-diagnostics] [--windows-gui] [--trace-imports] [--windows-fixed-base <address>] [--linux-fixed-base <address>] [--macos-fixed-base <address>] [--skip-syscall-check | --trap-sdk-syscall-stubs] [--skip-sce-module | --sce-module-path <path>] [--exclude-sce-module <file>]... [--module-dir <dir>]... [--executable <path>]... [--to-intel] [--to-rosetta] [--frame-red-zone [--frame-shrink-wrapped] [--precise-red-zone-guard [--precise-red-zone-kills]] [--frame-pointer-allocation [--frame-pointer-stub-jumps]] [--suspect-frame-pointer-leaves]] [unused-filter=0|1|2] [--registry] [--rpath <path>] [--lazy-binding] [--autorun] [--patches <file> | --no-patches] <input.elf> <output.elf>\n"
+    return "Usage: relinker [--help] [--version] [--windows | --macos] [--windows-diagnostics] [--windows-gui] [--trace-imports] [--windows-fixed-base <address>] [--linux-fixed-base <address>] [--macos-fixed-base <address>] [--skip-syscall-check | --trap-sdk-syscall-stubs] [--skip-sce-module | --sce-module-path <path>] [--exclude-sce-module <file>]... [--module-dir <dir>]... [--executable <path>]... [--to-intel] [--to-rosetta] [--frame-red-zone [--frame-shrink-wrapped] [--frame-exit-branches] [--precise-red-zone-guard [--precise-red-zone-kills]] [--frame-pointer-allocation [--frame-pointer-stub-jumps]] [--suspect-frame-pointer-leaves]] [unused-filter=0|1|2] [--registry] [--rpath <path>] [--lazy-binding] [--autorun] [--patches <file> | --no-patches] <input.elf> <output.elf>\n"
            "       relinker --verify-patches <file> [--verify-output] [--skip-sce-module | --sce-module-path <path>] [--exclude-sce-module <file>]... [--module-dir <dir>]... [--executable <path>]... <path>\n"
            "Example: relinker input.elf output.elf";
 }
@@ -22,7 +22,7 @@ namespace {
 
 constexpr std::string_view kVerifyRejectedOptions[] = {
     "--windows", "--macos", "--windows-gui", "--windows-diagnostics", "--windows-fixed-base", "--trace-imports", "--linux-fixed-base", "--macos-fixed-base",
-    "--to-intel", "--to-rosetta", "--frame-red-zone", "--frame-shrink-wrapped", "--precise-red-zone-guard", "--precise-red-zone-kills", "--frame-pointer-allocation", "--frame-pointer-stub-jumps", "--suspect-frame-pointer-leaves", "--skip-syscall-check", "--trap-sdk-syscall-stubs", "unused-filter=",
+    "--to-intel", "--to-rosetta", "--frame-red-zone", "--frame-shrink-wrapped", "--frame-exit-branches", "--precise-red-zone-guard", "--precise-red-zone-kills", "--frame-pointer-allocation", "--frame-pointer-stub-jumps", "--suspect-frame-pointer-leaves", "--skip-syscall-check", "--trap-sdk-syscall-stubs", "unused-filter=",
     "--rpath", "--registry", "--lazy-binding", "--autorun", "--patches", "--no-patches",
 };
 
@@ -118,6 +118,8 @@ Args ParseArgs(int argc, char* argv[]) {
             args.preciseRedZoneKills = true;
         } else if (arg == "--frame-pointer-allocation") {
             args.framePointerAllocation = true;
+        } else if (arg == "--frame-exit-branches") {
+            args.frameExitBranches = true;
         } else if (arg == "--frame-pointer-stub-jumps") {
             args.framePointerStubJumps = true;
         } else if (arg == "--suspect-frame-pointer-leaves") {
@@ -220,6 +222,8 @@ Args ParseArgs(int argc, char* argv[]) {
         throw std::runtime_error("--precise-red-zone-kills requires --precise-red-zone-guard");
     if (args.framePointerAllocation && !args.frameRedZone)
         throw std::runtime_error("--frame-pointer-allocation requires --frame-red-zone");
+    if (args.frameExitBranches && !args.frameRedZone)
+        throw std::runtime_error("--frame-exit-branches requires --frame-red-zone");
     if (args.framePointerStubJumps && !args.framePointerAllocation)
         throw std::runtime_error("--frame-pointer-stub-jumps requires --frame-pointer-allocation");
     if (args.suspectFramePointerLeaves && !args.frameRedZone)

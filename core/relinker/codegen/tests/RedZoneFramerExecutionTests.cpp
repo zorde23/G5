@@ -301,6 +301,19 @@ std::vector<Leaf> widenedLeaves() {
     };
 }
 
+std::vector<Leaf> exitBranchLeaves() {
+    return {
+        {"pushless leaf whose exit is a short jne back into its loop and a ret", {
+            0x48, 0x89, 0x7c, 0x24, 0xf0, 0x48, 0x89, 0x74, 0x24, 0xf8, 0x31, 0xc0, 0xb9, 0x08, 0x00, 0x00, 0x00,
+            0x48, 0x03, 0x44, 0x24, 0xf0, 0x48, 0x03, 0x44, 0x24, 0xf8, 0xff, 0xc9, 0x75, 0xf2, 0xc3,
+        }, 8 * (kA + kB)},
+        {"pushless leaf whose exit is a near jne back into its loop and a ret", {
+            0x48, 0x89, 0x7c, 0x24, 0xf0, 0x48, 0x89, 0x74, 0x24, 0xf8, 0x31, 0xc0, 0xb9, 0x08, 0x00, 0x00, 0x00,
+            0x48, 0x03, 0x44, 0x24, 0xf0, 0x48, 0x03, 0x44, 0x24, 0xf8, 0xff, 0xc9, 0x0f, 0x85, 0xee, 0xff, 0xff, 0xff, 0xc3,
+        }, 8 * (kA + kB)},
+    };
+}
+
 std::vector<Leaf> shrinkWrappedLeaves() {
     return {
         {"leaf testing rdi before pushing three registers, spilling 0x10 below rsp, with its early je on the ret", {
@@ -366,7 +379,7 @@ struct Framing {
     std::vector<Codegen::RedZoneDisplacement> Displacements;
 };
 
-Framing load(const Image& image, const bool frame, const bool shrinkWrapped = false) {
+Framing load(const Image& image, const bool frame, const bool shrinkWrapped = false, const bool exitBranches = false) {
     std::fill_n(arena, kArenaBytes, 0xcc);
     std::copy(image.Bytes.begin(), image.Bytes.end(), arena);
 #ifdef _WIN32
@@ -383,7 +396,7 @@ Framing load(const Image& image, const bool frame, const bool shrinkWrapped = fa
     const std::vector<Domain::ProgramHeader> segments{{1, 5, 0, base, base, image.Bytes.size(), image.Bytes.size(), 16}};
     std::vector<Codegen::RedZoneFunction> functions;
     for (std::size_t index = 0; index < image.Starts.size(); ++index) functions.push_back({base + image.Starts[index], base + image.Ends[index]});
-    framing.Sites = Codegen::FrameRedZoneFunctions(image.Bytes, segments, functions, {}, framing.Report, framing.Displacements, shrinkWrapped);
+    framing.Sites = Codegen::FrameRedZoneFunctions(image.Bytes, segments, functions, {}, framing.Report, framing.Displacements, shrinkWrapped, false, false, false, exitBranches);
     for (const auto& moved : framing.Displacements) std::copy(moved.Bytes.begin(), moved.Bytes.end(), arena + moved.Offset);
     std::size_t cursor = kStubBase;
     for (const auto& site : framing.Sites) {
@@ -499,7 +512,7 @@ void runsAShrinkWrappedLeafThroughItsTakenEarlyExit() {
     }
 }
 
-Codegen::RedZoneFrameReport runLeaves(const std::vector<Leaf>& leaves, const bool shrinkWrapped = false) {
+Codegen::RedZoneFrameReport runLeaves(const std::vector<Leaf>& leaves, const bool shrinkWrapped = false, const bool exitBranches = false) {
     const auto image = place(leaves);
     load(image, false);
     std::vector<Run> plain, clobbered;
@@ -510,7 +523,7 @@ Codegen::RedZoneFrameReport runLeaves(const std::vector<Leaf>& leaves, const boo
         require(clobbered.back().Steps > 0, std::string(leaves[index].Name) + ": the clobber did not run");
         require(clobbered.back().Result != leaves[index].Expected, std::string(leaves[index].Name) + ": the unframed leaf survived writes below rsp, so the case proves nothing");
     }
-    const auto framing = load(image, true, shrinkWrapped);
+    const auto framing = load(image, true, shrinkWrapped, exitBranches);
     require(framing.Report.Framed == leaves.size(), "only " + std::to_string(framing.Report.Framed) + " of " + std::to_string(leaves.size()) + " leaves were framed");
     for (std::size_t index = 0; index < leaves.size(); ++index) {
         const auto calm = run(image.Starts[index], false);
@@ -579,6 +592,8 @@ int main() {
         const auto widened = runLeaves(widenedLeaves());
         require(widened.WidenedPrologues == 8 && widened.WidenedExits == 9 && widened.WidenedOperands == 12, "the leaves with short prologues and exits were framed with " + std::to_string(widened.WidenedPrologues) + " widened prologues, " + std::to_string(widened.WidenedExits) + " widened exits and " + std::to_string(widened.WidenedOperands) + " rsp operands in them, not 8, 9 and 12");
         const auto shrinkWrapped = runLeaves(shrinkWrappedLeaves(), true);
+        const auto exitBranches = runLeaves(exitBranchLeaves(), false, true);
+        require(exitBranches.WidenedExits == 2, "the exits behind a jne were widened " + std::to_string(exitBranches.WidenedExits) + " times, not twice");
         runsAShrinkWrappedLeafThroughItsTakenEarlyExit();
 #ifdef _WIN32
         exceptionDispatchLeavesBytesAboveRspIntact();

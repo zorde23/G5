@@ -1276,6 +1276,28 @@ void killsRedZoneSlotsOnlyWhereEveryPathStoresTheWholeSlot() {
     require(dead[11].empty(), "a jump through a RIP-relative pointer, which the decoder reports as a direct jump, was taken as an exit");
 }
 
+void framesExitsBehindABranchOnlyWhenAsked() {
+    const std::vector<std::uint8_t> loopBack{0x48, 0x89, 0x7c, 0x24, 0xf0, 0x31, 0xc0, 0xb9, 0x08, 0x00, 0x00, 0x00, 0x48, 0x03, 0x44, 0x24, 0xf0, 0xff, 0xc9, 0x75, 0xf7, 0xc3};
+    const std::vector<std::uint8_t> forward{0x48, 0x89, 0x7c, 0x24, 0xf0, 0x48, 0x8b, 0x44, 0x24, 0xf0, 0x85, 0xc0, 0x75, 0x00, 0xc3};
+    const auto frame = [](const std::vector<std::uint8_t>& leaf, const bool exitBranches) {
+        const auto input = image({leaf});
+        Codegen::RedZoneFrameReport report;
+        std::vector<Codegen::RedZoneDisplacement> displacements;
+        const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements, false, false, false, false, exitBranches);
+        return std::pair{report, sites};
+    };
+    const auto [plain, plainSites] = frame(loopBack, false);
+    require(plain.Framed == 0 && plain.Skipped.at("exit shorter than a jump") == 1, "a jne+ret exit was framed without --frame-exit-branches");
+    const auto [widened, sites] = frame(loopBack, true);
+    require(widened.Framed == 1 && widened.WidenedExits == 1, "a jne+ret exit behind its loop was not framed with --frame-exit-branches");
+    const auto exitSite = std::find_if(sites.begin(), sites.end(), [](const Codegen::TrampolineSite& site) { return !site.Relocations.empty(); });
+    require(exitSite != sites.end() && exitSite->Relocations.size() == 1, "the moved jne carries no relocation to its loop");
+    require(exitSite->Body[exitSite->Relocations[0].DisplacementOffset - 2] == 0x0f && exitSite->Body[exitSite->Relocations[0].DisplacementOffset - 1] == 0x85, "the moved jne is not a jne rel32");
+    require(exitSite->Address + static_cast<std::uint64_t>(exitSite->Relocations[0].SiteTarget) == exitSite->Address - 5, "the moved jne does not target its loop head");
+    const auto [ahead, aheadSites] = frame(forward, true);
+    require(ahead.Framed == 0, "an exit behind a branch that targets the exit itself was framed");
+}
+
 int main() {
     try {
         framesRedZoneLeaf();
@@ -1326,6 +1348,7 @@ int main() {
         countsAFramePointerLeafsAllocationOverItsOwnStubsWhenAsked();
         killsRedZoneSlotsOnlyWithWholeStoresWhenAsked();
         killsRedZoneSlotsOnlyWhereEveryPathStoresTheWholeSlot();
+        framesExitsBehindABranchOnlyWhenAsked();
         listsFramePointerLeavesWithUnanalyzedInstructionsWhenAsked();
         std::cout << "red-zone framer tests passed\n";
         return 0;
