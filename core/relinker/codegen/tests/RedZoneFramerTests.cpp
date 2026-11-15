@@ -1233,6 +1233,49 @@ void killsRedZoneSlotsOnlyWithWholeStoresWhenAsked() {
     require(tailCalls == std::vector<std::uint64_t>{first(4)}, "the leaves taken through a tail-call exit were not exactly the one tail call after the pops");
 }
 
+void killsRedZoneSlotsOnlyWhereEveryPathStoresTheWholeSlot() {
+    const std::vector<std::uint8_t> other{0x89, 0x06};
+    const std::vector<std::uint8_t> store8{0x48, 0x89, 0x44, 0x24, 0xf8};
+    const std::vector<std::uint8_t> read8{0x48, 0x8b, 0x4c, 0x24, 0xf8};
+    const auto join = [](std::initializer_list<std::vector<std::uint8_t>> parts) {
+        std::vector<std::uint8_t> bytes;
+        for (const auto& part : parts) append(bytes, part);
+        return bytes;
+    };
+    const std::vector<std::vector<std::uint8_t>> leaves{
+        join({other, {0x0f, 0x7f, 0x44, 0x24, 0xf8}, read8, {0xc3}}),
+        join({other, {0x48, 0x66, 0x89, 0x44, 0x24, 0xf8}, read8, {0xc3}}),
+        join({other, {0x88, 0x44, 0x24, 0xf8}, read8, {0xc3}}),
+        join({other, {0x48, 0xc7, 0x44, 0x24, 0xf8, 0, 0, 0, 0}, read8, {0xc3}}),
+        join({other, {0x85, 0xd2, 0x74, 0x05}, store8, read8, {0xc3}}),
+        join({{0x53}, other, store8, read8, {0x5b, 0xc3}}),
+        join({other, {0xc5, 0xfc, 0x11, 0x44, 0x24, 0xe0}, read8, {0x48, 0x8b, 0x4c, 0x24, 0xe0, 0xc3}}),
+        join({other, {0x0f, 0x11, 0x44, 0x24, 0xf0}, read8, {0x48, 0x8b, 0x4c, 0x24, 0xf0, 0xc3}}),
+        join({other, {0x48, 0x8b, 0x8c, 0x24, 0x00, 0xfd, 0xff, 0xff}, {0xc3}}),
+        join({{0x53}, other, store8, read8, {0x5b, 0x42, 0xff, 0x24, 0x23}}),
+        join({other, store8, read8, {0xff, 0x64, 0x24, 0x08}}),
+        join({other, store8, read8, {0xff, 0x25, 0, 0, 0, 0}}),
+    };
+    const auto input = image(leaves);
+    const auto dead = Codegen::FindRedZoneDeadRanges(input.bytes, input.segments, input.functions, true);
+    const auto deadAt = [&](const std::size_t leaf, const std::uint64_t offset) {
+        const auto address = input.functions[leaf].Begin + offset;
+        return std::any_of(dead[leaf].begin(), dead[leaf].end(), [&](const auto& range) { return range.Begin <= address && address < range.End; });
+    };
+    require(!deadAt(0, 0), "an MMX movq store (0F 7F without a prefix) killed a slot");
+    require(!deadAt(1, 0), "a 2-byte store whose REX the operand-size prefix voids killed an 8-byte read");
+    require(!deadAt(2, 0), "a 1-byte store killed an 8-byte read");
+    require(deadAt(3, 0), "an 8-byte store of an immediate did not kill its slot");
+    require(!deadAt(4, 0), "a slot stored on one branch only was dead where the branches split");
+    require(deadAt(5, 1), "a store after a push did not kill the slot it writes at that depth");
+    require(deadAt(6, 0), "a 32-byte vmovups store did not kill the two slots it covers");
+    require(deadAt(7, 0), "a 16-byte movups store did not kill the two slots it covers");
+    require(dead[8].empty(), "an access below the tracked span had instructions called dead");
+    require(dead[9].empty(), "a jump indexed through REX.X was treated as an exit");
+    require(dead[10].empty(), "a jump through an RSP slot was treated as an exit");
+    require(dead[11].empty(), "a jump through a RIP-relative pointer, which the decoder reports as a direct jump, was taken as an exit");
+}
+
 int main() {
     try {
         framesRedZoneLeaf();
@@ -1282,6 +1325,7 @@ int main() {
         countsAFramePointerLeafsAllocationOnlyWhenAsked();
         countsAFramePointerLeafsAllocationOverItsOwnStubsWhenAsked();
         killsRedZoneSlotsOnlyWithWholeStoresWhenAsked();
+        killsRedZoneSlotsOnlyWhereEveryPathStoresTheWholeSlot();
         listsFramePointerLeavesWithUnanalyzedInstructionsWhenAsked();
         std::cout << "red-zone framer tests passed\n";
         return 0;
