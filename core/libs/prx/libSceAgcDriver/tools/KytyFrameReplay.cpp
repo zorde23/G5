@@ -295,6 +295,19 @@ std::uint64_t CallGuest(std::uint64_t function, std::uint64_t object, std::uint6
     return g_replayer->Callback(function, object);
 }
 
+int SelfTest(const std::filesystem::path& dllPath) {
+    const auto dll = LoadLibraryExW(dllPath.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (dll == nullptr) throw std::runtime_error("kyty frame replay: cannot load " + dllPath.string());
+    const auto init = reinterpret_cast<void (*)(const Aps5Host*)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_init")));
+    const auto test = reinterpret_cast<bool (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_self_test_rewind")));
+    if (init == nullptr || test == nullptr) throw std::runtime_error("kyty frame replay: the DLL lacks kyty_gpu_init or kyty_gpu_self_test_rewind");
+    static const Aps5Host host{2, &ProtectHost, &Resolve};
+    init(&host);
+    const bool passed = test();
+    std::fprintf(stderr, "[kyty-replay] self test: %s\n", passed ? "passed" : "FAILED");
+    return passed ? 0 : 1;
+}
+
 int List(const std::filesystem::path& directory) {
     const FrameCaptureReader reader(directory);
     for (const auto& call : reader.Calls()) {
@@ -371,6 +384,13 @@ int Replay(const std::filesystem::path& directory, const std::filesystem::path& 
 
 int main(int argc, char** argv) {
     if (argc == 3 && std::string(argv[1]) == "--list") return List(argv[2]);
+    if (argc == 3 && std::string(argv[1]) == "--self-test") {
+        SetEnvironmentVariableA("DISABLE_RTSS_LAYER", "1");
+        SetEnvironmentVariableA("DISABLE_VULKAN_OBS_CAPTURE", "1");
+        const int result = SelfTest(std::filesystem::absolute(argv[2]));
+        std::fflush(stderr);
+        TerminateProcess(GetCurrentProcess(), static_cast<UINT>(result));
+    }
     if (argc < 3) {
         std::fprintf(stderr, "usage: kyty_frame_replay <capture directory> <kyty_gpu.dll> [output directory, default <capture>/replay] | --list <capture directory>\n");
         return 2;

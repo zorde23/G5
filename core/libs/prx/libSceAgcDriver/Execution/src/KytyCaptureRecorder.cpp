@@ -138,12 +138,13 @@ public:
                 starting = true;
                 startingSeen = startingPassed = 0;
                 lock.unlock();
-                step("waiting for the whole GPU to go idle");
-                const bool full = waitIdleFor != nullptr ? waitIdleFor(FullIdleTimeoutMs) : (waitIdle(), true);
+                step("waiting for the GPU to go quiet");
+                std::uint32_t blocked = 0;
+                const bool full = waitQuietFor != nullptr ? waitQuietFor(FullIdleTimeoutMs, &blocked) : waitIdleFor != nullptr ? waitIdleFor(FullIdleTimeoutMs) : (waitIdle(), true);
                 bool idle = full;
                 runningQueues.clear();
                 if (!full && waitGfxIdleFor != nullptr) {
-                    step("the whole GPU is still busy: waiting for the graphics queue only");
+                    step("the GPU is not quiet: waiting for the graphics queue only");
                     idle = waitGfxIdleFor(GfxIdleTimeoutMs);
                     if (idle && busyQueues != nullptr) {
                         std::uint32_t queues[64]{};
@@ -152,15 +153,15 @@ public:
                     }
                 }
                 lock.lock();
-                idleRule = full ? "full idle" : "gfx0 idle, compute running";
+                idleRule = !full ? "gfx0 idle, compute running" : blocked == 0 ? "full idle" : "quiet with " + std::to_string(blocked) + " blocked submits";
                 if (!idle) {
                     starting = false;
                     started.notify_all();
                     lastFlips = flipCount != nullptr ? flipCount() : 0;
-                    step(trigger == "F9" ? "neither the whole GPU (1 s) nor the graphics queue (4 s) went idle: not started, press F9 again" : "neither the whole GPU (1 s) nor the graphics queue (4 s) went idle: not started, trying at the next flip");
+                    step(trigger == "F9" ? "the GPU did not go quiet (1 s) and the graphics queue did not go idle (4 s): not started, press F9 again" : "the GPU did not go quiet (1 s) and the graphics queue did not go idle (4 s): not started, trying at the next flip");
                     return;
                 }
-                step(full ? "GPU idle: full idle" : "GPU idle: gfx0 idle, compute running");
+                step(("GPU idle: " + idleRule).c_str());
                 try {
                     start();
                 } catch (...) {
@@ -210,6 +211,7 @@ private:
         takeHotkey = reinterpret_cast<bool (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_take_capture_hotkey")));
         waitIdleFor = reinterpret_cast<bool (*)(std::uint32_t)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_wait_idle_for")));
         waitGfxIdleFor = reinterpret_cast<bool (*)(std::uint32_t)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_wait_gfx_idle_for")));
+        waitQuietFor = reinterpret_cast<bool (*)(std::uint32_t, std::uint32_t*)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_wait_quiet_for")));
         busyQueues = reinterpret_cast<std::uint32_t (*)(std::uint32_t*, std::uint32_t)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_busy_queues")));
         if (this->trigger == "F9" && takeHotkey == nullptr) throw std::runtime_error("APS5_KYTY_CAPTURE_TRIGGER=F9: the Kyty GPU DLL has no kyty_gpu_take_capture_hotkey");
         const char* at = std::getenv("APS5_KYTY_CAPTURE_AT_FLIP");
@@ -462,6 +464,7 @@ private:
     bool (*takeHotkey)() = nullptr;
     bool (*waitIdleFor)(std::uint32_t) = nullptr;
     bool (*waitGfxIdleFor)(std::uint32_t) = nullptr;
+    bool (*waitQuietFor)(std::uint32_t, std::uint32_t*) = nullptr;
     std::uint32_t (*busyQueues)(std::uint32_t*, std::uint32_t) = nullptr;
     std::string idleRule = "full idle";
     std::vector<std::uint32_t> runningQueues;
