@@ -110,6 +110,10 @@ using CaptureCall = void (*)(const char* nid, const KytyCaptureRegisters* regist
 
 CaptureCall g_captureCall = nullptr;
 
+using CaptureCallback = void (*)(std::uint64_t function, std::uint64_t first, std::uint64_t second, std::uint64_t third, std::uint64_t result);
+
+CaptureCallback g_captureCallback = nullptr;
+
 void CaptureRecord(std::uint64_t nid, const KytyCaptureRegisters* registers) {
     g_captureCall(reinterpret_cast<const char*>(static_cast<std::uintptr_t>(nid)), registers);
 }
@@ -122,7 +126,8 @@ void* CaptureWrap(void* target, const char* nid) {
     if (!capture) return target;
     if (g_captureCall == nullptr) {
         g_captureCall = reinterpret_cast<CaptureCall>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("libSceAgcDriver.prx"), "AgcDriverKytyCaptureCall_nid_no_patch")));
-        if (g_captureCall == nullptr) throw std::runtime_error("APS5_KYTY_CAPTURE: libSceAgcDriver.prx is not loaded or has no AgcDriverKytyCaptureCall_nid_no_patch");
+        g_captureCallback = reinterpret_cast<CaptureCallback>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("libSceAgcDriver.prx"), "AgcDriverKytyCaptureCallback_nid_no_patch")));
+        if (g_captureCall == nullptr || g_captureCallback == nullptr) throw std::runtime_error("APS5_KYTY_CAPTURE: libSceAgcDriver.prx is not loaded or has no AgcDriverKytyCaptureCall_nid_no_patch or AgcDriverKytyCaptureCallback_nid_no_patch");
     }
     const auto length = std::strlen(nid) + 1;
     auto* stable = new char[length];
@@ -130,6 +135,13 @@ void* CaptureWrap(void* target, const char* nid) {
     return KytyCaptureTrampoline(target, reinterpret_cast<std::uintptr_t>(stable), &CaptureRecord);
 }
 
+}
+
+extern "C" std::uint64_t KytyGpuCallGuest_nid_no_patch(std::uint64_t function, std::uint64_t first, std::uint64_t second, std::uint64_t third) {
+    using Guest = std::uint64_t(APS5_VABI*)(std::uint64_t, std::uint64_t, std::uint64_t);
+    const auto result = reinterpret_cast<Guest>(static_cast<std::uintptr_t>(function))(first, second, third);
+    if (g_captureCallback != nullptr) g_captureCallback(function, first, second, third, result);
+    return result;
 }
 
 bool KytyGpuEnabled() {
