@@ -208,6 +208,7 @@ private:
         recordedFrames = 0;
         writeMarker(FrameCallKind::FrameStart);
         if (requestTargetDump != nullptr) requestTargetDump();
+        lastFlips = flipCount();
         std::fprintf(stderr, "[kyty-capture] started: %zu ranges, %.1f MiB stored in %.1f s\n", ranges.size(), static_cast<double>(snapshotBytes) / (1024.0 * 1024.0), std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count());
     }
 

@@ -384,7 +384,8 @@ int main(int argc, char** argv) {
         TerminateProcess(GetCurrentProcess(), static_cast<UINT>(result));
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
-        return 1;
+        std::fflush(stderr);
+        TerminateProcess(GetCurrentProcess(), 1);
     }
     return 0;
 }
