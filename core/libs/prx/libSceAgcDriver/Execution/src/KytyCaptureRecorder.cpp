@@ -93,8 +93,10 @@ private:
         const auto dll = GetModuleHandleA(std::filesystem::path(path != nullptr ? path : "kyty_gpu.dll").filename().string().c_str());
         flipCount = reinterpret_cast<std::uint64_t (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_flip_count")));
         waitIdle = reinterpret_cast<void (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_wait_idle")));
+        const char* at = std::getenv("APS5_KYTY_CAPTURE_AT_FLIP");
+        atFlip = at != nullptr ? std::strtoull(at, nullptr, 10) : 0;
         if (flipCount == nullptr || waitIdle == nullptr) throw std::runtime_error("APS5_KYTY_CAPTURE: the Kyty GPU DLL has no kyty_gpu_flip_count or kyty_gpu_wait_idle");
-        std::fprintf(stderr, "[kyty-capture] armed: %s, %llu frames, trigger %s\n", this->directory.string().c_str(), static_cast<unsigned long long>(frames), this->trigger.empty() ? "(none: first flip)" : this->trigger.string().c_str());
+        std::fprintf(stderr, "[kyty-capture] armed: %s, %llu frames from flip %llu, trigger %s\n", this->directory.string().c_str(), static_cast<unsigned long long>(frames), static_cast<unsigned long long>(atFlip), this->trigger.empty() ? "(none)" : this->trigger.string().c_str());
     }
 
     bool boundary() {
@@ -104,6 +106,7 @@ private:
             else writeMarker(FrameCallKind::FrameStart);
             return false;
         }
+        if (lastFlips < atFlip) return false;
         std::error_code error;
         return trigger.empty() || std::filesystem::exists(trigger, error);
     }
@@ -236,6 +239,7 @@ private:
     std::filesystem::path directory;
     std::filesystem::path trigger;
     std::uint64_t frames = 3;
+    std::uint64_t atFlip = 0;
     std::chrono::steady_clock::time_point origin;
     std::uint64_t (*flipCount)() = nullptr;
     void (*waitIdle)() = nullptr;
