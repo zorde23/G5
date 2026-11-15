@@ -732,7 +732,7 @@ void frameSegment(
                     if (exitBranches && prior.Offset + prior.Length == exit.Begin && prior.Info.FlowKind == ControlFlowKind::ConditionalBranch) {
                         const auto condition = conditionCode(at(j), prior);
                         const auto target = static_cast<std::int64_t>(prior.Offset + prior.Length) + prior.Info.BranchDisp;
-                        if (!condition || target < static_cast<std::int64_t>(start) || target >= static_cast<std::int64_t>(prior.Offset) || frees.contains(j)) break;
+                        if (!condition || target <= static_cast<std::int64_t>(start) || target >= static_cast<std::int64_t>(prior.Offset) || !bodyStarts.contains(static_cast<std::size_t>(target)) || frees.contains(j)) break;
                         const std::vector<std::uint8_t> jump{0x0f, static_cast<std::uint8_t>(0x80 | *condition), 0, 0, 0, 0};
                         exit.Lead.insert(exit.Lead.begin(), jump.begin(), jump.end());
                         for (auto& branch : exit.Branches) branch.first += jump.size();
