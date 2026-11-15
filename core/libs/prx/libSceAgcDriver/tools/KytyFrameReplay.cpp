@@ -129,11 +129,10 @@ void Commit(std::uint64_t address, std::uint64_t bytes, bool range) {
     if (InArena(address, bytes)) {
         if (CommittedWritable(address, bytes)) return;
         std::uintptr_t start = 0, end = 0;
-        if (!GuestArena::GuestArenaNextUsed_nid_no_patch(static_cast<std::uintptr_t>(address), &start, &end) || start >= address + bytes) {
-            if (range) GuestArena::GuestArenaMarkUsed_nid_postfix(pointer, static_cast<std::size_t>(bytes));
-            GuestArena::GuestArenaCommit_nid_postfix(pointer, static_cast<std::size_t>(bytes), PAGE_READWRITE, static_cast<std::size_t>(bytes));
-            return;
-        }
+        const bool overlaps = GuestArena::GuestArenaNextUsed_nid_no_patch(static_cast<std::uintptr_t>(address), &start, &end) && start < address + bytes;
+        if (range && !overlaps) GuestArena::GuestArenaMarkUsed_nid_postfix(pointer, static_cast<std::size_t>(bytes));
+        GuestArena::GuestArenaCommit_nid_postfix(pointer, static_cast<std::size_t>(bytes), PAGE_READWRITE, static_cast<std::size_t>(bytes));
+        return;
     }
     const auto begin = address & ~(Granularity - 1);
     const auto end = (address + bytes + Granularity - 1) & ~(Granularity - 1);
