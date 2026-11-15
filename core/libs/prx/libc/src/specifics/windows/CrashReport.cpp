@@ -379,6 +379,8 @@ struct FaultSlot {
 };
 
 bool g_redZoneStats = false;
+bool g_guardByFrame = false;
+std::atomic<std::uint64_t> g_leafFaultsResumed{0};
 std::atomic<std::uint64_t> g_resumedFaults{0};
 std::atomic<std::uint64_t> g_outsideFaults{0};
 std::atomic<std::uint64_t> g_untrackedFaults{0};
@@ -461,6 +463,8 @@ void InstallRedZoneGuard() {
         return;
     }
     g_redZoneStats = guard != nullptr || armed || std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    const char* byFrame = std::getenv("APS5_RED_ZONE_GUARD_BY_FRAME");
+    g_guardByFrame = byFrame != nullptr && std::strcmp(byFrame, "1") == 0;
     if (guard == nullptr && !armed) return;
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
@@ -540,6 +544,14 @@ void GuardRedZone(const EXCEPTION_POINTERS* info) {
         break;
     }
     if (tabled && hit == nullptr) g_outsideFaults.fetch_add(1, std::memory_order_relaxed);
+    if (hit != nullptr && !hit->Uncovered && g_guardByFrame && frame.KnownMask && frame.Gap >= 192) {
+        g_leafFaultsResumed.fetch_add(1, std::memory_order_relaxed);
+        auto& resumed = g_redZoneLogged[(rip * 0x9e3779b97f4a7c15ull) >> 54];
+        std::uint64_t none = 0;
+        if (resumed.load(std::memory_order_relaxed) != rip && resumed.compare_exchange_strong(none, rip))
+            Report("[red-zone-guard] %s fault at %ls+0x%llx resumed inside a red-zone leaf without a frame [0x%llx, 0x%llx) (%s): the dispatch frame (XSTATE_BV 0x%llx) ends %lld bytes below RSP, clear of the red zone\n", access == 1 ? "write" : access == 0 ? "read" : "other", path, static_cast<unsigned long long>(rva), static_cast<unsigned long long>(hit->Begin), static_cast<unsigned long long>(hit->End), hit->Reason, static_cast<unsigned long long>(frame.Mask), static_cast<long long>(frame.Gap));
+        return;
+    }
     if (hit != nullptr && !hit->Uncovered) {
         Report("[red-zone-guard] %s fault at %ls+0x%llx resumed inside a red-zone leaf without a frame [0x%llx, 0x%llx) (%s): its values below RSP were overwritten; terminating\n", access == 1 ? "write" : access == 0 ? "read" : "other", path, static_cast<unsigned long long>(rva), static_cast<unsigned long long>(hit->Begin), static_cast<unsigned long long>(hit->End), hit->Reason);
         Report("[red-zone-guard] dispatch frame: XSTATE_BV %s0x%llx, its top %lld bytes below the guest RSP\n", frame.KnownMask ? "" : "unknown ", static_cast<unsigned long long>(frame.Mask), static_cast<long long>(frame.Gap));
@@ -929,7 +941,7 @@ extern "C" void LibcReportRedZoneFaults_nid_no_patch() {
     QueryPerformanceFrequency(&frequency);
     const auto faults = g_resumedFaults.exchange(0, std::memory_order_relaxed);
     const auto handlerUs = g_handlerTicks.exchange(0, std::memory_order_relaxed) * 1000000u / static_cast<std::uint64_t>(frequency.QuadPart);
-    std::string line = "[red-zone-faults] 10 s: " + std::to_string(faults) + " resumed guest-memory faults, " + std::to_string(g_outsideFaults.exchange(0, std::memory_order_relaxed)) + " outside every listed range, " + std::to_string(g_untrackedFaults.exchange(0, std::memory_order_relaxed)) + " past the slot tables; handler " + std::to_string(handlerUs) + " us (Kyty GPU " + std::to_string(g_kytyTicks.exchange(0, std::memory_order_relaxed) * 1000000u / static_cast<std::uint64_t>(frequency.QuadPart)) + " us, guard " + std::to_string(g_guardTicks.exchange(0, std::memory_order_relaxed) * 1000000u / static_cast<std::uint64_t>(frequency.QuadPart)) + " us); AVX state saved " + std::to_string(g_avxDirtyFaults.exchange(0, std::memory_order_relaxed)) + ", XSTATE unknown " + std::to_string(g_unknownXstateFaults.exchange(0, std::memory_order_relaxed)) + ", nearest dispatch frame " + nearestFrameText() + "; by thread:";
+    std::string line = "[red-zone-faults] 10 s: " + std::to_string(faults) + " resumed guest-memory faults, " + std::to_string(g_outsideFaults.exchange(0, std::memory_order_relaxed)) + " outside every listed range, " + std::to_string(g_untrackedFaults.exchange(0, std::memory_order_relaxed)) + " past the slot tables; handler " + std::to_string(handlerUs) + " us (Kyty GPU " + std::to_string(g_kytyTicks.exchange(0, std::memory_order_relaxed) * 1000000u / static_cast<std::uint64_t>(frequency.QuadPart)) + " us, guard " + std::to_string(g_guardTicks.exchange(0, std::memory_order_relaxed) * 1000000u / static_cast<std::uint64_t>(frequency.QuadPart)) + " us); AVX state saved " + std::to_string(g_avxDirtyFaults.exchange(0, std::memory_order_relaxed)) + ", XSTATE unknown " + std::to_string(g_unknownXstateFaults.exchange(0, std::memory_order_relaxed)) + ", nearest dispatch frame " + nearestFrameText() + ", leaf faults resumed by their frame " + std::to_string(g_leafFaultsResumed.exchange(0, std::memory_order_relaxed)) + "; by thread:";
     for (const auto& [count, thread] : takeTop(g_faultThreads, 5)) line += " " + std::to_string(thread) + " " + std::to_string(count) + ";";
     line += " by site:";
     for (const auto& [count, rip] : takeTop(g_faultSites, 10)) {
