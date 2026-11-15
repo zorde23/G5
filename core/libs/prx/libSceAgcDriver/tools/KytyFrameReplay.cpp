@@ -162,6 +162,7 @@ struct Replayer {
     std::uint64_t frame = 0, calls = 0, callbacks = 0;
     std::uint64_t current = 0;
     std::set<const FrameCall*> used;
+    std::set<const FrameCall*> done;
 
     std::map<std::uint64_t, const FrameCall*> objects;
     std::uint64_t differing = 0;
@@ -203,7 +204,9 @@ struct Replayer {
             if (call.kind != FrameCallKind::GuestCallback) continue;
             std::fprintf(stderr, "[kyty-replay] recorded guest callback %llu: function %llu, object %llu, during call %llu on thread %llu, result %llu\n", static_cast<unsigned long long>(call.ordinal), static_cast<unsigned long long>(call.values[0]), static_cast<unsigned long long>(call.values[1]), static_cast<unsigned long long>(call.values.size() > 6 ? call.values[6] : 0), static_cast<unsigned long long>(call.thread), static_cast<unsigned long long>(call.values[4]));
         }
-        for (const auto& call : reader.Calls()) Step(call);
+        for (const auto& call : reader.Calls()) {
+            if (!done.contains(&call)) Step(call);
+        }
         Totals();
         for (const auto& call : reader.Calls()) {
             if (call.kind == FrameCallKind::GuestCallback && !used.contains(&call)) std::fprintf(stderr, "[kyty-replay] recorded guest callback %llu was not asked for\n", static_cast<unsigned long long>(call.ordinal));
@@ -218,6 +221,17 @@ struct Replayer {
             used.insert(&call);
             std::fprintf(stderr, "[kyty-replay] guest callback %llu asked during call %llu: recorded %llu\n", static_cast<unsigned long long>(function), static_cast<unsigned long long>(current), static_cast<unsigned long long>(call.ordinal));
             if (keyed) {
+                const auto trigger = current;
+                bool inside = false;
+                for (const auto& nested : reader.Calls()) {
+                    if (&nested == &call) break;
+                    if (nested.kind == FrameCallKind::GuestCall && nested.ordinal == trigger) inside = true;
+                    if (!inside || nested.kind != FrameCallKind::GuestCall || nested.ordinal == trigger || nested.thread != call.thread || done.contains(&nested)) continue;
+                    std::fprintf(stderr, "[kyty-replay] call %llu runs inside the callback of call %llu\n", static_cast<unsigned long long>(nested.ordinal), static_cast<unsigned long long>(trigger));
+                    done.insert(&nested);
+                    Step(nested);
+                }
+                current = trigger;
                 std::copy(call.values.begin() + 8, call.values.end(), reinterpret_cast<std::uint64_t*>(static_cast<std::uintptr_t>(call.values[1])));
             } else {
                 ApplyDeltas(reader, call.values[5]);
