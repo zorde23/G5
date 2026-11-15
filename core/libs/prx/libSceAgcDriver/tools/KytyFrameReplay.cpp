@@ -166,13 +166,27 @@ struct Replayer {
     std::map<std::uint64_t, const FrameCall*> objects;
     std::uint64_t differing = 0;
 
-    void CheckObject(std::uint64_t ordinal, const char* nid) {
+    std::uint64_t compared = 0, uncovered = 0;
+
+    void Totals() {
+        std::fprintf(stderr, "[kyty-replay] call objects so far: %llu compared, %llu differed, %llu calls not covered\n", static_cast<unsigned long long>(compared), static_cast<unsigned long long>(differing), static_cast<unsigned long long>(uncovered));
+        std::fflush(stderr);
+    }
+
+    void CheckObject(std::uint64_t ordinal, const char* nid, std::uint64_t rdi) {
         const auto found = objects.find(ordinal);
-        if (found == objects.end() || found->second->values.size() < 3) return;
+        if (found == objects.end() || found->second->values.size() < 3) {
+            ++uncovered;
+            std::fprintf(stderr, "[kyty-replay] call %llu %s: rdi %llx not covered\n", static_cast<unsigned long long>(ordinal), nid, static_cast<unsigned long long>(rdi));
+            return;
+        }
+        ++compared;
         const auto& values = found->second->values;
         auto* object = reinterpret_cast<std::uint64_t*>(static_cast<std::uintptr_t>(values[1]));
         const auto words = values.size() - 2;
-        if (!std::equal(values.begin() + 2, values.end(), object)) {
+        const bool equal = std::equal(values.begin() + 2, values.end(), object);
+        if (equal) std::fprintf(stderr, "[kyty-replay] call %llu %s: object %llx equal\n", static_cast<unsigned long long>(ordinal), nid, static_cast<unsigned long long>(values[1]));
+        if (!equal) {
             if (++differing <= 32) {
                 std::fprintf(stderr, "[kyty-replay] call %llu %s: object %llu differs from the game:", static_cast<unsigned long long>(ordinal), nid, static_cast<unsigned long long>(values[1]));
                 for (std::size_t i = 0; i < words; ++i) std::fprintf(stderr, " [%zu] %llx/%llx", i, static_cast<unsigned long long>(object[i]), static_cast<unsigned long long>(values[2 + i]));
@@ -190,7 +204,7 @@ struct Replayer {
             std::fprintf(stderr, "[kyty-replay] recorded guest callback %llu: function %llu, object %llu, during call %llu on thread %llu, result %llu\n", static_cast<unsigned long long>(call.ordinal), static_cast<unsigned long long>(call.values[0]), static_cast<unsigned long long>(call.values[1]), static_cast<unsigned long long>(call.values.size() > 6 ? call.values[6] : 0), static_cast<unsigned long long>(call.thread), static_cast<unsigned long long>(call.values[4]));
         }
         for (const auto& call : reader.Calls()) Step(call);
-        std::fprintf(stderr, "[kyty-replay] %llu of %zu recorded call objects differed from the game before the call\n", static_cast<unsigned long long>(differing), objects.size());
+        Totals();
         for (const auto& call : reader.Calls()) {
             if (call.kind == FrameCallKind::GuestCallback && !used.contains(&call)) std::fprintf(stderr, "[kyty-replay] recorded guest callback %llu was not asked for\n", static_cast<unsigned long long>(call.ordinal));
         }
@@ -211,6 +225,10 @@ struct Replayer {
             ++callbacks;
             return call.values[4];
         }
+        const auto* words = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(object));
+        const auto found = objects.find(current);
+        std::fprintf(stderr, "[kyty-replay] unmatched callback %llx during call %llu: object %llx (%s); replay words bottom %llx top %llx cursor_up %llx cursor_down %llx callback %llx user_data %llx reserved_dw %u\n", static_cast<unsigned long long>(function), static_cast<unsigned long long>(current), static_cast<unsigned long long>(object), found == objects.end() ? "no object recorded for this call" : (found->second->values[1] == object ? "the object compared before this call" : "not the object compared before this call"), static_cast<unsigned long long>(words[0]), static_cast<unsigned long long>(words[1]), static_cast<unsigned long long>(words[2]), static_cast<unsigned long long>(words[3]), static_cast<unsigned long long>(words[4]), static_cast<unsigned long long>(words[5]), static_cast<unsigned>(words[6] & 0xffffffffu));
+        Totals();
         throw std::runtime_error("kyty frame replay: Kyty asked for the guest callback " + std::to_string(function) + " during call " + std::to_string(current) + ", which the capture does not have");
     }
 
@@ -237,7 +255,7 @@ struct Replayer {
         std::memcpy(nid, call.values.data(), NameWords * 8);
         const auto target = resolve(nid);
         if (target == 0) throw std::runtime_error(std::string("kyty frame replay: the DLL does not export ") + nid);
-        CheckObject(call.ordinal, nid);
+        CheckObject(call.ordinal, nid, call.values[IntegerAt]);
         KytyCaptureReplayCall replay{};
         std::copy_n(call.values.begin() + IntegerAt, 6, replay.registers.integers);
         replay.registers.vectorCount = call.values[VectorCountAt];
@@ -257,6 +275,23 @@ Replayer* g_replayer = nullptr;
 
 std::uint64_t CallGuest(std::uint64_t function, std::uint64_t object, std::uint64_t, std::uint64_t) {
     return g_replayer->Callback(function, object);
+}
+
+int List(const std::filesystem::path& directory) {
+    const FrameCaptureReader reader(directory);
+    for (const auto& call : reader.Calls()) {
+        const auto name = AgcDriver::FrameCallName(call.kind);
+        std::printf("%llu %.*s thread %llu", static_cast<unsigned long long>(call.ordinal), static_cast<int>(name.size()), name.data(), static_cast<unsigned long long>(call.thread));
+        if (call.kind == FrameCallKind::GuestCall && call.values.size() >= StackAt) {
+            char nid[NameWords * 8 + 1]{};
+            std::memcpy(nid, call.values.data(), NameWords * 8);
+            std::printf(" %s rdi %llx", nid, static_cast<unsigned long long>(call.values[IntegerAt]));
+        } else {
+            for (const auto value : call.values) std::printf(" %llx", static_cast<unsigned long long>(value));
+        }
+        std::printf("\n");
+    }
+    return 0;
 }
 
 int Replay(const std::filesystem::path& directory, const std::filesystem::path& dllPath, const std::filesystem::path& output) {
@@ -302,8 +337,9 @@ int Replay(const std::filesystem::path& directory, const std::filesystem::path& 
 }
 
 int main(int argc, char** argv) {
+    if (argc == 3 && std::string(argv[1]) == "--list") return List(argv[2]);
     if (argc < 3) {
-        std::fprintf(stderr, "usage: kyty_frame_replay <capture directory> <kyty_gpu.dll> [output directory, default <capture>/replay]\n");
+        std::fprintf(stderr, "usage: kyty_frame_replay <capture directory> <kyty_gpu.dll> [output directory, default <capture>/replay] | --list <capture directory>\n");
         return 2;
     }
     SetEnvironmentVariableA("DISABLE_RTSS_LAYER", "1");

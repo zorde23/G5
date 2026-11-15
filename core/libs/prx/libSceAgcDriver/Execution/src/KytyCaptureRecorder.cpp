@@ -105,7 +105,7 @@ public:
         record(nid, registers);
     }
 
-    void Callback(std::uint64_t function, std::uint64_t first, std::uint64_t second, std::uint64_t third, std::uint64_t result) {
+    void Callback(std::uint64_t function, std::uint64_t first, std::uint64_t second, std::uint64_t third, std::uint64_t result, std::uint64_t trigger) {
         if (abandoned.load()) return;
         std::lock_guard lock(mutex);
         if (state != State::Recording) return;
@@ -114,7 +114,7 @@ public:
         call.ordinal = ++ordinal;
         call.timeNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - origin).count());
         call.thread = GetCurrentThreadId();
-        call.values = {function, first, second, third, result, 0, t_callOrdinal, call.thread};
+        call.values = {function, first, second, third, result, 0, trigger, call.thread};
         const auto* object = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(first));
         call.values.insert(call.values.end(), object, object + CallbackObjectWords);
         writer->WriteCall(call);
@@ -379,10 +379,14 @@ extern "C" void AgcDriverKytyCaptureCall_nid_no_patch(const char* nid, const Kyt
     }
 }
 
-extern "C" void AgcDriverKytyCaptureCallback_nid_no_patch(std::uint64_t function, std::uint64_t first, std::uint64_t second, std::uint64_t third, std::uint64_t result) {
+extern "C" std::uint64_t AgcDriverKytyCaptureCallbackTrigger_nid_no_patch() {
+    return t_callOrdinal;
+}
+
+extern "C" void AgcDriverKytyCaptureCallback_nid_no_patch(std::uint64_t function, std::uint64_t first, std::uint64_t second, std::uint64_t third, std::uint64_t result, std::uint64_t trigger) {
     if (Recorder::Abandoned()) return;
     try {
-        if (auto* recorder = Recorder::Active()) recorder->Callback(function, first, second, third, result);
+        if (auto* recorder = Recorder::Active()) recorder->Callback(function, first, second, third, result, trigger);
     } catch (const std::exception& error) {
         Recorder::Abandon(error.what());
     } catch (...) {
