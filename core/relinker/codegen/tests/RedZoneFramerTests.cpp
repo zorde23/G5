@@ -1296,6 +1296,12 @@ void framesExitsBehindABranchOnlyWhenAsked() {
     require(exitSite->Address + static_cast<std::uint64_t>(exitSite->Relocations[0].SiteTarget) == exitSite->Address - 5, "the moved jne does not target its loop head");
     const auto [ahead, aheadSites] = frame(forward, true);
     require(ahead.Framed == 0, "an exit behind a branch that targets the exit itself was framed");
+    const std::vector<std::uint8_t> intoMoved{0x48, 0x89, 0x7c, 0x24, 0xf0, 0x48, 0x8b, 0x44, 0x24, 0xf0, 0x90, 0xfc, 0x75, 0xfd, 0xc3};
+    const auto [inside, insideSites] = frame(intoMoved, true);
+    require(inside.Framed == 0, "an exit behind a branch into the instructions moved with it was framed");
+    const std::vector<std::uint8_t> toStart{0x48, 0x89, 0x7c, 0x24, 0xf0, 0x48, 0x8b, 0x44, 0x24, 0xf0, 0xff, 0xc9, 0x75, 0xf2, 0xc3};
+    const auto [restart, restartSites] = frame(toStart, true);
+    require(restart.Framed == 0, "an exit behind a branch to the start of the leaf was framed");
 }
 
 int main() {
