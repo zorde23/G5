@@ -33,7 +33,8 @@ using AgcDriver::FrameRangeKind;
 constexpr std::uint64_t PageBytes = 4096;
 constexpr std::uint64_t StackBytes = 4096;
 constexpr std::size_t CallbackObjectWords = 7;
-constexpr std::uint32_t IdleTimeoutMs = 5000;
+constexpr std::uint32_t FullIdleTimeoutMs = 1000;
+constexpr std::uint32_t GfxIdleTimeoutMs = 4000;
 
 thread_local std::uint64_t t_callOrdinal = 0;
 thread_local bool t_setFlip = false;
@@ -137,17 +138,29 @@ public:
                 starting = true;
                 startingSeen = startingPassed = 0;
                 lock.unlock();
-                step("waiting for the GPU to go idle");
-                const bool idle = waitIdleFor != nullptr ? waitIdleFor(IdleTimeoutMs) : (waitIdle(), true);
+                step("waiting for the whole GPU to go idle");
+                const bool full = waitIdleFor != nullptr ? waitIdleFor(FullIdleTimeoutMs) : (waitIdle(), true);
+                bool idle = full;
+                runningQueues.clear();
+                if (!full && waitGfxIdleFor != nullptr) {
+                    step("the whole GPU is still busy: waiting for the graphics queue only");
+                    idle = waitGfxIdleFor(GfxIdleTimeoutMs);
+                    if (idle && busyQueues != nullptr) {
+                        std::uint32_t queues[64]{};
+                        const auto count = std::min<std::uint32_t>(busyQueues(queues, 64), 64);
+                        runningQueues.assign(queues, queues + count);
+                    }
+                }
                 lock.lock();
+                idleRule = full ? "full idle" : "gfx0 idle, compute running";
                 if (!idle) {
                     starting = false;
                     started.notify_all();
                     lastFlips = flipCount != nullptr ? flipCount() : 0;
-                    step(trigger == "F9" ? "the GPU did not go idle in time (it may wait on memory this game thread writes later): not started, press F9 again" : "the GPU did not go idle in time (it may wait on memory this game thread writes later): not started, trying at the next flip");
+                    step(trigger == "F9" ? "neither the whole GPU (1 s) nor the graphics queue (4 s) went idle: not started, press F9 again" : "neither the whole GPU (1 s) nor the graphics queue (4 s) went idle: not started, trying at the next flip");
                     return;
                 }
-                step("GPU idle");
+                step(full ? "GPU idle: full idle" : "GPU idle: gfx0 idle, compute running");
                 try {
                     start();
                 } catch (...) {
@@ -196,6 +209,8 @@ private:
         captureState = reinterpret_cast<std::uint64_t (*)(std::uint64_t*, std::uint64_t)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_capture_state")));
         takeHotkey = reinterpret_cast<bool (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_take_capture_hotkey")));
         waitIdleFor = reinterpret_cast<bool (*)(std::uint32_t)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_wait_idle_for")));
+        waitGfxIdleFor = reinterpret_cast<bool (*)(std::uint32_t)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_wait_gfx_idle_for")));
+        busyQueues = reinterpret_cast<std::uint32_t (*)(std::uint32_t*, std::uint32_t)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_busy_queues")));
         if (this->trigger == "F9" && takeHotkey == nullptr) throw std::runtime_error("APS5_KYTY_CAPTURE_TRIGGER=F9: the Kyty GPU DLL has no kyty_gpu_take_capture_hotkey");
         const char* at = std::getenv("APS5_KYTY_CAPTURE_AT_FLIP");
         atFlip = at != nullptr ? std::strtoull(at, nullptr, 10) : 0;
@@ -390,8 +405,11 @@ private:
         std::size_t arenaSize = 0;
         GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaSize);
         char header[512];
-        std::snprintf(header, sizeof(header), "{\"kind\":\"kyty-guest-calls\",\"arena_base\":%llu,\"frames\":%llu,\"calls\":%llu,\"callbacks\":%llu,\"ranges\":%zu,\"snapshot_bytes\":%llu,\"delta_bytes\":%llu,\"stack_bytes\":%llu}", static_cast<unsigned long long>(arenaBase), static_cast<unsigned long long>(recordedFrames), static_cast<unsigned long long>(recordedCalls), static_cast<unsigned long long>(recordedCallbacks), ranges.size(), static_cast<unsigned long long>(snapshotBytes), static_cast<unsigned long long>(deltaBytes), static_cast<unsigned long long>(StackBytes));
-        writer->Finish(header);
+        std::snprintf(header, sizeof(header), "{\"kind\":\"kyty-guest-calls\",\"arena_base\":%llu,\"frames\":%llu,\"calls\":%llu,\"callbacks\":%llu,\"ranges\":%zu,\"snapshot_bytes\":%llu,\"delta_bytes\":%llu,\"stack_bytes\":%llu,\"idle_rule\":\"%s\",\"running_queues\":[", static_cast<unsigned long long>(arenaBase), static_cast<unsigned long long>(recordedFrames), static_cast<unsigned long long>(recordedCalls), static_cast<unsigned long long>(recordedCallbacks), ranges.size(), static_cast<unsigned long long>(snapshotBytes), static_cast<unsigned long long>(deltaBytes), static_cast<unsigned long long>(StackBytes), idleRule.c_str());
+        std::string json(header);
+        for (std::size_t i = 0; i < runningQueues.size(); ++i) json += (i == 0 ? "" : ",") + std::to_string(runningQueues[i]);
+        json += runningQueues.empty() ? "]}" : "],\"gap\":\"asynchronous compute was running when the snapshot was taken\"}";
+        writer->Finish(json);
         std::fprintf(stderr, "[kyty-capture] %llu frames, %llu guest calls, %llu guest callbacks, %.1f MiB of deltas, stored in %s\n", static_cast<unsigned long long>(recordedFrames), static_cast<unsigned long long>(recordedCalls), static_cast<unsigned long long>(recordedCallbacks), static_cast<double>(deltaBytes) / (1024.0 * 1024.0), directory.string().c_str());
         if (submits != 0) std::fprintf(stderr, "[kyty-capture] %llu submit deltas: %.2f ms mean, %.2f ms max\n", static_cast<unsigned long long>(submits), submitMs / static_cast<double>(submits), submitMaxMs);
         writer.reset();
@@ -443,6 +461,10 @@ private:
     std::uint64_t (*captureState)(std::uint64_t*, std::uint64_t) = nullptr;
     bool (*takeHotkey)() = nullptr;
     bool (*waitIdleFor)(std::uint32_t) = nullptr;
+    bool (*waitGfxIdleFor)(std::uint32_t) = nullptr;
+    std::uint32_t (*busyQueues)(std::uint32_t*, std::uint32_t) = nullptr;
+    std::string idleRule = "full idle";
+    std::vector<std::uint32_t> runningQueues;
     bool pending = false;
     DWORD startThread = 0;
     std::condition_variable started;
