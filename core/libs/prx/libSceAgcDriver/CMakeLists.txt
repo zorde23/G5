@@ -3685,6 +3685,9 @@ if(WIN32)
     target_link_options(kyty_frame_replay PRIVATE LINKER:--image-base=0x500000000000)
     set_target_properties(kyty_frame_replay PROPERTIES CXX_EXTENSIONS OFF)
     configure_windows_unwind(kyty_frame_replay)
+    add_custom_command(TARGET kyty_frame_replay POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:libc> $<TARGET_FILE_DIR:kyty_frame_replay>
+            VERBATIM)
 endif()
 
 add_executable(agc_pm4_replay EXCLUDE_FROM_ALL
