@@ -1,4 +1,5 @@
 #include "prx/libc/include/KytyCapture.hpp"
+#include "prx/libc/include/general/VabiMacros.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -23,9 +24,9 @@ void Record(std::uint64_t index, const KytyCaptureRegisters* registers) {
     asm volatile("" : : "r"(scratch) : "memory", "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "rax", "rcx", "rdx", "r8", "r9", "r10", "r11");
 }
 
-using Target = std::uint64_t (__attribute__((sysv_abi)) *)(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, double, double, double, double, double, double, double, double, std::uint64_t, std::uint64_t);
+using Target = std::uint64_t (APS5_VABI*)(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, double, double, double, double, double, double, double, double, std::uint64_t, std::uint64_t);
 
-[[gnu::noinline]] std::uint64_t __attribute__((sysv_abi)) Sum(std::uint64_t a, std::uint64_t b, std::uint64_t c, std::uint64_t d, std::uint64_t e, std::uint64_t f, double x0, double x1, double x2, double x3, double x4, double x5, double x6, double x7, std::uint64_t s0, std::uint64_t s1) {
+[[gnu::noinline]] std::uint64_t APS5_VABI Sum(std::uint64_t a, std::uint64_t b, std::uint64_t c, std::uint64_t d, std::uint64_t e, std::uint64_t f, double x0, double x1, double x2, double x3, double x4, double x5, double x6, double x7, std::uint64_t s0, std::uint64_t s1) {
     return a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f + static_cast<std::uint64_t>(x0 + 2 * x1 + 3 * x2 + 4 * x3 + 5 * x4 + 6 * x5 + 7 * x6 + 8 * x7) + 100 * s0 + 1000 * s1;
 }
 
@@ -49,6 +50,11 @@ int main() {
         const auto* stack = reinterpret_cast<const std::uint64_t*>(g_seen.stack);
         Require(stack[0] == 7 && stack[1] == 9, "the stack arguments are not where the recorded stack pointer says");
         Require((g_seen.stack & 7) == 0, "the recorded stack pointer is not the caller's argument area");
+        KytyCaptureReplayCall replay{};
+        replay.registers = g_seen;
+        replay.stackArguments[0] = stack[0];
+        replay.stackArguments[1] = stack[1];
+        Require(KytyCaptureReplay(replay, reinterpret_cast<void*>(&Sum)) == expected, "replaying the recorded registers and stack arguments did not return the same value");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "kyty capture trampoline: %s\n", error.what());
         return 1;

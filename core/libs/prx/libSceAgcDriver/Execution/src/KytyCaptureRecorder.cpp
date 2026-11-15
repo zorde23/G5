@@ -188,8 +188,11 @@ private:
 
     void finish() {
         writeMarker(FrameCallKind::End);
+        std::uintptr_t arenaBase = 0;
+        std::size_t arenaSize = 0;
+        GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaSize);
         char header[512];
-        std::snprintf(header, sizeof(header), "{\"kind\":\"kyty-guest-calls\",\"frames\":%llu,\"calls\":%llu,\"ranges\":%zu,\"snapshot_bytes\":%llu,\"delta_bytes\":%llu,\"stack_bytes\":%llu}", static_cast<unsigned long long>(recordedFrames), static_cast<unsigned long long>(recordedCalls), ranges.size(), static_cast<unsigned long long>(snapshotBytes), static_cast<unsigned long long>(deltaBytes), static_cast<unsigned long long>(StackBytes));
+        std::snprintf(header, sizeof(header), "{\"kind\":\"kyty-guest-calls\",\"arena_base\":%llu,\"frames\":%llu,\"calls\":%llu,\"ranges\":%zu,\"snapshot_bytes\":%llu,\"delta_bytes\":%llu,\"stack_bytes\":%llu}", static_cast<unsigned long long>(arenaBase), static_cast<unsigned long long>(recordedFrames), static_cast<unsigned long long>(recordedCalls), ranges.size(), static_cast<unsigned long long>(snapshotBytes), static_cast<unsigned long long>(deltaBytes), static_cast<unsigned long long>(StackBytes));
         writer->Finish(header);
         std::fprintf(stderr, "[kyty-capture] %llu frames, %llu guest calls, %.1f MiB of deltas, stored in %s\n", static_cast<unsigned long long>(recordedFrames), static_cast<unsigned long long>(recordedCalls), static_cast<double>(deltaBytes) / (1024.0 * 1024.0), directory.string().c_str());
         writer.reset();
