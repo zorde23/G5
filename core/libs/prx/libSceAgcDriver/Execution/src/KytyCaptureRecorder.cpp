@@ -38,6 +38,11 @@ struct Range {
     bool writable = false;
 };
 
+bool IsSubmit(const char* nid) {
+    static constexpr const char* submits[] = {"UglJIZjGssM", "AhGvpITrf4M", "6UzEidRZwkg", "+T8Xo6LtFJI", "b4fpgH5ZXxQ", "Fj7r9EHzF38", "gSRnr79F8tQ", "HF3YllT3mXU", "U46NwOiJpys"};
+    return std::any_of(std::begin(submits), std::end(submits), [nid](const char* submit) { return std::strcmp(nid, submit) == 0; });
+}
+
 std::uint64_t Hash(const std::byte* bytes, std::size_t size) {
     std::uint64_t hash = 0xcbf29ce484222325ull;
     const auto* words = reinterpret_cast<const std::uint64_t*>(bytes);
@@ -82,7 +87,9 @@ public:
                 start();
             }
         }
-        if (state == State::Recording) record(nid, registers);
+        if (state != State::Recording) return;
+        if (IsSubmit(nid)) submitDelta();
+        record(nid, registers);
     }
 
     void Callback(std::uint64_t function, std::uint64_t first, std::uint64_t second, std::uint64_t third, std::uint64_t result) {
@@ -140,6 +147,11 @@ private:
                 if (range.writable) hashPages(range.address + at, bytes, false);
             }
         }
+        for (const auto& range : ranges) {
+            if (!range.writable) continue;
+            writableBytes += range.bytes;
+            if (GuestArena::GuestArenaDonatedAny_nid_no_patch(static_cast<std::uintptr_t>(range.address), static_cast<std::size_t>(range.bytes))) donatedBytes += range.bytes;
+        }
         state = State::Recording;
         recordedFrames = 0;
         writeMarker(FrameCallKind::FrameStart);
@@ -157,6 +169,22 @@ private:
                 deltaBytes += PageBytes;
             }
         }
+    }
+
+    void submitDelta() {
+        const auto began = std::chrono::steady_clock::now();
+        const auto before = deltaBytes;
+        emitDelta();
+        FrameCall call;
+        call.kind = FrameCallKind::Memory;
+        call.ordinal = ++ordinal;
+        call.values = {deltaGroup};
+        writer->WriteCall(call);
+        const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+        ++submits;
+        submitMs += ms;
+        submitMaxMs = std::max(submitMaxMs, ms);
+        if (submits <= 16) std::fprintf(stderr, "[kyty-capture] submit %llu: %.1f MiB hashed (%.1f MiB donated), %.1f KiB changed, %.2f ms\n", static_cast<unsigned long long>(submits), static_cast<double>(writableBytes) / (1024.0 * 1024.0), static_cast<double>(donatedBytes) / (1024.0 * 1024.0), static_cast<double>(deltaBytes - before) / 1024.0, ms);
     }
 
     void emitDelta() {
@@ -213,6 +241,7 @@ private:
         std::snprintf(header, sizeof(header), "{\"kind\":\"kyty-guest-calls\",\"arena_base\":%llu,\"frames\":%llu,\"calls\":%llu,\"callbacks\":%llu,\"ranges\":%zu,\"snapshot_bytes\":%llu,\"delta_bytes\":%llu,\"stack_bytes\":%llu}", static_cast<unsigned long long>(arenaBase), static_cast<unsigned long long>(recordedFrames), static_cast<unsigned long long>(recordedCalls), static_cast<unsigned long long>(recordedCallbacks), ranges.size(), static_cast<unsigned long long>(snapshotBytes), static_cast<unsigned long long>(deltaBytes), static_cast<unsigned long long>(StackBytes));
         writer->Finish(header);
         std::fprintf(stderr, "[kyty-capture] %llu frames, %llu guest calls, %llu guest callbacks, %.1f MiB of deltas, stored in %s\n", static_cast<unsigned long long>(recordedFrames), static_cast<unsigned long long>(recordedCalls), static_cast<unsigned long long>(recordedCallbacks), static_cast<double>(deltaBytes) / (1024.0 * 1024.0), directory.string().c_str());
+        if (submits != 0) std::fprintf(stderr, "[kyty-capture] %llu submit deltas: %.2f ms mean, %.2f ms max\n", static_cast<unsigned long long>(submits), submitMs / static_cast<double>(submits), submitMaxMs);
         writer.reset();
         state = State::Done;
     }
@@ -264,6 +293,11 @@ private:
     std::uint64_t recordedFrames = 0;
     std::uint64_t recordedCalls = 0;
     std::uint64_t recordedCallbacks = 0;
+    std::uint64_t submits = 0;
+    std::uint64_t writableBytes = 0;
+    std::uint64_t donatedBytes = 0;
+    double submitMs = 0;
+    double submitMaxMs = 0;
     std::uint64_t ordinal = 0;
     std::uint64_t deltaGroup = 0;
     std::uint64_t snapshotBytes = 0;
