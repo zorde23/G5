@@ -110,9 +110,11 @@ using CaptureCall = void (*)(const char* nid, const KytyCaptureRegisters* regist
 
 CaptureCall g_captureCall = nullptr;
 
-using CaptureCallback = void (*)(std::uint64_t function, std::uint64_t first, std::uint64_t second, std::uint64_t third, std::uint64_t result);
+using CaptureCallback = void (*)(std::uint64_t function, std::uint64_t first, std::uint64_t second, std::uint64_t third, std::uint64_t result, std::uint64_t trigger);
+using CaptureTrigger = std::uint64_t (*)();
 
 CaptureCallback g_captureCallback = nullptr;
+CaptureTrigger g_captureTrigger = nullptr;
 
 void CaptureRecord(std::uint64_t nid, const KytyCaptureRegisters* registers) {
     g_captureCall(reinterpret_cast<const char*>(static_cast<std::uintptr_t>(nid)), registers);
@@ -127,7 +129,8 @@ void* CaptureWrap(void* target, const char* nid) {
     if (g_captureCall == nullptr) {
         g_captureCall = reinterpret_cast<CaptureCall>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("libSceAgcDriver.prx"), "AgcDriverKytyCaptureCall_nid_no_patch")));
         g_captureCallback = reinterpret_cast<CaptureCallback>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("libSceAgcDriver.prx"), "AgcDriverKytyCaptureCallback_nid_no_patch")));
-        if (g_captureCall == nullptr || g_captureCallback == nullptr) throw std::runtime_error("APS5_KYTY_CAPTURE: libSceAgcDriver.prx is not loaded or has no AgcDriverKytyCaptureCall_nid_no_patch or AgcDriverKytyCaptureCallback_nid_no_patch");
+        g_captureTrigger = reinterpret_cast<CaptureTrigger>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("libSceAgcDriver.prx"), "AgcDriverKytyCaptureCallbackTrigger_nid_no_patch")));
+        if (g_captureCall == nullptr || g_captureCallback == nullptr || g_captureTrigger == nullptr) throw std::runtime_error("APS5_KYTY_CAPTURE: libSceAgcDriver.prx is not loaded or lacks AgcDriverKytyCaptureCall, AgcDriverKytyCaptureCallback or AgcDriverKytyCaptureCallbackTrigger (_nid_no_patch)");
     }
     const auto length = std::strlen(nid) + 1;
     auto* stable = new char[length];
@@ -139,8 +142,9 @@ void* CaptureWrap(void* target, const char* nid) {
 
 extern "C" std::uint64_t KytyGpuCallGuest_nid_no_patch(std::uint64_t function, std::uint64_t first, std::uint64_t second, std::uint64_t third) {
     using Guest = std::uint64_t(APS5_VABI*)(std::uint64_t, std::uint64_t, std::uint64_t);
+    const auto trigger = g_captureTrigger != nullptr ? g_captureTrigger() : 0;
     const auto result = reinterpret_cast<Guest>(static_cast<std::uintptr_t>(function))(first, second, third);
-    if (g_captureCallback != nullptr) g_captureCallback(function, first, second, third, result);
+    if (g_captureCallback != nullptr) g_captureCallback(function, first, second, third, result, trigger);
     return result;
 }
 
