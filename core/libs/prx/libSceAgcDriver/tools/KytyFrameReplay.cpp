@@ -148,10 +148,13 @@ void Commit(std::uint64_t address, std::uint64_t bytes, bool range) {
     }
 }
 
+bool (*g_invalidate)(std::uint64_t, std::uint64_t) = nullptr;
+
 void ApplyDeltas(const FrameCaptureReader& reader, std::uint64_t group) {
     for (const auto& chunk : reader.Chunks()) {
         if (chunk.kind != FrameMemoryKind::Delta || chunk.group != group) continue;
         reader.Read(chunk, std::span(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes)));
+        if (g_invalidate != nullptr) g_invalidate(chunk.address, chunk.bytes);
     }
 }
 
@@ -170,7 +173,7 @@ struct Replayer {
     std::uint64_t compared = 0, uncovered = 0;
 
     void Totals() {
-        std::fprintf(stderr, "[kyty-replay] call objects so far: %llu compared, %llu differed (set to the game's words), %llu calls not covered; setup memory: %llu checked, %llu differed\n", static_cast<unsigned long long>(compared), static_cast<unsigned long long>(differing), static_cast<unsigned long long>(uncovered), static_cast<unsigned long long>(memoryChecks), static_cast<unsigned long long>(memoryDiffers));
+        std::fprintf(stderr, "[kyty-replay] call objects so far: %llu compared, %llu differed (set to the game's words), %llu calls not covered\n", static_cast<unsigned long long>(compared), static_cast<unsigned long long>(differing), static_cast<unsigned long long>(uncovered));
         std::fflush(stderr);
     }
 
@@ -197,25 +200,7 @@ struct Replayer {
         std::copy(values.begin() + 2, values.end(), object);
     }
 
-    std::map<std::uint64_t, const FrameCall*> memories;
-    std::uint64_t memoryChecks = 0, memoryDiffers = 0;
-
-    void CheckMemory(std::uint64_t ordinal, const char* nid) {
-        const auto found = memories.find(ordinal);
-        if (found == memories.end()) return;
-        const auto& values = found->second->values;
-        for (std::size_t at = 1; at + 3 <= values.size(); at += 3) {
-            ++memoryChecks;
-            const bool mapped = AgcDriver::FrameReadableBytes(values[at], values[at + 1]) == values[at + 1];
-            if (mapped && AgcDriver::FrameHash(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(values[at])), static_cast<std::size_t>(values[at + 1])) == values[at + 2]) continue;
-            if (++memoryDiffers <= 32) std::fprintf(stderr, "[kyty-replay] setup call %llu %s: %llu bytes at %llx %s than at the call in the game\n", static_cast<unsigned long long>(ordinal), nid, static_cast<unsigned long long>(values[at + 1]), static_cast<unsigned long long>(values[at]), mapped ? "hold other bytes" : "are not mapped");
-        }
-    }
-
     void Run() {
-        for (const auto& call : reader.Calls()) {
-            if (call.kind == FrameCallKind::GuestCallMemory && !call.values.empty()) memories[call.values[0]] = &call;
-        }
         for (const auto& call : reader.Calls()) {
             if (call.kind == FrameCallKind::GuestCallObject && !call.values.empty()) objects[call.values[0]] = &call;
         }
@@ -288,7 +273,7 @@ struct Replayer {
         std::memcpy(nid, call.values.data(), NameWords * 8);
         const auto target = resolve(nid);
         if (target == 0) throw std::runtime_error(std::string("kyty frame replay: the DLL does not export ") + nid);
-        if (!memories.contains(call.ordinal)) CheckObject(call.ordinal, nid, call.values[IntegerAt]);
+        CheckObject(call.ordinal, nid, call.values[IntegerAt]);
         KytyCaptureReplayCall replay{};
         std::copy_n(call.values.begin() + IntegerAt, 6, replay.registers.integers);
         replay.registers.vectorCount = call.values[VectorCountAt];
@@ -299,7 +284,6 @@ struct Replayer {
         const auto stackWords = call.values.size() - StackAt;
         std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(call.address)), call.values.data() + StackAt, stackWords * 8);
         for (std::size_t i = 0; i < 8 && 1 + i < stackWords; ++i) replay.stackArguments[i] = call.values[StackAt + 1 + i];
-        CheckMemory(call.ordinal, nid);
         KytyCaptureReplay(replay, reinterpret_cast<void*>(static_cast<std::uintptr_t>(target)));
         ++calls;
     }
@@ -361,6 +345,20 @@ int Replay(const std::filesystem::path& directory, const std::filesystem::path& 
     g_replayer = &replayer;
     static const Aps5Host host{2, &ProtectHost, &Resolve};
     init(&host);
+    g_invalidate = reinterpret_cast<bool (*)(std::uint64_t, std::uint64_t)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_invalidate")));
+    const auto mapInPlace = reinterpret_cast<void (*)(std::uint64_t, std::uint64_t)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_map_in_place")));
+    const auto restoreState = reinterpret_cast<bool (*)(const std::uint64_t*, std::uint64_t)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_restore_state")));
+    if (g_invalidate == nullptr || mapInPlace == nullptr || restoreState == nullptr) throw std::runtime_error("kyty frame replay: the DLL lacks kyty_gpu_invalidate, kyty_gpu_map_in_place or kyty_gpu_restore_state");
+    std::uint64_t mapped = 0;
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind != FrameMemoryKind::Range) continue;
+        mapInPlace(chunk.address, chunk.bytes);
+        ++mapped;
+    }
+    const auto state = std::find_if(reader.Calls().begin(), reader.Calls().end(), [](const FrameCall& call) { return call.kind == FrameCallKind::KytyState; });
+    if (state == reader.Calls().end()) throw std::runtime_error("kyty frame replay: the capture has no Kyty state (made before the state export)");
+    if (!restoreState(state->values.data(), state->values.size())) throw std::runtime_error("kyty frame replay: the DLL could not restore the captured Kyty state");
+    std::fprintf(stderr, "[kyty-replay] %llu captured ranges mapped for the GPU in place, Kyty state restored\n", static_cast<unsigned long long>(mapped));
     if (const auto request = reinterpret_cast<void (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_request_target_dump")))) request();
     replayer.Run();
     waitIdle();
