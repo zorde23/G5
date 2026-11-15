@@ -1213,9 +1213,12 @@ if(WIN32)
         add_dependencies(guest_donation_map_tests kyty_gpu_fake)
         add_test(NAME guest_donation_map COMMAND guest_donation_map_tests)
         add_test(NAME guest_donation_map_kyty COMMAND guest_donation_map_tests kyty)
+        add_test(NAME guest_donation_map_kyty_fast COMMAND guest_donation_map_tests kyty)
         set_tests_properties(guest_donation_map PROPERTIES TIMEOUT 30 ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         set_tests_properties(guest_donation_map_kyty PROPERTIES TIMEOUT 30 ENVIRONMENT "APS5_KYTY_GPU=1;APS5_KYTY_GPU_DLL=kyty_gpu_fake.dll" ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        set_tests_properties(guest_donation_map_kyty_fast PROPERTIES TIMEOUT 30 ENVIRONMENT "APS5_KYTY_GPU=1;APS5_KYTY_GPU_DLL=kyty_gpu_fake.dll;APS5_KYTY_FAST_PROTECT=1" ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
