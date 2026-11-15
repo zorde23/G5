@@ -159,6 +159,8 @@ private:
         waitIdle = reinterpret_cast<void (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_wait_idle")));
         requestTargetDump = reinterpret_cast<void (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_request_target_dump")));
         captureState = reinterpret_cast<std::uint64_t (*)(std::uint64_t*, std::uint64_t)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_capture_state")));
+        takeHotkey = reinterpret_cast<bool (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_take_capture_hotkey")));
+        if (this->trigger == "F9" && takeHotkey == nullptr) throw std::runtime_error("APS5_KYTY_CAPTURE_TRIGGER=F9: the Kyty GPU DLL has no kyty_gpu_take_capture_hotkey");
         const char* at = std::getenv("APS5_KYTY_CAPTURE_AT_FLIP");
         atFlip = at != nullptr ? std::strtoull(at, nullptr, 10) : 0;
         if (flipCount == nullptr || waitIdle == nullptr) throw std::runtime_error("APS5_KYTY_CAPTURE: the Kyty GPU DLL has no kyty_gpu_flip_count or kyty_gpu_wait_idle");
@@ -173,6 +175,7 @@ private:
             return false;
         }
         if (lastFlips < atFlip) return false;
+        if (trigger == "F9") return takeHotkey != nullptr && takeHotkey();
         std::error_code error;
         return trigger.empty() || std::filesystem::exists(trigger, error);
     }
@@ -393,6 +396,7 @@ private:
     void (*waitIdle)() = nullptr;
     void (*requestTargetDump)() = nullptr;
     std::uint64_t (*captureState)(std::uint64_t*, std::uint64_t) = nullptr;
+    bool (*takeHotkey)() = nullptr;
     std::condition_variable started;
     std::uint64_t startingSeen = 0, startingPassed = 0;
     State state = State::Waiting;
