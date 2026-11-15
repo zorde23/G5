@@ -159,22 +159,37 @@ struct Replayer {
     const FrameCaptureReader& reader;
     std::uint64_t (*resolve)(const char*);
     void (*waitIdle)();
-    std::size_t next = 0;
     std::uint64_t frame = 0, calls = 0, callbacks = 0;
+    std::uint64_t current = 0;
+    std::set<const FrameCall*> used;
 
     void Run() {
-        while (next < reader.Calls().size()) Step(reader.Calls()[next++]);
+        for (const auto& call : reader.Calls()) {
+            if (call.kind != FrameCallKind::GuestCallback) continue;
+            std::fprintf(stderr, "[kyty-replay] recorded guest callback %llu: function %llu, object %llu, during call %llu on thread %llu, result %llu\n", static_cast<unsigned long long>(call.ordinal), static_cast<unsigned long long>(call.values[0]), static_cast<unsigned long long>(call.values[1]), static_cast<unsigned long long>(call.values.size() > 6 ? call.values[6] : 0), static_cast<unsigned long long>(call.thread), static_cast<unsigned long long>(call.values[4]));
+        }
+        for (const auto& call : reader.Calls()) Step(call);
+        for (const auto& call : reader.Calls()) {
+            if (call.kind == FrameCallKind::GuestCallback && !used.contains(&call)) std::fprintf(stderr, "[kyty-replay] recorded guest callback %llu was not asked for\n", static_cast<unsigned long long>(call.ordinal));
+        }
     }
 
-    std::uint64_t Callback(std::uint64_t function) {
-        const auto& all = reader.Calls();
-        while (next < all.size() && all[next].kind != FrameCallKind::GuestCallback) Step(all[next++]);
-        if (next == all.size()) throw std::runtime_error("kyty frame replay: Kyty called a guest callback the capture does not have at " + std::to_string(function));
-        const auto& call = all[next++];
-        if (call.values.size() < 6 || call.values[0] != function) throw std::runtime_error("kyty frame replay: Kyty called the guest callback at " + std::to_string(function) + " where the capture has another one");
-        ApplyDeltas(reader, call.values[5]);
-        ++callbacks;
-        return call.values[4];
+    std::uint64_t Callback(std::uint64_t function, std::uint64_t object) {
+        for (const auto& call : reader.Calls()) {
+            if (call.kind != FrameCallKind::GuestCallback || used.contains(&call) || call.values.size() < 6 || call.values[0] != function) continue;
+            const bool keyed = call.values.size() > 7;
+            if (keyed ? call.values[6] != current : call.values[1] != object) continue;
+            used.insert(&call);
+            std::fprintf(stderr, "[kyty-replay] guest callback %llu asked during call %llu: recorded %llu\n", static_cast<unsigned long long>(function), static_cast<unsigned long long>(current), static_cast<unsigned long long>(call.ordinal));
+            if (keyed) {
+                std::copy(call.values.begin() + 8, call.values.end(), reinterpret_cast<std::uint64_t*>(static_cast<std::uintptr_t>(call.values[1])));
+            } else {
+                ApplyDeltas(reader, call.values[5]);
+            }
+            ++callbacks;
+            return call.values[4];
+        }
+        throw std::runtime_error("kyty frame replay: Kyty asked for the guest callback " + std::to_string(function) + " during call " + std::to_string(current) + ", which the capture does not have");
     }
 
     void Step(const FrameCall& call) {
@@ -193,13 +208,8 @@ struct Replayer {
             if (!call.values.empty()) ApplyDeltas(reader, call.values[0]);
             return;
         }
-        if (call.kind == FrameCallKind::GuestCallback) {
-            std::fprintf(stderr, "[kyty-replay] a recorded guest callback at %llu was not called; its memory is applied\n", static_cast<unsigned long long>(call.values.empty() ? 0 : call.values[0]));
-            waitIdle();
-            if (call.values.size() >= 6) ApplyDeltas(reader, call.values[5]);
-            return;
-        }
         if (call.kind != FrameCallKind::GuestCall) return;
+        current = call.ordinal;
         if (call.values.size() < StackAt) throw std::runtime_error("kyty frame replay: a guest call record is too short");
         char nid[NameWords * 8 + 1]{};
         std::memcpy(nid, call.values.data(), NameWords * 8);
@@ -222,8 +232,8 @@ struct Replayer {
 
 Replayer* g_replayer = nullptr;
 
-std::uint64_t CallGuest(std::uint64_t function, std::uint64_t, std::uint64_t, std::uint64_t) {
-    return g_replayer->Callback(function);
+std::uint64_t CallGuest(std::uint64_t function, std::uint64_t object, std::uint64_t, std::uint64_t) {
+    return g_replayer->Callback(function, object);
 }
 
 int Replay(const std::filesystem::path& directory, const std::filesystem::path& dllPath, const std::filesystem::path& output) {
@@ -273,6 +283,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: kyty_frame_replay <capture directory> <kyty_gpu.dll> [output directory, default <capture>/replay]\n");
         return 2;
     }
+    SetEnvironmentVariableA("DISABLE_RTSS_LAYER", "1");
+    SetEnvironmentVariableA("DISABLE_VULKAN_OBS_CAPTURE", "1");
     try {
         const auto capture = std::filesystem::absolute(argv[1]);
         const int result = Replay(capture, std::filesystem::absolute(argv[2]), argc > 3 ? std::filesystem::absolute(argv[3]) : capture / "replay");
