@@ -170,6 +170,13 @@ int Replay(const std::filesystem::path& directory, const std::filesystem::path& 
     for (const auto& chunk : reader.Chunks()) {
         if (chunk.kind == FrameMemoryKind::Snapshot) reader.Read(chunk, std::span(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes)));
     }
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind != FrameMemoryKind::Range || (chunk.protection & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0) continue;
+        DWORD previous = 0;
+        if (VirtualProtect(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<SIZE_T>(chunk.bytes), PAGE_EXECUTE_READWRITE, &previous) == 0) {
+            throw std::runtime_error("kyty frame replay: cannot make the captured guest code at " + std::to_string(chunk.address) + " executable (error " + std::to_string(GetLastError()) + ")");
+        }
+    }
     for (const auto& call : reader.Calls()) {
         if (call.kind == FrameCallKind::GuestCall && call.size != 0) Commit(call.address, call.size, false);
     }
