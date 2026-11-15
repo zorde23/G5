@@ -382,6 +382,8 @@ std::atomic<std::uint64_t> g_resumedFaults{0};
 std::atomic<std::uint64_t> g_outsideFaults{0};
 std::atomic<std::uint64_t> g_untrackedFaults{0};
 std::atomic<std::uint64_t> g_handlerTicks{0};
+std::atomic<std::uint64_t> g_kytyTicks{0};
+std::atomic<std::uint64_t> g_guardTicks{0};
 FaultSlot g_faultThreads[64];
 FaultSlot g_faultSites[512];
 
@@ -515,7 +517,12 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     const auto* fault = info->ExceptionRecord;
     const auto entered = g_redZoneStats && fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ? handlerTicks() : 0;
     if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && KytyGpuHandleFault(fault->ExceptionInformation[1], static_cast<std::uint32_t>(fault->ExceptionInformation[0]), info->ContextRecord->Rip, info->ContextRecord)) {
+        const auto handled = entered != 0 ? handlerTicks() : 0;
         GuardRedZone(info);
+        if (entered != 0) {
+            g_kytyTicks.fetch_add(static_cast<std::uint64_t>(handled - entered), std::memory_order_relaxed);
+            g_guardTicks.fetch_add(static_cast<std::uint64_t>(handlerTicks() - handled), std::memory_order_relaxed);
+        }
         noteResumedFault(info, entered);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
@@ -876,7 +883,7 @@ extern "C" void LibcReportRedZoneFaults_nid_no_patch() {
     QueryPerformanceFrequency(&frequency);
     const auto faults = g_resumedFaults.exchange(0, std::memory_order_relaxed);
     const auto handlerUs = g_handlerTicks.exchange(0, std::memory_order_relaxed) * 1000000u / static_cast<std::uint64_t>(frequency.QuadPart);
-    std::string line = "[red-zone-faults] 10 s: " + std::to_string(faults) + " resumed guest-memory faults, " + std::to_string(g_outsideFaults.exchange(0, std::memory_order_relaxed)) + " outside every listed range, " + std::to_string(g_untrackedFaults.exchange(0, std::memory_order_relaxed)) + " past the slot tables; handler " + std::to_string(handlerUs) + " us; by thread:";
+    std::string line = "[red-zone-faults] 10 s: " + std::to_string(faults) + " resumed guest-memory faults, " + std::to_string(g_outsideFaults.exchange(0, std::memory_order_relaxed)) + " outside every listed range, " + std::to_string(g_untrackedFaults.exchange(0, std::memory_order_relaxed)) + " past the slot tables; handler " + std::to_string(handlerUs) + " us (Kyty GPU " + std::to_string(g_kytyTicks.exchange(0, std::memory_order_relaxed) * 1000000u / static_cast<std::uint64_t>(frequency.QuadPart)) + " us, guard " + std::to_string(g_guardTicks.exchange(0, std::memory_order_relaxed) * 1000000u / static_cast<std::uint64_t>(frequency.QuadPart)) + " us); by thread:";
     for (const auto& [count, thread] : takeTop(g_faultThreads, 5)) line += " " + std::to_string(thread) + " " + std::to_string(count) + ";";
     line += " by site:";
     for (const auto& [count, rip] : takeTop(g_faultSites, 10)) {
