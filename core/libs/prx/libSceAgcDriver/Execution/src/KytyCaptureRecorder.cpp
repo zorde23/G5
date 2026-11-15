@@ -30,6 +30,9 @@ using AgcDriver::FrameRangeKind;
 
 constexpr std::uint64_t PageBytes = 4096;
 constexpr std::uint64_t StackBytes = 4096;
+constexpr std::size_t CallbackObjectWords = 7;
+
+thread_local std::uint64_t t_callOrdinal = 0;
 
 struct Range {
     std::uint64_t address = 0;
@@ -96,13 +99,14 @@ public:
         if (abandoned.load()) return;
         std::lock_guard lock(mutex);
         if (state != State::Recording) return;
-        emitDelta();
         FrameCall call;
         call.kind = FrameCallKind::GuestCallback;
         call.ordinal = ++ordinal;
         call.timeNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - origin).count());
         call.thread = GetCurrentThreadId();
-        call.values = {function, first, second, third, result, deltaGroup};
+        call.values = {function, first, second, third, result, 0, t_callOrdinal, call.thread};
+        const auto* object = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(first));
+        call.values.insert(call.values.end(), object, object + CallbackObjectWords);
         writer->WriteCall(call);
         ++recordedCallbacks;
     }
@@ -221,6 +225,7 @@ private:
         const auto* stack = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(call.address));
         call.values.insert(call.values.end(), stack, stack + stackBytes / 8);
         writer->WriteCall(call);
+        t_callOrdinal = call.ordinal;
         ++recordedCalls;
     }
 
