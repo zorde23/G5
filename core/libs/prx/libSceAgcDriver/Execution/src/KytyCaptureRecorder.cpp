@@ -143,8 +143,10 @@ public:
         call.timeNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - origin).count());
         call.thread = GetCurrentThreadId();
         call.values = {function, first, second, third, result, 0, trigger, call.thread};
-        const auto* object = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(first));
-        call.values.insert(call.values.end(), object, object + CallbackObjectWords);
+        if (inWritableRange(first, CallbackObjectWords * 8)) {
+            const auto* object = reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(first));
+            call.values.insert(call.values.end(), object, object + CallbackObjectWords);
+        }
         writer->WriteCall(call);
         ++recordedCallbacks;
     }
@@ -269,10 +271,12 @@ private:
         }
     }
 
+    bool inWritableRange(std::uint64_t address, std::uint64_t bytes) const {
+        return std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.writable && address >= range.address && address - range.address < range.bytes && bytes <= range.bytes - (address - range.address); });
+    }
+
     void recordObject(std::uint64_t callOrdinal, std::uint64_t address) {
-        const auto bytes = CallbackObjectWords * 8;
-        const bool captured = std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.writable && address >= range.address && address + bytes <= range.address + range.bytes; });
-        if (!captured) return;
+        if (!inWritableRange(address, CallbackObjectWords * 8)) return;
         FrameCall call;
         call.kind = FrameCallKind::GuestCallObject;
         call.ordinal = ++ordinal;
