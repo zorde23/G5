@@ -192,6 +192,9 @@ namespace {
 constexpr std::uint8_t TrackerMask = 0x03;
 constexpr std::uint8_t GameShift = 2;
 constexpr std::uint8_t GameMask = 0x1c;
+constexpr std::uint8_t CaptureBit = 0x20;
+constexpr std::uint8_t DirtyBit = 0x40;
+std::atomic<std::uint64_t> g_captureFaults{0};
 constexpr DWORD GameProtections[] = {PAGE_READWRITE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE};
 
 std::uint8_t GameClass(std::uint32_t protection) {
@@ -201,22 +204,27 @@ std::uint8_t GameClass(std::uint32_t protection) {
     return 0;
 }
 
+DWORD ReadOnly(DWORD protection) {
+    if (protection == PAGE_READWRITE) return PAGE_READONLY;
+    if (protection == PAGE_EXECUTE_READWRITE) return PAGE_EXECUTE_READ;
+    return protection;
+}
+
 DWORD Effective(std::uint8_t state) {
     const auto game = GameProtections[std::min<std::size_t>((state & GameMask) >> GameShift, std::size(GameProtections) - 1)];
+    DWORD protection = game;
     switch (state & TrackerMask) {
-    case 1:
-        if (game == PAGE_READWRITE) return PAGE_READONLY;
-        if (game == PAGE_EXECUTE_READWRITE) return PAGE_EXECUTE_READ;
-        return game;
-    case 2: return PAGE_NOACCESS;
-    default: return game;
+    case 1: protection = ReadOnly(game); break;
+    case 2: protection = PAGE_NOACCESS; break;
+    default: break;
     }
+    return (state & CaptureBit) != 0 ? ReadOnly(protection) : protection;
 }
 
 bool ApplyEffectivePage(std::uintptr_t page, bool trackedOnly, bool record) {
     bool applied = true;
     for (auto state = GuestArena::GuestArenaHostPageState_nid_no_patch(page);;) {
-        if (trackedOnly && (state & TrackerMask) == 0) break;
+        if (trackedOnly && (state & (TrackerMask | CaptureBit)) == 0) break;
         DWORD previous = 0;
         if (record) GuestArena::WindowsMappings::RecordProtection(page, GuestArena::HostPageBytes, Effective(state), "protect a page the Kyty GPU tracks");
         applied = VirtualProtect(reinterpret_cast<void*>(page), GuestArena::HostPageBytes, Effective(state), &previous) != 0 && applied;
@@ -241,7 +249,7 @@ bool ApplyEffectiveRuns(std::uintptr_t address, std::size_t bytes, bool trackedO
     bool applied = true;
     for (auto page = first; page < end;) {
         const auto state = GuestArena::GuestArenaHostPageState_nid_no_patch(page);
-        if (trackedOnly && (state & TrackerMask) == 0) {
+        if (trackedOnly && (state & (TrackerMask | CaptureBit)) == 0) {
             page += GuestArena::HostPageBytes;
             continue;
         }
@@ -249,7 +257,7 @@ bool ApplyEffectiveRuns(std::uintptr_t address, std::size_t bytes, bool trackedO
         auto runEnd = page + GuestArena::HostPageBytes;
         while (runEnd < end) {
             const auto next = GuestArena::GuestArenaHostPageState_nid_no_patch(runEnd);
-            if ((trackedOnly && (next & TrackerMask) == 0) || Effective(next) != protection) break;
+            if ((trackedOnly && (next & (TrackerMask | CaptureBit)) == 0) || Effective(next) != protection) break;
             runEnd += GuestArena::HostPageBytes;
         }
         DWORD previous = 0;
@@ -273,9 +281,44 @@ bool ApplyEffective(std::uintptr_t address, std::size_t bytes, bool trackedOnly)
 
 }
 
+namespace {
+
+template <typename Run>
+void ForDonatedRuns(std::uintptr_t address, std::size_t bytes, Run&& run) {
+    const auto end = address + bytes;
+    for (auto page = address & ~static_cast<std::uintptr_t>(GuestArena::HostPageBytes - 1); page < end;) {
+        if (!GuestArena::GuestArenaDonated_nid_no_patch(page)) {
+            page += GuestArena::HostPageBytes;
+            continue;
+        }
+        auto runEnd = page + GuestArena::HostPageBytes;
+        while (runEnd < end && GuestArena::GuestArenaDonated_nid_no_patch(runEnd)) runEnd += GuestArena::HostPageBytes;
+        run(page, static_cast<std::size_t>(runEnd - page));
+        page = runEnd;
+    }
+}
+
+void ReleaseCapturedPages(std::uintptr_t address, std::size_t bytes) {
+    const auto end = address + bytes;
+    for (auto page = address & ~static_cast<std::uintptr_t>(GuestArena::HostPageBytes - 1); page < end; page += GuestArena::HostPageBytes) {
+        if ((GuestArena::GuestArenaHostPageState_nid_no_patch(page) & CaptureBit) == 0) continue;
+        GuestArena::GuestArenaSetHostPageState_nid_no_patch(page, GuestArena::HostPageBytes, CaptureBit | DirtyBit, DirtyBit);
+        ApplyEffectivePage(page, false, false);
+    }
+}
+
+}
+
 void KytyGpuNoteGameProtection(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
     if (!KytyGpuEnabled() || !GuestArena::GuestArenaDonatedAny_nid_no_patch(address, bytes)) return;
     GuestArena::GuestArenaSetHostPageState_nid_no_patch(address, bytes, GameMask, static_cast<std::uint8_t>(GameClass(protection) << GameShift));
+    const auto game = protection & 0xffu;
+    if (game == PAGE_READWRITE || game == PAGE_EXECUTE_READWRITE) {
+        const auto end = address + bytes;
+        for (auto page = address & ~static_cast<std::uintptr_t>(GuestArena::HostPageBytes - 1); page < end; page += GuestArena::HostPageBytes) {
+            if ((GuestArena::GuestArenaHostPageState_nid_no_patch(page) & CaptureBit) != 0) GuestArena::GuestArenaSetHostPageState_nid_no_patch(page, GuestArena::HostPageBytes, DirtyBit, DirtyBit);
+        }
+    }
     ApplyEffective(address, bytes, true);
 }
 
@@ -293,13 +336,50 @@ bool KytyGpuProtectHost(std::uint64_t address, std::uint64_t bytes, std::uint32_
 }
 
 void KytyGpuPrepareHostWrite(std::uintptr_t address, std::size_t bytes) {
-    if (KytyGpuEnabled() && GuestArena::GuestArenaDonatedAny_nid_no_patch(address, bytes)) Ready().prepareHostWrite(address, bytes);
+    if (!KytyGpuEnabled() || !GuestArena::GuestArenaDonatedAny_nid_no_patch(address, bytes)) return;
+    ReleaseCapturedPages(address, bytes);
+    Ready().prepareHostWrite(address, bytes);
 }
 
 bool KytyGpuHandleFault(std::uintptr_t address, std::uint32_t access, std::uint64_t rip, void* context) {
-    if (!KytyGpuEnabled() || !GuestArena::GuestArenaDonated_nid_no_patch(address) || !Dll().handleFault(address, access, rip, context)) return false;
+    if (!KytyGpuEnabled() || !GuestArena::GuestArenaDonated_nid_no_patch(address)) return false;
+    const auto page = address & ~static_cast<std::uintptr_t>(GuestArena::HostPageBytes - 1);
+    if (access == 1 && (GuestArena::GuestArenaHostPageState_nid_no_patch(page) & CaptureBit) != 0) {
+        GuestArena::GuestArenaSetHostPageState_nid_no_patch(page, GuestArena::HostPageBytes, CaptureBit | DirtyBit, DirtyBit);
+        g_captureFaults.fetch_add(1, std::memory_order_relaxed);
+        ApplyEffectivePage(page, false, false);
+        const auto state = GuestArena::GuestArenaHostPageState_nid_no_patch(page);
+        const auto protection = Effective(state);
+        if ((state & CaptureBit) != 0 || protection == PAGE_READWRITE || protection == PAGE_EXECUTE_READWRITE) return true;
+    }
+    if (!Dll().handleFault(address, access, rip, context)) return false;
     g_kytyFaults.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+void KytyGpuCaptureTrack_nid_no_patch(std::uintptr_t address, std::size_t bytes, bool on) {
+    if (!KytyGpuEnabled()) return;
+    ForDonatedRuns(address, bytes, [on](std::uintptr_t run, std::size_t runBytes) {
+        GuestArena::GuestArenaSetHostPageState_nid_no_patch(run, runBytes, CaptureBit | DirtyBit, on ? CaptureBit : 0);
+        ApplyEffective(run, runBytes, false);
+    });
+}
+
+std::vector<std::uintptr_t> KytyGpuCaptureTakeWritten_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    std::vector<std::uintptr_t> written;
+    if (!KytyGpuEnabled()) return written;
+    const auto first = address & ~static_cast<std::uintptr_t>(GuestArena::HostPageBytes - 1);
+    for (auto page = first; page < address + bytes; page += GuestArena::HostPageBytes) {
+        if ((GuestArena::GuestArenaHostPageState_nid_no_patch(page) & DirtyBit) == 0) continue;
+        GuestArena::GuestArenaSetHostPageState_nid_no_patch(page, GuestArena::HostPageBytes, CaptureBit | DirtyBit, CaptureBit);
+        ApplyEffectivePage(page, false, true);
+        written.push_back(page);
+    }
+    return written;
+}
+
+std::uint64_t KytyGpuCaptureFaults_nid_no_patch() {
+    return g_captureFaults.exchange(0, std::memory_order_relaxed);
 }
 
 void KytyGpuReportCounters() {
@@ -328,6 +408,13 @@ bool KytyGpuProtectHost(std::uint64_t, std::uint64_t, std::uint32_t) {
     return false;
 }
 void KytyGpuReportCounters() {}
+void KytyGpuCaptureTrack_nid_no_patch(std::uintptr_t, std::size_t, bool) {}
+std::vector<std::uintptr_t> KytyGpuCaptureTakeWritten_nid_no_patch(std::uintptr_t, std::size_t) {
+    return {};
+}
+std::uint64_t KytyGpuCaptureFaults_nid_no_patch() {
+    return 0;
+}
 
 bool KytyGpuHandleFault(std::uintptr_t, std::uint32_t, std::uint64_t, void*) {
     return false;
