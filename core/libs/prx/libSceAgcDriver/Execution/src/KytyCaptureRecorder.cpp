@@ -217,6 +217,7 @@ private:
         waitGfxIdleFor = reinterpret_cast<bool (*)(std::uint32_t)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_wait_gfx_idle_for")));
         waitQuietFor = reinterpret_cast<bool (*)(std::uint32_t, std::uint32_t*)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_wait_quiet_for")));
         busyQueues = reinterpret_cast<std::uint32_t (*)(std::uint32_t*, std::uint32_t)>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_busy_queues")));
+        flushImages = reinterpret_cast<bool (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_flush_images")));
         if (this->trigger == "F9" && takeHotkey == nullptr) throw std::runtime_error("APS5_KYTY_CAPTURE_TRIGGER=F9: the Kyty GPU DLL has no kyty_gpu_take_capture_hotkey");
         const char* at = std::getenv("APS5_KYTY_CAPTURE_AT_FLIP");
         atFlip = at != nullptr ? std::strtoull(at, nullptr, 10) : 0;
@@ -241,6 +242,12 @@ private:
         const auto began = std::chrono::steady_clock::now();
         writer = std::make_unique<FrameCaptureWriter>(directory);
         step("folder created");
+        if (flushImages != nullptr) {
+            step("writing GPU images to guest memory");
+            if (!flushImages()) throw std::runtime_error("APS5_KYTY_CAPTURE: kyty_gpu_flush_images failed");
+        } else {
+            step("the Kyty GPU DLL has no kyty_gpu_flush_images: what earlier frames rendered is missing from the snapshot");
+        }
         writeKytyState();
         ranges = committedRanges();
         for (auto& range : ranges) {
@@ -470,6 +477,7 @@ private:
     bool (*waitGfxIdleFor)(std::uint32_t) = nullptr;
     bool (*waitQuietFor)(std::uint32_t, std::uint32_t*) = nullptr;
     std::uint32_t (*busyQueues)(std::uint32_t*, std::uint32_t) = nullptr;
+    bool (*flushImages)() = nullptr;
     std::string idleRule = "full idle";
     std::vector<std::uint32_t> runningQueues;
     bool pending = false;
