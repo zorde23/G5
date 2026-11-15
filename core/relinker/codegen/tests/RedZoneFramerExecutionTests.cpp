@@ -523,6 +523,44 @@ Codegen::RedZoneFrameReport runLeaves(const std::vector<Leaf>& leaves, const boo
     return framing.Report;
 }
 
+
+#ifdef _WIN32
+std::uint8_t* guardedPage = nullptr;
+
+LONG CALLBACK reopenGuardedPage(EXCEPTION_POINTERS* exception) {
+    const auto& record = *exception->ExceptionRecord;
+    if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2 || reinterpret_cast<std::uint8_t*>(record.ExceptionInformation[1]) != guardedPage)
+        return EXCEPTION_CONTINUE_SEARCH;
+    DWORD old = 0;
+    return VirtualProtect(guardedPage, 0x1000, PAGE_READWRITE, &old) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+
+void exceptionDispatchLeavesBytesAboveRspIntact() {
+    guardedPage = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY));
+    require(guardedPage != nullptr, "cannot allocate the guarded page");
+    const auto handler = AddVectoredExceptionHandler(1, reopenGuardedPage);
+    require(handler != nullptr, "cannot install the access-violation handler");
+    const std::vector<std::uint8_t> probe{
+        0x57, 0x56, 0x49, 0x89, 0xc8, 0x48, 0x81, 0xec, 0x00, 0x01, 0x00, 0x00,
+        0x48, 0x89, 0xe7, 0xb9, 0x00, 0x01, 0x00, 0x00, 0xb0, kClobber, 0xf3, 0xaa,
+        0x41, 0xc7, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x48, 0x89, 0xe6, 0xb9, 0x00, 0x01, 0x00, 0x00, 0x31, 0xc0,
+        0x80, 0x3e, kClobber, 0x75, 0x09, 0x48, 0xff, 0xc6, 0xff, 0xc9, 0x75, 0xf4, 0xeb, 0x05,
+        0xb8, 0x01, 0x00, 0x00, 0x00,
+        0x48, 0x81, 0xc4, 0x00, 0x01, 0x00, 0x00, 0x5e, 0x5f, 0xc3,
+    };
+    std::memcpy(arena + kRunnerBase, probe.data(), probe.size());
+    FlushInstructionCache(GetCurrentProcess(), arena + kRunnerBase, probe.size());
+    const auto run = reinterpret_cast<std::uint32_t (*)(std::uint8_t*)>(arena + kRunnerBase);
+    const auto changed = run(guardedPage);
+    const bool wrote = guardedPage[0] == 1;
+    RemoveVectoredExceptionHandler(handler);
+    VirtualFree(guardedPage, 0, MEM_RELEASE);
+    require(wrote, "the faulting store was not resumed after the handler reopened the page");
+    require(changed == 0, "the exception dispatch changed bytes at or above RSP while the faulting store ran");
+    std::cout << "exception dispatch: the 256 bytes at and above RSP were intact after a resumed write fault\n";
+}
+#endif
 }
 
 int main() {
@@ -542,6 +580,9 @@ int main() {
         require(widened.WidenedPrologues == 8 && widened.WidenedExits == 9 && widened.WidenedOperands == 12, "the leaves with short prologues and exits were framed with " + std::to_string(widened.WidenedPrologues) + " widened prologues, " + std::to_string(widened.WidenedExits) + " widened exits and " + std::to_string(widened.WidenedOperands) + " rsp operands in them, not 8, 9 and 12");
         const auto shrinkWrapped = runLeaves(shrinkWrappedLeaves(), true);
         runsAShrinkWrappedLeafThroughItsTakenEarlyExit();
+#ifdef _WIN32
+        exceptionDispatchLeavesBytesAboveRspIntact();
+#endif
         Precision precision;
         for (const auto& leaves : {framedLeaves(), stubbedLeaves(), backwardStubbedLeaves(), widenedLeaves(), shrinkWrappedLeaves(), leavesWithADeadTail()}) {
             const auto checked = checkDeadRangesAreNeverOptimistic(leaves);

@@ -1200,10 +1200,14 @@ void killsRedZoneSlotsOnlyWithWholeStoresWhenAsked() {
         join({other, {0x64}, store8, read8, {0xc3}}),
         join({other, {0x64}, vstore4, read8, {0xc3}}),
         join({other, {0x67}, store8, read8, {0xc3}}),
+        join({other, {0x66, 0x0f, 0x3a, 0x17, 0x44, 0x24, 0xf8, 0x00}, read8, {0xc3}}),
+        join({other, {0x66, 0x0f, 0x38, 0x17, 0x44, 0x24, 0xf8}, read8, {0xc3}}),
+        join({{0x5b}, other, read8, {0xc3}}),
     };
     const auto input = image(leaves);
     const auto ranges = [&](const bool kills) { return Codegen::FindRedZoneDeadRanges(input.bytes, input.segments, input.functions, kills); };
-    const auto killed = ranges(true);
+    std::vector<std::uint64_t> tailCalls;
+    const auto killed = Codegen::FindRedZoneDeadRanges(input.bytes, input.segments, input.functions, true, &tailCalls);
     const auto plain = ranges(false);
     const auto deadAt = [&](const std::vector<Codegen::RedZoneDeadRange>& dead, const std::uint64_t address) {
         return std::any_of(dead.begin(), dead.end(), [&](const auto& range) { return range.Begin <= address && address < range.End; });
@@ -1223,6 +1227,10 @@ void killsRedZoneSlotsOnlyWithWholeStoresWhenAsked() {
     require(!deadAt(killed[10], first(10)), "a store through fs killed a stack slot");
     require(!deadAt(killed[11], first(11)), "a VEX store through fs killed a stack slot");
     require(!deadAt(killed[12], first(12)), "a store with a 32-bit address killed a stack slot");
+    require(!deadAt(killed[13], first(13)), "an extractps (0F 3A) store killed a stack slot");
+    require(!deadAt(killed[14], first(14)), "a ptest (0F 38) read killed a stack slot");
+    require(killed[15].empty(), "a leaf that pops above its entry RSP had instructions called dead");
+    require(tailCalls == std::vector<std::uint64_t>{first(4)}, "the leaves taken through a tail-call exit were not exactly the one tail call after the pops");
 }
 
 int main() {

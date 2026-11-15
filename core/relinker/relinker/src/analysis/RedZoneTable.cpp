@@ -72,7 +72,7 @@ std::string RedZoneGuardTable(const std::vector<std::uint8_t>& bytes, const std:
     if (precise) {
         std::vector<Codegen::RedZoneFunction> leaves;
         for (const auto& leaf : listed) leaves.push_back({leaf.Begin, leaf.End});
-        dead = Codegen::FindRedZoneDeadRanges(bytes, codeSegments, leaves, killStores);
+        dead = Codegen::FindRedZoneDeadRanges(bytes, codeSegments, leaves, killStores, stats != nullptr ? &stats->TailCallLeaves : nullptr);
     }
     for (std::size_t index = 0; index < listed.size(); ++index) {
         auto cursor = listed[index].Begin;
