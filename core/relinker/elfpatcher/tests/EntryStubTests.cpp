@@ -102,6 +102,22 @@ void windowsStubLoadsTheAllocatorOnRequest(const std::string& runPath, const std
     require(load != std::string::npos && target == static_cast<std::int64_t>(load) + 6, runPath + ": an unset APS5_MIMALLOC does not skip exactly the load of mimalloc.dll");
 }
 
+void windowsStubSetsTheIniSectionFirst() {
+    const auto nativeImports = Elfpatcher::Windows::WindowsImportBuilder().Build(0x1000);
+    const auto stub = windowsStub(nativeImports, "$ORIGIN/libs", {"libc.prx"});
+    const auto file = ripReference(stub.Code, {0x48, 0x8d, 0x35}, wideStringRva(stub.Data, u"g5.ini"));
+    const auto section = ripReference(stub.Code, {0x48, 0x8d, 0x0d}, wideStringRva(stub.Data, u"g5"));
+    const auto profile = ripReference(stub.Code, {0xff, 0x15}, nativeImports.Functions.at("GetPrivateProfileSectionW"));
+    const auto read = ripReference(stub.Code, {0x48, 0x8d, 0x0d}, wideStringRva(stub.Data, u"APS5_MIMALLOC"));
+    require(file != std::string::npos && section != std::string::npos && profile != std::string::npos, "the stub does not read the [g5] section of g5.ini beside the executable");
+    require(file < section && section < profile && profile < read, "the stub does not read g5.ini before APS5_MIMALLOC");
+    const auto check = ripReference(stub.Code, {0xff, 0x15}, nativeImports.Functions.at("GetEnvironmentVariableW"), profile);
+    const auto set = ripReference(stub.Code, {0xff, 0x15}, nativeImports.Functions.at("SetEnvironmentVariableW"), profile);
+    require(check != std::string::npos && set != std::string::npos && check < set && set < read, "the stub does not set a g5.ini key only when the environment lacks it");
+    std::size_t cursor = check + 6;
+    require(bytesAt(stub.Code.Data, cursor, {0x85, 0xc0, 0x0f, 0x85}), "a key already in the environment is not skipped");
+}
+
 void windowsStubRejectsAnOverlongAllocatorPath() {
     const auto nativeImports = Elfpatcher::Windows::WindowsImportBuilder().Build(0x1000);
     const auto runPath = [](const std::size_t length) { return "C:\\" + std::string(length - 4, 'a') + "\\"; };
@@ -169,6 +185,7 @@ int main() {
         windowsStubLoadsTheAllocatorFirst("$ORIGIN/libs", u"libs\\", {0x48, 0x8d, 0x35});
         windowsStubLoadsTheAllocatorOnRequest("C:/Games/Title/libs", u"C:\\Games\\Title\\libs\\", {0x48, 0x8d, 0x0d});
         windowsStubLoadsTheAllocatorOnRequest("$ORIGIN/libs", u"libs\\", {0x48, 0x8d, 0x35});
+        windowsStubSetsTheIniSectionFirst();
         windowsStubRejectsAnOverlongAllocatorPath();
         windowsLibSceAmprObjectImportsFallBackToTheLibcProvider();
         windowsKernelVariantImportsSearchCanonicalKernelAfterTheRequestedVariant();
