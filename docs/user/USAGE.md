@@ -236,6 +236,8 @@ Windows PowerShell:
 
 A Windows executable started without a standard output or error handle, such as a `--windows-gui` build started from Explorer, writes that output to `anyps5.log` beside it, replacing the previous run's file. Without write access to that directory it runs without the log.
 
+On Windows, `g5.ini` beside the executable can hold `KEY=value` lines that are set before the libraries start, each only when the environment lacks it, and `APS5_LOG_FILE` in it sends the output of a run without a redirect to that file; see `APS5_LOG_FILE` in docs/dev/ENVIRONMENT.md.
+
 ### Display resolution and window size
 
 The game chooses its video-output resolution; AnyPS5 uses that mode for rendering. The display window can be resized or switched to fullscreen, which scales the presented image to fit the window. F11 switches between window and fullscreen; set `ANYPS5_FULLSCREEN` to a non-empty value other than `0` to open the window fullscreen from the start. Changing the window size does not change the game's render resolution. AnyPS5 does not currently provide a global render-resolution override; use a game's own display setting when it offers one.

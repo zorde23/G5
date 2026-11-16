@@ -10,6 +10,15 @@ if(BUILD_TESTING)
             add_test(NAME windows_mappings_release_mismatch_${mode} COMMAND windows_mappings_release_tests ${mode})
             set_tests_properties(windows_mappings_release_mismatch_${mode} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endforeach()
+        add_test_executable(guest_exe_ini_tests ${LIBS_INCLUDE_DIR}/tests/GuestExeIni.cpp)
+        target_include_directories(guest_exe_ini_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(guest_exe_ini_tests PRIVATE libc)
+        configure_windows_unwind(guest_exe_ini_tests)
+        file(GENERATE OUTPUT "$<TARGET_FILE_DIR:guest_exe_ini_tests>/g5.ini"
+            CONTENT "# G5_INI_TEST_COMMENT=set\r\nG5_INI_TEST = from ini\r\nG5_INI_TEST_KEEP=ini\r\n")
+        add_test(NAME guest_exe_ini COMMAND guest_exe_ini_tests)
+        set_tests_properties(guest_exe_ini PROPERTIES TIMEOUT 10 ENVIRONMENT "G5_INI_TEST_KEEP=environment"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
     add_test_executable(guest_binary_word_tests ${LIBS_INCLUDE_DIR}/tests/GuestBinaryWord.cpp)
@@ -56,6 +65,7 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/x86_64/CallTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/KytyGpu.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/KytyCapture.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/ExeIni.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/linux/DlIteratePhdr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/macos/GuestImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Strings.cpp
