@@ -236,7 +236,7 @@ Windows PowerShell:
 
 A Windows executable started without a standard output or error handle, such as a `--windows-gui` build started from Explorer, writes that output to `anyps5.log` beside it, replacing the previous run's file. Without write access to that directory it runs without the log.
 
-On Windows, `g5.ini` beside the executable can hold `KEY=value` lines that are set before the libraries start, each only when the environment lacks it, and `APS5_LOG_FILE` in it sends the output of a run without a redirect to that file; see `APS5_LOG_FILE` in docs/dev/ENVIRONMENT.md.
+On Windows, the entry stub reads the `KEY=value` lines under a `[g5]` line of `g5.ini` beside the executable and sets each key that the environment lacks, before it loads mimalloc or any library, so a double-click launch gets the same keys as a launch script. The lines are taken as Windows reads an INI file: write `KEY=value` without spaces around `=`, save the file as ANSI or UTF-16 (a UTF-8 byte order mark hides a first-line `[g5]`), keep comment lines without `=` and the section under 16 KiB. `APS5_LOG_FILE` among them sends the output of a run without a redirect to that file (see docs/dev/ENVIRONMENT.md).
 
 ### Display resolution and window size
 
