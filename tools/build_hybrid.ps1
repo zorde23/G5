@@ -1,0 +1,126 @@
+param(
+    [string]$Eboot = '',
+    [string]$Output = '',
+    [string]$Name = 'g5',
+    [string]$Patches = '',
+    [string]$GameDir = '',
+    [int]$Jobs = [Environment]::ProcessorCount,
+    [string]$Build = '',
+    [string]$KytyBuild = ''
+)
+$root = Split-Path -Parent $PSScriptRoot
+if (-not $Build) { $Build = Join-Path $root 'build-hybrid' }
+if (-not $KytyBuild) { $KytyBuild = Join-Path $root 'build-kyty-gpu' }
+if ($Eboot -and -not $Output) { throw '-Eboot needs -Output, the folder to lay the converted title out in' }
+
+function Run([string]$what, [scriptblock]$command) {
+    Write-Host "== $what"
+    $ErrorActionPreference = 'Continue'
+    & $command
+    if ($LASTEXITCODE -ne 0) { throw "$what failed with exit code $LASTEXITCODE" }
+}
+
+function Real([string]$tool) {
+    Get-Command $tool -All -ErrorAction SilentlyContinue | Where-Object { $_.Source -notmatch '\\(WindowsApps|System32)\\' } | Select-Object -First 1
+}
+$git = Real 'git'
+if ($git) {
+    $gitBin = Join-Path (Split-Path -Parent (Split-Path -Parent $git.Source)) 'usr\bin'
+    if (Test-Path (Join-Path $gitBin 'bash.exe')) { $env:PATH = "$gitBin;$env:PATH" }
+}
+$missing = @()
+foreach ($tool in 'git', 'cmake', 'ninja', 'gcc', 'g++', 'objdump', 'bash') {
+    if (-not (Real $tool)) { $missing += "$tool (put the WinLibs mingw64\bin, CMake and Git for Windows cmd and usr\bin on PATH; see docs/dev/BUILD.md)" }
+}
+$python = ''
+foreach ($candidate in 'python3', 'python', 'py') {
+    $command = Real $candidate
+    if (-not $command) { continue }
+    $found = "$(& $command.Source -c 'import sys; print(sys.version_info[0], sys.executable)' 2>$null)"
+    if ($LASTEXITCODE -eq 0 -and $found -match '^3 (.+)$') { $python = $Matches[1].Trim(); break }
+}
+if (-not $python) { $missing += 'Python 3 (python.org or the Python Install Manager; the Microsoft Store alias does not run it)' }
+if ((Real 'gcc') -and ((& gcc -dumpmachine) -notmatch 'mingw')) { $missing += "a MinGW gcc first on PATH (found $((Get-Command gcc).Source))" }
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+$vs = if (Test-Path $vswhere) { & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang -property installationPath } else { '' }
+$vsDevCmd = if ($vs) { Join-Path $vs 'Common7\Tools\VsDevCmd.bat' } else { '' }
+if (-not $vsDevCmd -or -not (Test-Path $vsDevCmd)) { $missing += 'Visual Studio or Build Tools with "C++ Clang tools for Windows" (clang-cl) and a Windows SDK' }
+$vsCmake = if ($vs) { Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin' } else { '' }
+if ($vsCmake -and (Test-Path (Join-Path $vsCmake 'cmake.exe'))) { $env:PATH = "$vsCmake;$env:PATH" }
+$glslang = if ($env:VULKAN_SDK) { Join-Path $env:VULKAN_SDK 'Bin\glslangValidator.exe' } else { '' }
+if (-not $glslang -or -not (Test-Path $glslang)) { $missing += 'the Vulkan SDK (VULKAN_SDK must point at it; Kyty compiles its shaders with glslangValidator)' }
+if ($Eboot -and -not (Test-Path -LiteralPath $Eboot)) { $missing += "the executable given to -Eboot: $Eboot" }
+if ($Patches -and -not (Test-Path -LiteralPath $Patches)) { $missing += "the patch file $Patches" }
+if ($GameDir -and -not (Test-Path -LiteralPath $GameDir -PathType Container)) { $missing += "the title folder given to -GameDir: $GameDir" }
+if ($missing) {
+    Write-Host 'Missing prerequisites:'
+    $missing | ForEach-Object { Write-Host "  - $_" }
+    exit 1
+}
+$ErrorActionPreference = 'Stop'
+
+Run 'submodules' { git -C $root submodule update --init --recursive }
+
+Run 'configure the runtime' { cmake -S $root -B $Build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DAPS5_HOST_NO_RED_ZONE=ON "-DPython3_EXECUTABLE=$python" }
+Run 'build the relinker and the runtime libraries' { cmake --build $Build --target relinker libs --parallel $Jobs }
+$libs = Join-Path $Build 'core\libs\libs'
+$toolchain = Split-Path -Parent (Get-Command gcc).Source
+foreach ($runtime in 'libgcc_s_seh-1.dll', 'libstdc++-6.dll', 'libwinpthread-1.dll') { Copy-Item (Join-Path $toolchain $runtime) $libs -Force }
+
+$kyty = Join-Path $root '3rdparty\kyty-gpu'
+$env:PATH = "$(Split-Path -Parent $glslang);$env:PATH"
+Run 'configure kyty_gpu.dll' { cmd /c "call `"$vsDevCmd`" -arch=x64 -host_arch=x64 >nul && cmake -S `"$kyty`" -B `"$KytyBuild`" -G Ninja -DCMAKE_BUILD_TYPE=Release -DKYTY_BUILD_LAUNCHER=OFF -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl" }
+Run 'build kyty_gpu.dll' { cmd /c "call `"$vsDevCmd`" -arch=x64 -host_arch=x64 >nul && cmake --build `"$KytyBuild`" --target kyty_gpu --parallel $Jobs" }
+
+if (-not $Eboot) {
+    Write-Host "Built: $Build\core\relinker\relinker.exe, $libs and $KytyBuild\kyty_gpu.dll"
+    exit 0
+}
+
+$outLibs = Join-Path $Output 'libs'
+New-Item -ItemType Directory -Force $outLibs | Out-Null
+Remove-Item (Join-Path $outLibs '*.redzone.txt') -ErrorAction SilentlyContinue
+Get-ChildItem -File $libs | Copy-Item -Destination $outLibs -Force
+Copy-Item (Join-Path $KytyBuild 'kyty_gpu.dll'), (Join-Path $kyty '3rdparty\winpthread\bin\libwinpthread-1.dll') $Output -Force
+$exe = Join-Path $Output "$Name.exe"
+$app0 = Join-Path $Output 'app0'
+$gameItems = @()
+if ($GameDir) {
+    $gameItems = @(Get-ChildItem -LiteralPath $GameDir -Force | Where-Object { $_.Name -ne 'sce_module' })
+    foreach ($item in $gameItems) {
+        $link = Join-Path $app0 $item.Name
+        if ((Test-Path -LiteralPath $link) -and -not (@((Get-Item -LiteralPath $link -Force).Target) -contains $item.FullName)) {
+            throw "$link already exists and is not a link to $($item.FullName); move it away and run the script again"
+        }
+        if (-not $item.PSIsContainer -and [IO.Path]::GetPathRoot($item.FullName) -ne [IO.Path]::GetPathRoot($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output))) {
+            throw "$($item.FullName) is on another volume than $Output; a hard link needs both on the same one"
+        }
+    }
+}
+$flags = @('--windows', '--registry', '--trace-imports', '--frame-red-zone', '--frame-shrink-wrapped', '--precise-red-zone-guard',
+    '--frame-pointer-allocation', '--frame-pointer-stub-jumps', '--precise-red-zone-kills', '--frame-exit-branches')
+if ($Patches) { $flags += '--patches', $Patches }
+Run 'convert the executable' { & (Join-Path $Build 'core\relinker\relinker.exe') @flags $Eboot $exe }
+if ($gameItems) { New-Item -ItemType Directory -Force $app0 | Out-Null }
+foreach ($item in $gameItems) {
+    $link = Join-Path $app0 $item.Name
+    if (Test-Path -LiteralPath $link) { continue }
+    if ($item.PSIsContainer) { Run "link app0\$($item.Name)" { cmd /c "mklink /J `"$link`" `"$($item.FullName)`"" } }
+    else { Run "link app0\$($item.Name)" { cmd /c "mklink /H `"$link`" `"$($item.FullName)`"" } }
+}
+Run 'red-zone tables of the host libraries' { & $python (Join-Path $root 'tools\host_red_zone_table.py') --libs $outLibs --objdump (Get-Command objdump).Source }
+if (Test-Path (Join-Path $outLibs 'libc.prx.redzone.txt')) { throw 'libc.prx got a red-zone table: a Kyty write fault inside its memcpy would end the title' }
+$ini = Join-Path $Output 'g5.ini'
+if (-not (Test-Path $ini)) {
+    Set-Content -Encoding ascii $ini @(
+        '[g5]',
+        'APS5_MIMALLOC=1',
+        'APS5_KYTY_GPU=1',
+        'APS5_RED_ZONE_GUARD=1',
+        'APS5_RED_ZONE_GUARD_BY_FRAME=1',
+        'KYTY_HYB_CLAMP_DONATED=1',
+        'DISABLE_RTSS_LAYER=1',
+        'DISABLE_VULKAN_OBS_CAPTURE=1',
+        'APS5_LOG_FILE=g5-last.log')
+}
+if ($GameDir) { Write-Host "Ready: $exe" } else { Write-Host "Ready: $exe. Put the title's files in $app0, or run again with -GameDir (see docs/user/USAGE.md)." }
