@@ -38,6 +38,8 @@ constexpr std::uint32_t FullIdleTimeoutMs = 1000;
 constexpr std::uint32_t GfxIdleTimeoutMs = 4000;
 
 thread_local std::uint64_t t_callOrdinal = 0;
+thread_local std::uint64_t t_callCapture = 0;
+std::atomic<std::uint64_t> g_capture{1};
 thread_local bool t_setFlip = false;
 constexpr const char* SetFlipNid = "YUeqkyT7mEQ";
 constexpr const char* SubmitFlipNid = "U46NwOiJpys";
@@ -77,10 +79,18 @@ bool IsSubmit(const char* nid) {
 }
 
 struct GuestClockPause {
-    GuestClockPause() { KernelGuestClockPause_nid_no_patch(true); }
-    ~GuestClockPause() { KernelGuestClockPause_nid_no_patch(false); }
+    GuestClockPause(double& totalMs, std::uint64_t& count) : totalMs(totalMs), began(std::chrono::steady_clock::now()) {
+        ++count;
+        KernelGuestClockPause_nid_no_patch(true);
+    }
+    ~GuestClockPause() {
+        KernelGuestClockPause_nid_no_patch(false);
+        totalMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+    }
     GuestClockPause(const GuestClockPause&) = delete;
     GuestClockPause& operator=(const GuestClockPause&) = delete;
+    double& totalMs;
+    std::chrono::steady_clock::time_point began;
 };
 
 class Recorder {
@@ -150,7 +160,7 @@ public:
                 starting = true;
                 startingSeen = startingPassed = 0;
                 lock.unlock();
-                const GuestClockPause paused;
+                const GuestClockPause paused(clockPausedMs, clockPauses);
                 step("waiting for the GPU to go quiet");
                 std::uint32_t blocked = 0;
                 const bool full = waitQuietFor != nullptr ? waitQuietFor(FullIdleTimeoutMs, &blocked) : waitIdleFor != nullptr ? waitIdleFor(FullIdleTimeoutMs) : (waitIdle(), true);
@@ -214,7 +224,7 @@ public:
 private:
     enum class State { Waiting, Recording, Done };
 
-    Recorder(std::filesystem::path directory, std::filesystem::path trigger, std::uint64_t frames) : directory(std::move(directory)), trigger(std::move(trigger)), frames(frames), origin(std::chrono::steady_clock::now()) {
+    Recorder(std::filesystem::path directory, std::filesystem::path trigger, std::uint64_t frames) : directory(directory), baseDirectory(directory.has_filename() ? std::move(directory) : directory.parent_path()), trigger(std::move(trigger)), frames(frames), origin(std::chrono::steady_clock::now()) {
         const char* path = std::getenv("APS5_KYTY_GPU_DLL");
         const auto dll = GetModuleHandleA(std::filesystem::path(path != nullptr ? path : "kyty_gpu.dll").filename().string().c_str());
         flipCount = reinterpret_cast<std::uint64_t (*)()>(reinterpret_cast<void*>(GetProcAddress(dll, "kyty_gpu_flip_count")));
@@ -320,7 +330,7 @@ private:
     }
 
     void emitDelta() {
-        const GuestClockPause paused;
+        const GuestClockPause paused(clockPausedMs, clockPauses);
         ++deltaGroup;
         writtenPages = 0;
         std::vector<std::byte> bytes;
@@ -401,6 +411,7 @@ private:
         call.ordinal = ++ordinal;
         writer->WriteCall(call);
         t_callOrdinal = call.ordinal;
+        t_callCapture = g_capture.load(std::memory_order_relaxed);
         recordObject(call.ordinal, registers.integers[0]);
         ++recordedCalls;
     }
@@ -435,8 +446,25 @@ private:
         writer->Finish(json);
         std::fprintf(stderr, "[kyty-capture] %llu frames, %llu guest calls, %llu guest callbacks, %.1f MiB of deltas, stored in %s\n", static_cast<unsigned long long>(recordedFrames), static_cast<unsigned long long>(recordedCalls), static_cast<unsigned long long>(recordedCallbacks), static_cast<double>(deltaBytes) / (1024.0 * 1024.0), directory.string().c_str());
         if (submits != 0) std::fprintf(stderr, "[kyty-capture] %llu submit deltas: %.2f ms mean, %.2f ms max\n", static_cast<unsigned long long>(submits), submitMs / static_cast<double>(submits), submitMaxMs);
+        std::fprintf(stderr, "[kyty-capture] guest clock held for %.1f ms over %llu pauses\n", clockPausedMs, static_cast<unsigned long long>(clockPauses));
         writer.reset();
-        state = State::Done;
+        if (trigger != "F9") {
+            state = State::Done;
+            return;
+        }
+        if (takeHotkey != nullptr) takeHotkey();
+        g_capture.fetch_add(1, std::memory_order_relaxed);
+        directory = baseDirectory.string() + "-" + std::to_string(++captureCount);
+        recordedFrames = recordedCalls = recordedCallbacks = submits = writableBytes = donatedBytes = ordinal = deltaGroup = snapshotBytes = deltaBytes = clockPauses = 0;
+        submitMs = submitMaxMs = clockPausedMs = 0;
+        writtenPages = 0;
+        idleRule = "full idle";
+        runningQueues.clear();
+        ranges.clear();
+        pageHashes.clear();
+        pending = false;
+        state = State::Waiting;
+        step(("waiting for F9 again: the next capture goes to " + directory.string()).c_str());
     }
 
     static bool stillReadable(const Range& range) {
@@ -474,6 +502,10 @@ private:
     static inline std::atomic<bool> abandoned{false};
     std::mutex mutex;
     std::filesystem::path directory;
+    std::filesystem::path baseDirectory;
+    std::uint64_t captureCount = 1;
+    double clockPausedMs = 0;
+    std::uint64_t clockPauses = 0;
     std::filesystem::path trigger;
     std::uint64_t frames = 3;
     std::uint64_t atFlip = 0;
@@ -530,7 +562,7 @@ extern "C" void AgcDriverKytyCaptureCall_nid_no_patch(const char* nid, const Kyt
 }
 
 extern "C" std::uint64_t AgcDriverKytyCaptureCallbackTrigger_nid_no_patch() {
-    return t_callOrdinal;
+    return t_callCapture == g_capture.load(std::memory_order_relaxed) ? t_callOrdinal : 0;
 }
 
 extern "C" void AgcDriverKytyCaptureCallback_nid_no_patch(std::uint64_t function, std::uint64_t first, std::uint64_t second, std::uint64_t third, std::uint64_t result, std::uint64_t trigger) {
