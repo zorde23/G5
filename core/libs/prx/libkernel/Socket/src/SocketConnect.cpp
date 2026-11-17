@@ -3,6 +3,9 @@
 #include <ws2tcpip.h>
 #include <mstcpip.h>
 #include <iphlpapi.h>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 namespace {
@@ -34,6 +37,80 @@ bool ListenerOnPort(ULONG family, u_short port) {
     return false;
 }
 
+bool OffHost(const sockaddr* address) {
+    if (address == nullptr || (address->sa_family != AF_INET && address->sa_family != AF_INET6) || IsLoopback(address)) return false;
+    if (address->sa_family == AF_INET6) {
+        const auto& ip = reinterpret_cast<const sockaddr_in6*>(address)->sin6_addr;
+        if (IN6_IS_ADDR_V4MAPPED(&ip) && ip.s6_addr[12] == 127) return false;
+    }
+    return true;
+}
+
+void NoteLocalOnlyOnce(std::atomic<bool>& noted, const char* what) {
+    if (!noted.exchange(true, std::memory_order_relaxed)) std::fprintf(stderr, "[net] APS5_NET_LOCAL_ONLY: %s\n", what);
+}
+
+}
+
+extern "C" bool NetLocalOnly_nid_no_patch() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_NET_LOCAL_ONLY");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+extern "C" bool KeepBindLocal_nid_no_patch(sockaddr* address) {
+    if (!NetLocalOnly_nid_no_patch() || !OffHost(address)) return false;
+    if (address->sa_family == AF_INET) {
+        reinterpret_cast<sockaddr_in*>(address)->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    } else {
+        auto& ip = reinterpret_cast<sockaddr_in6*>(address)->sin6_addr;
+        const bool mapped = IN6_IS_ADDR_V4MAPPED(&ip);
+        ip = in6addr_loopback;
+        if (mapped) {
+            ip = in6_addr{};
+            ip.s6_addr[10] = 0xff;
+            ip.s6_addr[11] = 0xff;
+            ip.s6_addr[12] = 127;
+            ip.s6_addr[15] = 1;
+        }
+        reinterpret_cast<sockaddr_in6*>(address)->sin6_scope_id = 0;
+    }
+    static std::atomic<bool> noted{false};
+    NoteLocalOnlyOnce(noted, "binds beyond the loopback interface are kept on it");
+    return true;
+}
+
+extern "C" bool RefuseOffHost_nid_no_patch(const sockaddr* address) {
+    if (!NetLocalOnly_nid_no_patch() || !OffHost(address)) return false;
+    static std::atomic<bool> noted{false};
+    NoteLocalOnlyOnce(noted, "connects and sends beyond the loopback interface fail as unreachable");
+    return true;
+}
+
+extern "C" bool RefuseHostLookup_nid_no_patch() {
+    if (!NetLocalOnly_nid_no_patch()) return false;
+    static std::atomic<bool> noted{false};
+    NoteLocalOnlyOnce(noted, "host name lookups fail as if no DNS server answered");
+    return true;
+}
+
+extern "C" bool NoteOffHostSocket_nid_no_patch(const char* call, const sockaddr* address) {
+    if (!OffHost(address)) return false;
+    static std::atomic<const char*> calls[32]{};
+    static std::atomic<unsigned> lines[32]{};
+    std::size_t slot = 0;
+    for (const char* expected = nullptr; slot < 32; ++slot, expected = nullptr) {
+        if (calls[slot].compare_exchange_strong(expected, call) || expected == call) break;
+    }
+    if (slot == 32 || lines[slot].fetch_add(1, std::memory_order_relaxed) >= 8) return true;
+    char text[INET6_ADDRSTRLEN] = "?";
+    const void* ip = address->sa_family == AF_INET ? static_cast<const void*>(&reinterpret_cast<const sockaddr_in*>(address)->sin_addr)
+                                                   : static_cast<const void*>(&reinterpret_cast<const sockaddr_in6*>(address)->sin6_addr);
+    inet_ntop(address->sa_family, ip, text, sizeof(text));
+    std::fprintf(stderr, "[net] %s %s port %u leaves the loopback interface\n", call, text, static_cast<unsigned>(ntohs(Port(address))));
+    return true;
 }
 
 extern "C" void RefuseClosedLoopbackAtOnce_nid_no_patch(SOCKET socket, const sockaddr* address) {

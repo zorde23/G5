@@ -93,7 +93,39 @@ static_assert(sizeof(NetDns6Info) == 32);
 
 static_assert(sizeof(NetIpv6InterfaceAddress) == 20);
 
+#ifdef _WIN32
+extern "C" bool NoteOffHostSocket_nid_no_patch(const char* call, const sockaddr* address);
+extern "C" bool KeepBindLocal_nid_no_patch(sockaddr* address);
+extern "C" bool RefuseOffHost_nid_no_patch(const sockaddr* address);
+extern "C" bool RefuseHostLookup_nid_no_patch();
+#endif
+
 namespace {
+void NoteOffHost(const char* call, const void* address) {
+#ifdef _WIN32
+    NoteOffHostSocket_nid_no_patch(call, static_cast<const sockaddr*>(address));
+#else
+    (void)call;
+    (void)address;
+#endif
+}
+bool KeepLocal(void* address) {
+#ifdef _WIN32
+    return KeepBindLocal_nid_no_patch(static_cast<sockaddr*>(address));
+#else
+    (void)address;
+    return false;
+#endif
+}
+bool RefusesOffHost(const void* address) {
+#ifdef _WIN32
+    return RefuseOffHost_nid_no_patch(static_cast<const sockaddr*>(address));
+#else
+    (void)address;
+    return false;
+#endif
+}
+
 // FreeBSD errno numbers as reported through sceNetErrnoLoc (SCE_NET_ERROR_* is 0x80410100 + errno).
 constexpr int NET_ENOENT = 2;
 constexpr int NET_EINTR = 4;
@@ -1023,6 +1055,8 @@ int APS5_VABI sceNetBind_nid_postfix(int s, const void* addr, uint32_t addrlen) 
     NativeLength native_length = 0;
     if (!guest_to_native_address(addr, addrlen, native, native_length)) return fail(NET_EINVAL);
     if (native.ss_family != (socket.family == NET_AF_INET ? AF_INET : AF_INET6)) return fail(NET_EAFNOSUPPORT);
+    NoteOffHost("sceNetBind", &native);
+    KeepLocal(&native);
     if (::bind(socket.native->value, reinterpret_cast<const sockaddr*>(&native), native_length) != 0)
         return fail(native_error());
     std::lock_guard lk(g_mutex);
@@ -1042,6 +1076,9 @@ int APS5_VABI sceNetListen(int s, int backlog) {
     }
     if (socket.type != NET_SOCK_STREAM) return fail(NET_EOPNOTSUPP);
     if (::listen(socket.native->value, backlog) != 0) return fail(native_error());
+    sockaddr_storage local{};
+    NativeLength local_length = sizeof(local);
+    if (::getsockname(socket.native->value, reinterpret_cast<sockaddr*>(&local), &local_length) == 0) NoteOffHost("sceNetListen", &local);
     std::lock_guard lk(g_mutex);
     auto it = g_socks.find(s);
     if (it != g_socks.end()) {
@@ -1135,6 +1172,8 @@ static int disconnect_datagram(const Sock& socket) {
     sockaddr_storage wildcard{};
     wildcard.ss_family = local.ss_family;
     native_port(wildcard) = native_port(local);
+    NoteOffHost("sceNetBind after a datagram disconnect", &wildcard);
+    KeepLocal(&wildcard);
     if (::bind(value, reinterpret_cast<const sockaddr*>(&wildcard), local_length) != 0) return fail(native_error());
     return 0;
 }
@@ -1168,6 +1207,8 @@ int APS5_VABI sceNetConnect(int s, const void* addr, uint32_t addrlen) {
         const auto current = g_socks.find(s);
         if (current != g_socks.end() && current->second.native == socket.native) current->second.connectAttempted = true;
     }
+    NoteOffHost("sceNetConnect", &native);
+    if (RefusesOffHost(&native)) return fail(NET_ENETUNREACH);
     if (::connect(socket.native->value, reinterpret_cast<const sockaddr*>(&native), native_length) == 0) {
 #if defined(_WIN32) || defined(__APPLE__)
         note_local_address(s, socket);
@@ -1326,6 +1367,15 @@ int64_t APS5_VABI sceNetSendto(int s, const void* buf, size_t len, int flags, co
         NativeLength destination_length = 0;
         if (!guest_to_native_address(to, tolen, destination, destination_length)) return fail(NET_EINVAL);
         if (destination.ss_family != (socket.family == NET_AF_INET ? AF_INET : AF_INET6)) return fail(NET_EAFNOSUPPORT);
+        if (RefusesOffHost(&destination)) return fail(NET_ENETUNREACH);
+        if (!socket.bound && socket.type == NET_SOCK_DGRAM) {
+            sockaddr_storage wildcard{};
+            wildcard.ss_family = destination.ss_family;
+            NoteOffHost("sceNetSendto on an unbound socket", &wildcard);
+            if (KeepLocal(&wildcard)) {
+                ::bind(socket.native->value, reinterpret_cast<const sockaddr*>(&wildcard), wildcard.ss_family == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6));
+            }
+        }
 #ifdef __APPLE__
         result = send_stream_in_chunks(*socket.native, flags, static_cast<const char*>(buf), len, [&](const char* data, std::size_t size) {
             return ::sendto(socket.native->value, data, size, NATIVE_SEND_FLAGS | native_message_flags(flags),
@@ -2264,6 +2314,12 @@ int lookup_host(int rid, const char* hostname, const char* func, int family, std
     if (!initialize_sockets()) return fail(5);
     std::uint64_t generation = 0;
     if (const int error = begin_lookup(rid, &Resolver::abort_ntoa, generation)) return error;
+#ifdef _WIN32
+    if (RefuseHostLookup_nid_no_patch()) {
+        set_errno(NET_ENOENT);
+        return end_lookup(rid, generation, NET_ERROR_RESOLVER_ENODNS);
+    }
+#endif
     if (const auto lookup = g_resolverLookupForTests.load()) {
         if (!lookup(hostname, family, addresses) || addresses.empty()) {
             set_errno(NET_ENOENT);

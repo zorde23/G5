@@ -47,6 +47,7 @@
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
 #include "prx/libkernel/Socket/include/SocketConnect.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cstdint>
@@ -63,6 +64,30 @@
 #include <vector>
 
 namespace {
+void NoteOffHost(const char* call, const void* address) {
+#ifdef _WIN32
+    NoteOffHostSocket_nid_no_patch(call, static_cast<const sockaddr*>(address));
+#else
+    (void)call;
+    (void)address;
+#endif
+}
+bool KeepLocal(void* address) {
+#ifdef _WIN32
+    return KeepBindLocal_nid_no_patch(static_cast<sockaddr*>(address));
+#else
+    (void)address;
+    return false;
+#endif
+}
+bool RefusesOffHost(const void* address) {
+#ifdef _WIN32
+    return RefuseOffHost_nid_no_patch(static_cast<const sockaddr*>(address));
+#else
+    (void)address;
+    return false;
+#endif
+}
 #ifdef _WIN32
 using NativeSocket = SOCKET;
 constexpr auto Invalid = INVALID_SOCKET;
@@ -125,6 +150,7 @@ struct Socket : KernelSocketPoll::NativeOwner {
     GuestSockets::SocketOptionState options;
     bool receiveShut = false;
     bool sendShut = false;
+    std::atomic<bool> sendBindChecked{false};
     std::uint32_t inode = 0;
     std::weak_ptr<Socket> peer;
     Socket(NativeSocket value, int family, int type) : value(value), family(family), type(type) {}
@@ -364,6 +390,8 @@ int Disconnect(const Socket& socket) {
     sockaddr_storage wildcard{};
     wildcard.ss_family = local.ss_family;
     PortOf(wildcard) = PortOf(local);
+    NoteOffHost("bind after a datagram disconnect", &wildcard);
+    KeepLocal(&wildcard);
     if (::bind(socket.value, reinterpret_cast<sockaddr*>(&wildcard), localSize) != 0) return Fail(NativeError());
     return 0;
 }
@@ -1321,13 +1349,20 @@ int APS5_VABI connect_nid_postfix(int descriptor, const void* address, std::uint
         std::lock_guard lock(socket->modeMutex);
         socket->options.reportedError = 0;
     }
+    NoteOffHost("connect", &native);
+    if (RefusesOffHost(&native)) return Fail(51);
     return ::connect(socket->value, reinterpret_cast<sockaddr*>(&native), size) ? Fail(ConnectError()) : 0;
 }
 int APS5_VABI listen_nid_postfix(int descriptor, int backlog) {
     const auto socket = Lookup(descriptor);
     if (!socket) return -1;
     if (socket->type != 1) return Fail(45);
-    if (::listen(socket->value, backlog) == 0) return 0;
+    if (::listen(socket->value, backlog) == 0) {
+        sockaddr_storage local{};
+        socklen_t localSize = sizeof(local);
+        if (::getsockname(socket->value, reinterpret_cast<sockaddr*>(&local), &localSize) == 0) NoteOffHost("listen", &local);
+        return 0;
+    }
     const int error = NativeError();
     return Fail(error == 56 ? 22 : error);
 }
@@ -1409,6 +1444,8 @@ int APS5_VABI bind_nid_postfix(int descriptor, const void* address, std::uint32_
     const int mapped = LongMappedDualStack(*socket, address, length);
     if (mapped < 0) return -1;
     if (!Address(socket->family, address, mapped ? 28 : length, native, size)) return -1;
+    NoteOffHost("bind", &native);
+    KeepLocal(&native);
     return ::bind(socket->value, reinterpret_cast<sockaddr*>(&native), size) ? Fail(NativeError()) : 0;
 }
 namespace {
@@ -1526,7 +1563,20 @@ std::int64_t APS5_VABI sendto_nid_postfix(int descriptor, const void* buffer, st
         sockaddr_storage native{};
         socklen_t size;
         if (!Address(socket->family, address, addressLength, native, size)) return -1;
+        if (RefusesOffHost(&native)) return Fail(51);
         if (const auto answered = ZeroPortSend(*socket, native, length); answered != NotAnswered) return answered;
+        if (!socket->sendBindChecked.exchange(true, std::memory_order_relaxed)) {
+            sockaddr_storage local{};
+            socklen_t localSize = sizeof(local);
+            if (::getsockname(socket->value, reinterpret_cast<sockaddr*>(&local), &localSize) != 0 || PortOf(local) == 0) {
+                sockaddr_storage wildcard{};
+                wildcard.ss_family = native.ss_family;
+                NoteOffHost("sendto on an unbound socket", &wildcard);
+                if (KeepLocal(&wildcard)) {
+                    ::bind(socket->value, reinterpret_cast<sockaddr*>(&wildcard), wildcard.ss_family == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6));
+                }
+            }
+        }
         result = static_cast<int>(::sendto(socket->value, static_cast<const char*>(buffer), static_cast<int>(length), SocketSendFlags(*socket, flags),
             reinterpret_cast<sockaddr*>(&native), size));
     }
