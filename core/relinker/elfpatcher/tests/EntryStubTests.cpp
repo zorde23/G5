@@ -105,12 +105,17 @@ void windowsStubLoadsTheAllocatorOnRequest(const std::string& runPath, const std
 void windowsStubSetsTheIniSectionFirst() {
     const auto nativeImports = Elfpatcher::Windows::WindowsImportBuilder().Build(0x1000);
     const auto stub = windowsStub(nativeImports, "$ORIGIN/libs", {"libc.prx"});
-    const auto file = ripReference(stub.Code, {0x48, 0x8d, 0x35}, wideStringRva(stub.Data, u"g5.ini"));
-    const auto section = ripReference(stub.Code, {0x48, 0x8d, 0x0d}, wideStringRva(stub.Data, u"g5"));
+    const auto hybridFile = ripReference(stub.Code, {0x48, 0x8d, 0x35}, wideStringRva(stub.Data, u"ps5-hybrid.ini"));
+    const auto hybridSection = ripReference(stub.Code, {0x48, 0x8d, 0x0d}, wideStringRva(stub.Data, u"hybrid"));
     const auto profile = ripReference(stub.Code, {0xff, 0x15}, nativeImports.Functions.at("GetPrivateProfileSectionW"));
+    require(hybridFile != std::string::npos && hybridSection != std::string::npos && profile != std::string::npos, "the stub does not read the [hybrid] section of ps5-hybrid.ini beside the executable");
+    require(hybridFile < hybridSection && hybridSection < profile, "the stub does not read ps5-hybrid.ini first");
+    const auto file = ripReference(stub.Code, {0x48, 0x8d, 0x35}, wideStringRva(stub.Data, u"g5.ini"), profile);
+    const auto section = ripReference(stub.Code, {0x48, 0x8d, 0x0d}, wideStringRva(stub.Data, u"g5"), profile);
+    const auto legacyProfile = ripReference(stub.Code, {0xff, 0x15}, nativeImports.Functions.at("GetPrivateProfileSectionW"), profile + 6);
     const auto read = ripReference(stub.Code, {0x48, 0x8d, 0x0d}, wideStringRva(stub.Data, u"APS5_MIMALLOC"));
-    require(file != std::string::npos && section != std::string::npos && profile != std::string::npos, "the stub does not read the [g5] section of g5.ini beside the executable");
-    require(file < section && section < profile && profile < read, "the stub does not read g5.ini before APS5_MIMALLOC");
+    require(file != std::string::npos && section != std::string::npos && legacyProfile != std::string::npos, "the stub does not read the [g5] section of g5.ini after ps5-hybrid.ini");
+    require(file < section && section < legacyProfile && legacyProfile < read, "the stub does not read both files before APS5_MIMALLOC");
     const auto check = ripReference(stub.Code, {0xff, 0x15}, nativeImports.Functions.at("GetEnvironmentVariableW"), profile);
     const auto set = ripReference(stub.Code, {0xff, 0x15}, nativeImports.Functions.at("SetEnvironmentVariableW"), profile);
     require(check != std::string::npos && set != std::string::npos && check < set && set < read, "the stub does not set a g5.ini key only when the environment lacks it");

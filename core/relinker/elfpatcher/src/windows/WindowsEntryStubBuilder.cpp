@@ -11,6 +11,7 @@
 #include <set>
 #include <optional>
 #include <filesystem>
+#include <utility>
 
 namespace Elfpatcher::Windows {
 
@@ -101,9 +102,14 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
 
     const auto parentVariable = addWideString(u"ANYPS5_LOADEXEC_PARENT");
     const auto allocatorVariable = addWideString(u"APS5_MIMALLOC");
-    const std::u16string iniFileName = u"g5.ini";
-    const auto iniName = addWideString(iniFileName);
-    const auto iniSection = addWideString(u"g5");
+    struct IniFile {
+        std::size_t units;
+        std::uint32_t name;
+        std::uint32_t section;
+    };
+    std::vector<IniFile> iniFiles;
+    for (const auto& [file, section] : {std::pair<std::u16string, std::u16string>{u"ps5-hybrid.ini", u"hybrid"}, {u"g5.ini", u"g5"}})
+        iniFiles.push_back({file.size() + 1, addWideString(file), addWideString(section)});
     constexpr std::uint32_t IniSectionUnits = 8192;
     const auto iniEntries = reserve(IniSectionUnits * 2);
     const auto parentText = reserve(34);
@@ -571,56 +577,60 @@ WindowsEntryStub WindowsEntryStubBuilder::Build(const std::uint32_t dataRva, con
         writeUtf8(programText);
     }
 
-    const auto iniUnits = CheckedRva(iniFileName.size() + 1);
-    code.Emit({0x4c, 0x89, 0xe0, 0x48, 0x29, 0xd8, 0x48, 0x05});
-    code.U32(iniUnits * 2);
-    code.Emit({0x48, 0x3d});
-    code.U32(PathCapacity * 2);
-    const auto iniTooLong = code.Branch({0x0f, 0x87});
-    code.Emit({0x4c, 0x89, 0xe7});
-    code.Rip({0x48, 0x8d, 0x35}, iniName);
-    code.Emit({0xb9});
-    code.U32(iniUnits);
-    code.Emit({0x66, 0xf3, 0xa5});
-    code.Rip({0x48, 0x8d, 0x0d}, iniSection);
-    code.Rip({0x48, 0x8d, 0x15}, iniEntries);
-    code.Emit({0x41, 0xb8});
-    code.U32(IniSectionUnits);
-    code.Rip({0x4c, 0x8d, 0x0d}, modulePath);
-    call("GetPrivateProfileSectionW");
-    code.Emit({0x66, 0x41, 0xc7, 0x04, 0x24, 0x00, 0x00});
-    code.Rip({0x48, 0x8d, 0x35}, iniEntries);
-    const auto iniEntry = code.GetRva();
-    code.Emit({0x66, 0x83, 0x3e, 0x00});
-    const auto iniEnd = code.Branch({0x0f, 0x84});
-    code.Emit({0x48, 0x89, 0xf7});
-    const auto iniKey = code.GetRva();
-    code.Emit({0x0f, 0xb7, 0x07, 0x85, 0xc0});
-    const auto iniNoValue = code.Branch({0x0f, 0x84});
-    code.Emit({0x83, 0xf8, 0x3d});
-    const auto iniEquals = code.Branch({0x0f, 0x84});
-    code.Emit({0x48, 0x83, 0xc7, 0x02});
-    code.Rip({0xe9}, iniKey);
-    code.PatchBranch(iniEquals, code.GetRva());
-    code.Emit({0x66, 0xc7, 0x07, 0x00, 0x00, 0x48, 0x83, 0xc7, 0x02});
-    code.Emit({0x48, 0x89, 0xf1, 0x31, 0xd2, 0x45, 0x31, 0xc0});
-    call("GetEnvironmentVariableW");
-    code.Emit({0x85, 0xc0});
-    const auto iniPresent = code.Branch({0x0f, 0x85});
-    code.Emit({0x48, 0x89, 0xf1, 0x48, 0x89, 0xfa});
-    call("SetEnvironmentVariableW");
-    code.PatchBranch(iniPresent, code.GetRva());
-    const auto iniValueEnd = code.GetRva();
-    code.Emit({0x66, 0x83, 0x3f, 0x00});
-    const auto iniNext = code.Branch({0x0f, 0x84});
-    code.Emit({0x48, 0x83, 0xc7, 0x02});
-    code.Rip({0xe9}, iniValueEnd);
-    code.PatchBranch(iniNext, code.GetRva());
-    code.PatchBranch(iniNoValue, code.GetRva());
-    code.Emit({0x48, 0x8d, 0x77, 0x02});
-    code.Rip({0xe9}, iniEntry);
-    code.PatchBranch(iniEnd, code.GetRva());
-    code.PatchBranch(iniTooLong, code.GetRva());
+    for (const auto& ini : iniFiles) {
+        const auto iniUnits = CheckedRva(ini.units);
+        code.Emit({0x4c, 0x89, 0xe0, 0x48, 0x29, 0xd8, 0x48, 0x05});
+        code.U32(iniUnits * 2);
+        code.Emit({0x48, 0x3d});
+        code.U32(PathCapacity * 2);
+        const auto iniTooLong = code.Branch({0x0f, 0x87});
+        code.Emit({0x4c, 0x89, 0xe7});
+        code.Rip({0x48, 0x8d, 0x35}, ini.name);
+        code.Emit({0xb9});
+        code.U32(iniUnits);
+        code.Emit({0x66, 0xf3, 0xa5});
+        code.Rip({0x48, 0x8d, 0x05}, iniEntries);
+        code.Emit({0x66, 0xc7, 0x00, 0x00, 0x00});
+        code.Rip({0x48, 0x8d, 0x0d}, ini.section);
+        code.Rip({0x48, 0x8d, 0x15}, iniEntries);
+        code.Emit({0x41, 0xb8});
+        code.U32(IniSectionUnits);
+        code.Rip({0x4c, 0x8d, 0x0d}, modulePath);
+        call("GetPrivateProfileSectionW");
+        code.Emit({0x66, 0x41, 0xc7, 0x04, 0x24, 0x00, 0x00});
+        code.Rip({0x48, 0x8d, 0x35}, iniEntries);
+        const auto iniEntry = code.GetRva();
+        code.Emit({0x66, 0x83, 0x3e, 0x00});
+        const auto iniEnd = code.Branch({0x0f, 0x84});
+        code.Emit({0x48, 0x89, 0xf7});
+        const auto iniKey = code.GetRva();
+        code.Emit({0x0f, 0xb7, 0x07, 0x85, 0xc0});
+        const auto iniNoValue = code.Branch({0x0f, 0x84});
+        code.Emit({0x83, 0xf8, 0x3d});
+        const auto iniEquals = code.Branch({0x0f, 0x84});
+        code.Emit({0x48, 0x83, 0xc7, 0x02});
+        code.Rip({0xe9}, iniKey);
+        code.PatchBranch(iniEquals, code.GetRva());
+        code.Emit({0x66, 0xc7, 0x07, 0x00, 0x00, 0x48, 0x83, 0xc7, 0x02});
+        code.Emit({0x48, 0x89, 0xf1, 0x31, 0xd2, 0x45, 0x31, 0xc0});
+        call("GetEnvironmentVariableW");
+        code.Emit({0x85, 0xc0});
+        const auto iniPresent = code.Branch({0x0f, 0x85});
+        code.Emit({0x48, 0x89, 0xf1, 0x48, 0x89, 0xfa});
+        call("SetEnvironmentVariableW");
+        code.PatchBranch(iniPresent, code.GetRva());
+        const auto iniValueEnd = code.GetRva();
+        code.Emit({0x66, 0x83, 0x3f, 0x00});
+        const auto iniNext = code.Branch({0x0f, 0x84});
+        code.Emit({0x48, 0x83, 0xc7, 0x02});
+        code.Rip({0xe9}, iniValueEnd);
+        code.PatchBranch(iniNext, code.GetRva());
+        code.PatchBranch(iniNoValue, code.GetRva());
+        code.Emit({0x48, 0x8d, 0x77, 0x02});
+        code.Rip({0xe9}, iniEntry);
+        code.PatchBranch(iniEnd, code.GetRva());
+        code.PatchBranch(iniTooLong, code.GetRva());
+    }
 
     code.Rip({0x48, 0x8d, 0x0d}, allocatorVariable);
     code.Emit({0x31, 0xd2, 0x45, 0x31, 0xc0});

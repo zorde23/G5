@@ -1,7 +1,8 @@
 param(
     [string]$Eboot = '',
     [string]$Output = '',
-    [string]$Name = 'g5',
+    [string]$Name = 'eboot',
+    [Alias('Profile')] [string]$ProfileName = 'base',
     [string]$Patches = '',
     [string]$GameDir = '',
     [int]$Jobs = [Environment]::ProcessorCount,
@@ -51,6 +52,8 @@ $glslang = if ($env:VULKAN_SDK) { Join-Path $env:VULKAN_SDK 'Bin\glslangValidato
 if (-not $glslang -or -not (Test-Path $glslang)) { $missing += 'the Vulkan SDK (VULKAN_SDK must point at it; Kyty compiles its shaders with glslangValidator)' }
 if ($Eboot -and -not (Test-Path -LiteralPath $Eboot)) { $missing += "the executable given to -Eboot: $Eboot" }
 if ($Patches -and -not (Test-Path -LiteralPath $Patches)) { $missing += "the patch file $Patches" }
+$profileFile = if (Test-Path -LiteralPath $ProfileName -PathType Leaf) { $ProfileName } else { Join-Path $PSScriptRoot "hybrid-profiles\$ProfileName.ini" }
+if (-not (Test-Path -LiteralPath $profileFile -PathType Leaf)) { $missing += "the profile given to -Profile: $ProfileName" }
 if ($GameDir -and -not (Test-Path -LiteralPath $GameDir -PathType Container)) { $missing += "the title folder given to -GameDir: $GameDir" }
 if ($missing) {
     Write-Host 'Missing prerequisites:'
@@ -97,8 +100,15 @@ if ($GameDir) {
         }
     }
 }
-$flags = @('--windows', '--registry', '--trace-imports', '--frame-red-zone', '--frame-shrink-wrapped', '--precise-red-zone-guard',
-    '--frame-pointer-allocation', '--frame-pointer-stub-jumps', '--precise-red-zone-kills', '--frame-exit-branches')
+$profileLines = @{ relinker = @(); hybrid = @() }
+$profileSection = ''
+foreach ($line in Get-Content -LiteralPath $profileFile) {
+    $line = $line.Trim()
+    if ($line -match '^\[(.+)\]$') { $profileSection = $Matches[1]; continue }
+    if ($line -and -not $line.StartsWith(';') -and $profileLines.ContainsKey($profileSection)) { $profileLines[$profileSection] += $line }
+}
+$flags = @($profileLines.relinker)
+if (-not $flags) { throw "the profile $profileFile has no [relinker] flags" }
 if ($Patches) { $flags += '--patches', $Patches }
 Run 'convert the executable' { & (Join-Path $Build 'core\relinker\relinker.exe') @flags $Eboot $exe }
 if ($gameItems) { New-Item -ItemType Directory -Force $app0 | Out-Null }
@@ -110,17 +120,6 @@ foreach ($item in $gameItems) {
 }
 Run 'red-zone tables of the host libraries' { & $python (Join-Path $root 'tools\host_red_zone_table.py') --libs $outLibs --objdump (Get-Command objdump).Source }
 if (Test-Path (Join-Path $outLibs 'libc.prx.redzone.txt')) { throw 'libc.prx got a red-zone table: a Kyty write fault inside its memcpy would end the title' }
-$ini = Join-Path $Output 'g5.ini'
-if (-not (Test-Path $ini)) {
-    Set-Content -Encoding ascii $ini @(
-        '[g5]',
-        'APS5_MIMALLOC=1',
-        'APS5_KYTY_GPU=1',
-        'APS5_RED_ZONE_GUARD=1',
-        'APS5_RED_ZONE_GUARD_BY_FRAME=1',
-        'KYTY_HYB_CLAMP_DONATED=1',
-        'DISABLE_RTSS_LAYER=1',
-        'DISABLE_VULKAN_OBS_CAPTURE=1',
-        'APS5_LOG_FILE=g5-last.log')
-}
+$ini = Join-Path $Output 'ps5-hybrid.ini'
+if (-not (Test-Path $ini)) { Set-Content -Encoding ascii $ini (@('[hybrid]') + $profileLines.hybrid) }
 if ($GameDir) { Write-Host "Ready: $exe" } else { Write-Host "Ready: $exe. Put the title's files in $app0, or run again with -GameDir (see docs/user/USAGE.md)." }
