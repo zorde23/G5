@@ -75,6 +75,9 @@ static void RequireZeroTimeout() {
     Require(sceKernelSignalSema(sem, 1) == SCE_OK);
     Require(sceKernelPollSema(sem, 1) == SCE_OK);
 
+    timeout = 0;
+    Require(sceKernelWaitSema(sem, 4, &timeout) == SCE_KERNEL_ERROR_EINVAL && timeout == 0);
+
     Waiter blocked{sem, false};
     Pthread blockedThread = nullptr;
     Require(scePthreadCreate(&blockedThread, nullptr, Wait, &blocked, nullptr) == SCE_OK);
