@@ -89,7 +89,7 @@ foreach ($runtime in 'libgcc_s_seh-1.dll', 'libstdc++-6.dll', 'libwinpthread-1.d
 $kyty = Join-Path $root '3rdparty\kyty-gpu'
 $kytyPathMap = "/clang:-ffile-prefix-map=$kyty=. /clang:-ffile-prefix-map=$KytyBuild=build"
 $env:PATH = "$(Split-Path -Parent $glslang);$env:PATH"
-Run 'configure kyty_gpu.dll' { cmd /c "call `"$vsDevCmd`" -arch=x64 -host_arch=x64 >nul && cmake -S `"$kyty`" -B `"$KytyBuild`" -G Ninja -DCMAKE_BUILD_TYPE=Release -DKYTY_BUILD_LAUNCHER=OFF -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `"-DCMAKE_C_FLAGS_INIT=$kytyPathMap`" `"-DCMAKE_CXX_FLAGS_INIT=$kytyPathMap`"" }
+Run 'configure kyty_gpu.dll' { cmd /c "call `"$vsDevCmd`" -arch=x64 -host_arch=x64 >nul && cmake -S `"$kyty`" -B `"$KytyBuild`" -G Ninja -DCMAKE_BUILD_TYPE=Release -DKYTY_BUILD_LAUNCHER=OFF -DKYTY_NATIVE_V3=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `"-DCMAKE_C_FLAGS_INIT=$kytyPathMap`" `"-DCMAKE_CXX_FLAGS_INIT=$kytyPathMap`"" }
 Run 'build kyty_gpu.dll' { cmd /c "call `"$vsDevCmd`" -arch=x64 -host_arch=x64 >nul && cmake --build `"$KytyBuild`" --target kyty_gpu --parallel $Jobs" }
 $relinkerExe = Join-Path $Build 'core\relinker\relinker.exe'
 $kytyFiles = (Join-Path $KytyBuild 'kyty_gpu.dll'), (Join-Path $kyty '3rdparty\winpthread\bin\libwinpthread-1.dll')
