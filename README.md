@@ -1,7 +1,7 @@
 # G5
 
 A project that runs one PS5 title natively on Windows, built on the generic
-[ps5-hybrid](https://github.com/PS5-Hybrid/ps5-hybrid) base: the
+[ps5-hybrid](https://github.com/zorde23/ps5-hybrid) base: the
 [AnyPS5](https://github.com/boykopovar/AnyPS5) relinker, kernel and libraries, with Kyty's GPU
 ([kyty-gpu-hybrid](https://github.com/zorde23/kyty-gpu-hybrid), submodule `3rdparty/kyty-gpu`)
 as the graphics backend.
