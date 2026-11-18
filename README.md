@@ -22,15 +22,16 @@ downloaded or included here.
 
 ### 1. Install the tools (once)
 
-| Tool | Notes |
-|------|-------|
-| Windows 10 or 11, 64-bit, and a GPU with Vulkan | Tested on an AMD Radeon RX 6750 XT. |
-| [Git for Windows](https://git-scm.com/download/win) | The full install, with Git Bash. |
-| [CMake](https://cmake.org/download/) 3.22.1 or newer and [Ninja](https://github.com/ninja-build/ninja/releases) | If Visual Studio brings its own CMake, the script uses that one. |
-| [WinLibs GCC 15.2.0](https://github.com/brechtsanders/winlibs_mingw/releases/tag/15.2.0posix-14.0.0-ucrt-r7) | The `x86_64-ucrt-posix-seh` zip; extract it to e.g. `C:\tools\winlibs`. |
-| [Python 3](https://www.python.org/downloads/) | Not the Microsoft Store alias. |
-| [Visual Studio 2022 Build Tools](https://visualstudio.microsoft.com/downloads/) | Workload "Desktop development with C++", plus "C++ Clang tools for Windows" and a Windows SDK. |
-| [Vulkan SDK](https://vulkan.lunarg.com/sdk/home#windows) | The installer sets `VULKAN_SDK`; open a new terminal afterwards. |
+Windows 10 or 11 (64-bit) and a GPU with Vulkan (tested on an AMD Radeon RX 6750 XT), plus:
+
+1. [Git for Windows](https://git-scm.com/download/win).
+2. [WinLibs GCC 15.2.0](https://github.com/brechtsanders/winlibs_mingw/releases/tag/15.2.0posix-14.0.0-ucrt-r7), the `x86_64-ucrt-posix-seh` zip, extracted to e.g. `C:\tools\winlibs`. It already brings CMake and Ninja.
+3. [Python 3](https://www.python.org/downloads/).
+4. [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/) with "Desktop development with C++" and "C++ Clang tools for Windows".
+5. [Vulkan SDK](https://vulkan.lunarg.com/sdk/home#windows); open a new terminal after installing it.
+
+Two compilers are needed because the two halves build differently: GCC builds the relinker and
+libraries, clang-cl builds Kyty's GPU.
 
 ### 2. Get the source
 
