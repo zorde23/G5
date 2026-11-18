@@ -1,47 +1,37 @@
-**English** | [Português (Brasil)](docs/user/README.pt-BR.md) | [Español](docs/user/README.es.md) | [简体中文](docs/user/README.zh-CN.md) | [Русский](docs/user/README.ru.md)
+# G5
 
-# About
+A project that runs one PS5 title natively on Windows, built on the generic
+[ps5-hybrid](https://github.com/PS5-Hybrid/ps5-hybrid) base: the
+[AnyPS5](https://github.com/boykopovar/AnyPS5) relinker, kernel and libraries, with Kyty's GPU
+([kyty-gpu-hybrid](https://github.com/zorde23/kyty-gpu-hybrid), submodule `3rdparty/kyty-gpu`)
+as the graphics backend.
 
-Tool for automatic executables porting to Linux and Windows.
-
-The relinker-only build runs on macOS, including Apple silicon.
-
-[**Web converter**](https://boykopovar.github.io/AnyPS5/) - files stay on your device.
-
-![anyps5_collage1](https://github.com/user-attachments/assets/ed2f0b2d-33d3-46d7-ab88-767ca872fc99)
-
-Includes a [relinker](core/relinker) that converts executable to the target system's native format and implementations of [system prx libraries](core/libs/prx) suitable for dynamic linking. No emulation or separate runtime process.
-
-[**Discord**](https://discord.gg/BHFztBPUe), [Usage](docs/user/USAGE.md), [Build instructions](docs/dev/BUILD.md), [Architecture](docs/dev/ARCHITECTURE.md), [Technical debt of the project](docs/dev/TechnicalDebt.md), [code style conventions](docs/dev/CONVENTIONS.md), [contributing](CONTRIBUTING.md)
+This repository is the base plus what belongs to this title only: its profile,
+`tools/hybrid-profiles/g5.ini` (the base keys, the log in `g5-last.log` and Brazilian Portuguese
+as the console language). The title's files, saves, captures and patches are never part of it.
 
 ## Status
 
-[![libraries](https://boykopovar.github.io/AnyPS5/badge-libraries.svg)](https://boykopovar.github.io/AnyPS5/progress.html) [![shaders](https://boykopovar.github.io/AnyPS5/badge-shaders.svg)](https://boykopovar.github.io/AnyPS5/progress.html)
+- Reaches the open world and plays on an AMD Radeon RX 6750 XT (Windows 11); the target is a steady 60 fps.
+- Each push to `g5` passes the build, the unit tests, a menu smoke run and a frame-capture replay.
 
-[![progress map](https://boykopovar.github.io/AnyPS5/progress.svg)](https://boykopovar.github.io/AnyPS5/progress.html)
+## Build and run
 
-[Progress history](https://boykopovar.github.io/AnyPS5/history.html)
+```powershell
+git clone --recursive https://github.com/zorde23/G5
+powershell -ExecutionPolicy Bypass -File tools\build_hybrid.ps1 -Profile g5 -Eboot C:\dump\eboot.bin -GameDir C:\dump -Output C:\g5
+```
 
-<sub>* System libraries: percentage of the functions known to the project so far (declared in [core/libs/prx](core/libs/prx)), not of every PS5 system function. The total grows as more functions are declared.</sub>
+Then run `C:\g5\eboot.exe`. Requirements and every option:
+[Usage, "Kyty GPU hybrid build"](docs/user/USAGE.md#kyty-gpu-hybrid-build).
 
-Unsupported or unexpected states strictly throw `std::runtime_error`. `what()` is printed to stderr and the process terminates.
+## Branches
 
-The [shader recompiler](core/shader/recompiler/Recompiler.cpp) successfully produces SPIR-V (validated via [Spirv-Tools](3rdparty/SPIRV-Tools) when built with `ANYPS5_ENABLE_SPIRV_TOOLS`).
+- `g5` (default): this project.
+- `main`: a mirror of AnyPS5 upstream, kept for reference.
 
-## Compatibility
+## Credits, disclaimer and license
 
-Per-game status and test reports live in the [Game bring-up](https://github.com/boykopovar/AnyPS5/discussions/categories/game-bring-up) discussions, one thread per title.
-
-## Input mapping
-
-SDL-mapped game controllers are supported, including analog sticks and triggers. Keyboard and mouse controls can be configured with an `anyps5-input.ini` file. See [input mapping](docs/user/INPUT_MAPPING.md) for the supported devices and configuration format.
-
-## Disclaimer
-
-This project is intended for interoperability, research, preservation, and compatibility purposes. It does not include, distribute, or require copyrighted software, firmware, cryptographic keys, or proprietary libraries. Users are responsible for ensuring that any binaries used with this project are obtained and used in accordance with applicable laws and their respective license terms.
-
-AnyPS5 is an independent project and is not affiliated with, authorized or endorsed by Sony Interactive Entertainment. "PlayStation" and "PS5" are trademarks of Sony Interactive Entertainment Inc.
-
-## License
-
-This project is licensed under the GNU General Public License version 2 only.
+- boykopovar and the AnyPS5 contributors; InoriRus for Kyty; TheCruZ and the KytyPS5 contributors.
+- For interoperability, research, preservation and compatibility. It does not include, distribute or require copyrighted software, firmware, keys or proprietary libraries; users are responsible for obtaining and using any binaries lawfully. Not affiliated with, authorized or endorsed by Sony Interactive Entertainment. "PlayStation" and "PS5" are trademarks of Sony Interactive Entertainment Inc.
+- GNU General Public License version 2 only, as AnyPS5.
