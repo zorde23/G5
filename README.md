@@ -15,15 +15,76 @@ as the console language). The title's files, saves, captures and patches are nev
 - Reaches the open world and plays on an AMD Radeon RX 6750 XT (Windows 11); the target is a steady 60 fps.
 - Each push to `g5` passes the build, the unit tests, a menu smoke run and a frame-capture replay.
 
-## Build and run
+## Install
+
+You need your own copy of the title, dumped from your own console. Nothing from the title is
+downloaded or included here.
+
+### 1. Install the tools (once)
+
+| Tool | Notes |
+|------|-------|
+| Windows 10 or 11, 64-bit, and a GPU with Vulkan | Tested on an AMD Radeon RX 6750 XT. |
+| [Git for Windows](https://git-scm.com/download/win) | The full install, with Git Bash. |
+| [CMake](https://cmake.org/download/) 3.22.1 or newer and [Ninja](https://github.com/ninja-build/ninja/releases) | If Visual Studio brings its own CMake, the script uses that one. |
+| [WinLibs GCC 15.2.0](https://github.com/brechtsanders/winlibs_mingw/releases/tag/15.2.0posix-14.0.0-ucrt-r7) | The `x86_64-ucrt-posix-seh` zip; extract it to e.g. `C:\tools\winlibs`. |
+| [Python 3](https://www.python.org/downloads/) | Not the Microsoft Store alias. |
+| [Visual Studio 2022 Build Tools](https://visualstudio.microsoft.com/downloads/) | Workload "Desktop development with C++", plus "C++ Clang tools for Windows" and a Windows SDK. |
+| [Vulkan SDK](https://vulkan.lunarg.com/sdk/home#windows) | The installer sets `VULKAN_SDK`; open a new terminal afterwards. |
+
+### 2. Get the source
+
+Use a short path: long paths break the build on Windows.
 
 ```powershell
-git clone --recursive https://github.com/zorde23/G5
-powershell -ExecutionPolicy Bypass -File tools\build_hybrid.ps1 -Profile g5 -Eboot C:\dump\eboot.bin -GameDir C:\dump -Output C:\g5
+git clone --recursive https://github.com/zorde23/G5 C:\g5src
+cd C:\g5src
 ```
 
-Then run `C:\g5\eboot.exe`. Requirements and every option:
-[Usage, "Kyty GPU hybrid build"](docs/user/USAGE.md#kyty-gpu-hybrid-build).
+### 3. Prepare your dump
+
+A folder with the decrypted (ELF) `eboot.bin`, `sce_sys\` and the rest of the title's files, for
+example `D:\dump`. Put it on the same drive as the output folder of step 4: the script links the
+files instead of copying them, and never copies, moves or deletes them.
+
+### 4. Build
+
+In PowerShell, from `C:\g5src` (adjust the WinLibs and Git paths to where you installed them):
+
+```powershell
+$env:PATH = "C:\tools\winlibs\mingw64\bin;C:\Program Files\Git\cmd;C:\Program Files\Git\usr\bin;$env:PATH"
+powershell -ExecutionPolicy Bypass -File tools\build_hybrid.ps1 -Profile g5 -Eboot D:\dump\eboot.bin -GameDir D:\dump -Output D:\g5
+```
+
+If a tool is missing, the script lists it and stops before building. The first build downloads
+dependencies and takes a while; it ends with `Ready: D:\g5\eboot.exe`.
+
+### 5. Play
+
+Double-click `D:\g5\eboot.exe` (from a terminal, start it inside `D:\g5`: saves go to `_sd\` in
+the current folder). Controllers mapped by SDL work out of the box;
+keyboard and mouse are set in `anyps5-input.ini` ([input mapping](docs/user/INPUT_MAPPING.md)).
+Settings live in `ps5-hybrid.ini` beside the executable and the log of the last run in
+`g5-last.log`. The game stays offline: its sockets are kept on the loopback interface, so Windows
+does not ask for network access.
+
+### Update
+
+```powershell
+cd C:\g5src
+git pull
+git submodule update --init --recursive
+```
+
+Then run step 4 again with the same `-Output`; your saves (`_sd`) and `ps5-hybrid.ini` are kept.
+
+### Problems
+
+- "Missing prerequisites": install what the script lists, open a new terminal and set `PATH` again.
+- `Python was not found` (when running the repo's `python3 tools/...` by hand): use `py -3` instead, or turn off the "App execution aliases" for `python3` in Windows settings.
+- `running scripts is disabled on this system`: a group policy blocks PowerShell scripts; see [Build instructions](docs/dev/BUILD.md).
+- `opening dependency file ... No such file or directory`: the source path is too long; clone to a short path such as `C:\g5src`.
+- Every option of the script: [Usage, "Kyty GPU hybrid build"](docs/user/USAGE.md#kyty-gpu-hybrid-build).
 
 ## Branches
 
